@@ -1,0 +1,66 @@
+# configs/agent.yaml
+
+# Agent 核心配置
+agent:
+  # 网络架构配置（引用 model.yaml 中的 gnn）
+  architecture:
+    use_hierarchical: true  # 使用分层策略
+    use_double_dqn: true    # 使用 Double DQN
+    use_prioritized_replay: false  # 是否使用优先经验回放
+
+  # 训练配置
+  training:
+    learning_rate: 0.001
+    gamma: 0.99           # 折扣因子
+    buffer_size: 100000   # 经验回放池大小
+    batch_size: 32
+    target_update_freq: 1000  # Target Network 更新频率
+    grad_clip: 1.0        # 梯度裁剪阈值
+
+  # 探索配置
+  epsilon:
+    initial: 1.0
+    final: 0.01
+    decay_steps: 10000
+    strategy: 'exponential'  # 'exponential' 或 'linear'
+
+  # 评估配置
+  eval:
+    device: 'cuda'        # 'cuda' 或 'cpu'
+    seed: 42
+    deterministic: true   # 固定随机种子
+    eval_freq: 100        # 每多少 episode 评估一次
+    num_eval_episodes: 20
+
+  # 优化器配置
+  optimizer:
+    type: 'Adam'          # 'Adam', 'RMSprop', 'SGD'
+    adam:
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      weight_decay: 0
+    rmsprop:
+      alpha: 0.95
+      eps: 1e-8
+
+  # 网络层配置（覆盖 model.yaml）
+  network:
+    hidden_dim: 128
+    dropout: 0.1
+    activation: 'relu'    # 'relu', 'leaky_relu', 'tanh'
+    use_layer_norm: true
+    use_batch_norm: false
+
+  # DAgger 配置（Phase2/Phase3 专家引导）
+  dagger:
+    enabled: false
+    initial_beta: 0.8
+    final_beta: 0.0
+    decay_steps: 50000
+
+  # 保存与加载
+  checkpoint:
+    save_freq: 1000       # 每多少步保存一次
+    save_best_only: true  # 只保存最佳模型
+    metric: 'reward'      # 'reward', 'loss', 'acceptance_rate'
+    max_to_keep: 5        # 保留最近的 N 个检查点

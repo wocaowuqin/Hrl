@@ -1,0 +1,48 @@
+# 模型配置 - 网络结构与训练参数
+# 基础模型参数
+base:
+  hidden_dim: 128
+  learning_rate: 0.00025  # LR 与hyperparameters.py一致
+  optimizer:
+    type: "RMSprop"
+    rho: 0.95
+    epsilon: 1e-08
+  loss: "mse"
+  batch_size: 32  # 与BATCH_SIZE一致
+  gamma: 0.99  # 折扣因子
+  exp_memory: 100000  # 经验池大小
+
+# GNN模型参数
+gnn:
+  node_feat_dim: 32
+  edge_feat_dim: 16
+  request_dim: 24
+  num_goals: 10
+  num_actions: 100
+  layers:
+    - type: "GCN"
+      out_channels: 64
+      activation: "relu"
+    - type: "GCN"
+      out_channels: 128
+      activation: "relu"
+
+# HRL模型参数
+hrl:
+  three_level:
+    high_level:
+      hidden_dim: 256
+      layers: 2
+      meta_train_freq: 50  # 高层训练频率（META_TRAIN_FREQ）
+    mid_level:
+      hidden_dim: 128
+      layers: 2
+    low_level:
+      hidden_dim: 64
+      layers: 1
+
+# 训练策略参数
+training:
+  pre_train_steps: 100  # 预训练步数
+  train_freq: 4  # 训练频率
+  hard_update_frequency: 1000  # 目标网络硬更新频率

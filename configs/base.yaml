@@ -1,0 +1,68 @@
+# configs/base.yaml - 路径适配版
+
+# 1. 项目基础信息
+project:
+  name: "HIRL-MSFC-CE"
+  description: "Hierarchical Reinforcement Learning for Service Function Chaining"
+  base_dir: "./outputs"
+
+# 2. 🔥 [关键] 路径配置 (已更新为您提供的绝对路径)
+path:
+  # [输入] 数据集位置 (存放 .mat 拓扑, phaseX_requests.pkl 等)
+  input_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/data/input_dir"
+
+  # [输出] 专家数据导出位置 (建议在 outputs 下建子文件夹，保持整洁)
+  expert_data_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/expert"
+
+  # [输出] 模型检查点 (checkpoints)
+  ckpt_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/checkpoints"
+
+  # [输出] 日志文件
+  log_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/logs"
+
+  # [输出] 失败案例可视化
+  failure_output_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/failures"
+
+# 3. 拓扑配置
+topology:
+  # 设为 null，由 main.py 自动从 input_dir 加载 .mat 文件
+  matrix: null
+  dc_nodes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 23]
+## ✅ DC 节点（数据中心，可以部署VNF）
+##DC_NODES = [1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 14, 17, 18, 19, 20, 23]
+#DC_NODES = [11]
+#
+## ✅ 重要节点（汇聚节点，可以作为目标，但不能作为源）
+##NODE_IMPORTANT = [16, 21, 22, 24, 25, 26, 27, 28]
+#NODE_IMPORTANT = [1,2,3,4,5,6,7,8,9,10,12,13,14,15,16,17,18,19,20, 21, 22,23, 24, 25, 26, 27, 28]
+# 4. 资源容量
+capacities:
+  cpu: 150.0
+  memory: 140.0
+  bandwidth: 70.0
+
+# 5. 环境参数
+environment:
+  num_nodes: 28
+  use_gnn: true
+  nb_high_level_goals: 10
+  nb_low_level_actions: 28
+  max_steps_per_episode: 200
+# 6. 评估配置
+eval:
+  device: 'cpu'
+  seed: 42
+  deterministic: true
+
+# 7. 训练配置
+training:
+  learning_rate: 0.001
+  gamma: 0.99
+  batch_size: 32
+  buffer_size: 10000
+
+# 8. 日志格式
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/training.log"

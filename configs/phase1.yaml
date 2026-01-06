@@ -1,0 +1,16 @@
+# 阶段1配置 - 专家轨迹采集
+phase1:
+  output_dir: "${project.base_dir}/phase1"
+  episodes: 2000
+  save_every: 500
+  max_dataset_size: 100000  # 防止内存溢出
+
+  # 数据生成相关参数
+  data_generation:
+    time_range: 1000
+    poisson_lambda: 0.6
+    vnf_chain_length: 3
+    num_destinations: 5
+    min_bandwidth: 4
+    max_bandwidth: 8
+    mean_lifetime: 3
