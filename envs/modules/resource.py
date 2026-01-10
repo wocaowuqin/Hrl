@@ -159,7 +159,6 @@ class ResourceManager:
             })
 
         return True
-
     def apply_tree_deployment(self, plan: dict, request: dict) -> bool:
         """应用树部署方案 (支持 Dict Tree 并同步 self.B)"""
         # 1. 部署 VNF
@@ -204,7 +203,6 @@ class ResourceManager:
                             self.link_ref_count[pid] += 1
 
         return True
-
     def get_network_state_dict(self, current_request=None):
         """返回结构化网络状态"""
         # 此时 self.C, self.M, self.B 已经是同步后的最新值
@@ -215,7 +213,6 @@ class ResourceManager:
         if current_request:
             state['request'] = current_request
         return state
-
     def _build_edge_index(self):
         """构建 PyTorch Geometric edge_index"""
         rows, cols = np.where(self.topo > 0)
@@ -249,10 +246,6 @@ class ResourceManager:
 
         self.edge_index = torch.tensor(np.array(edge_list).T, dtype=torch.long)
         self.edge_hops = torch.tensor([float(self.topo[u, v]) for u, v in zip(rows, cols)], dtype=torch.float32)
-
-    # ==========================================================
-    # 🔥 之前丢失的方法：get_graph_state
-    # ==========================================================
     def get_graph_state(self, current_request, nodes_on_tree, current_tree,
                         served_dest_count: int, sharing_strategy: int, nb_high_goals: int):
         """获取图状态 (GNN Input)"""
@@ -357,7 +350,6 @@ class ResourceManager:
 
         req_vec = torch.tensor(req_vec_array, dtype=torch.float32)
         return x, self.edge_index, edge_attrs, req_vec
-
     def _compute_dest_distances(self, dest_set):
         key = frozenset(dest_set)
         if key in self._dest_dist_cache: return self._dest_dist_cache[key]
@@ -368,30 +360,16 @@ class ResourceManager:
             avg_dist[i] = np.mean(dists) if dists else 999.0
         self._dest_dist_cache[key] = avg_dist
         return avg_dist
-
     def _compute_vnf_sharing_potential(self, dest_set):
         avg_dist = self._compute_dest_distances(dest_set)
         dist_factor = 1.0 - avg_dist / (np.max(avg_dist) + 1e-5)
         resource_factor = 1.0 - (self.C / max(1, self.C_cap))
         return np.clip(0.4 * dist_factor + 0.3 * resource_factor, 0, 1)
-
     def _build_shortest_dist_matrix(self):
         self.shortest_dist = np.full((self.n, self.n), 9999.0)
         np.fill_diagonal(self.shortest_dist, 0.0)
         # 实际应使用 FW 算法或 Dijkstra，这里假设已预计算或简化
         # 如果需要精确距离，请确保此矩阵正确初始化
-
-    def can_share_vnf(self, node_id: int, vnf_type: int) -> bool:
-        return True
-
-    def find_closest_tree_node(self, nodes_on_tree: set, goal_node: int, source_node: int):
-        if not nodes_on_tree: return source_node
-        return list(nodes_on_tree)[0]  # 简化
-
-    def get_shortest_distance(self, src: int, dst: int) -> float:
-        if src == dst: return 0.0
-        return 9999.0  # 简化
-
     def get_flat_state(self, *args, **kwargs):
         """占位符，如果需要 Flat State 请实现"""
         return np.zeros(self.STATE_VECTOR_SIZE, dtype=np.float32)
@@ -488,7 +466,42 @@ class ResourceManager:
         # 如果未传入具体数值，默认检查是否大于0（或者由调用方保证传入值）
         return self.C[node] >= cpu_need - 1e-5 and self.M[node] >= mem_need - 1e-5
 
+    def check_link_resource(self, u: int, v: int, bw_need: float) -> bool:
+        """
+        🔥 [新增] 检查链路带宽资源 (只读，不扣费)
+        用于 Mask 生成和路径规划预判
+        """
+        # 1. 拓扑检查
+        if not self.has_link(u, v):
+            return False
 
+        # 2. 带宽检查 (兼容不同存储结构)
+        # 情况 A: 字典存储 (self.links['bandwidth'])
+        if hasattr(self, 'links') and 'bandwidth' in self.links:
+            # 检查正向
+            if (u, v) in self.links['bandwidth']:
+                return self.links['bandwidth'][(u, v)] >= bw_need - 1e-5
+            # 检查反向 (如果是无向图或双向存储)
+            elif (v, u) in self.links['bandwidth']:
+                return self.links['bandwidth'][(v, u)] >= bw_need - 1e-5
+            # 默认：有连接但没带宽记录，视为 0
+            return False
+
+        # 情况 B: 矩阵存储
+        elif hasattr(self, 'topology'):
+            # 假设 topology 矩阵直接存带宽
+            return self.topology[u][v] >= bw_need - 1e-5
+
+        # 情况 C: self.B 数组直接映射 (最快)
+        elif hasattr(self, 'edge_to_phys') and hasattr(self, 'B'):
+            pid = self.edge_to_phys.get((u, v))
+            if pid is None: pid = self.edge_to_phys.get((v, u))
+
+            if pid is not None and pid < len(self.B):
+                return self.B[pid] >= bw_need - 1e-5
+
+        # 兜底
+        return False
 
     def get_link_cost(self, u: int, v: int) -> float:
         """获取链路开销 (默认跳数为1，可扩展为延迟或带宽倒数)"""
@@ -648,7 +661,7 @@ class ResourceManager:
 
     def allocate_link_resource(self, u, v, bw_need):
         """
-        扣除链路带宽资源
+        扣除链路带宽资源（修复版 - 同步更新 self.B）
         :param u: 起点节点 ID
         :param v: 终点节点 ID
         :param bw_need: 需要的带宽量
@@ -665,6 +678,16 @@ class ResourceManager:
 
             if current_bw >= bw_need:
                 self.links['bandwidth'][(u, v)] -= bw_need
+
+                # ✅ 关键修复：同步更新 self.B 数组
+                if hasattr(self, 'edge_to_phys'):
+                    pid = self.edge_to_phys.get((u, v))
+                    if pid is None:
+                        pid = self.edge_to_phys.get((v, u))
+
+                    if pid is not None and pid < len(self.B):
+                        self.B[pid] = self.links['bandwidth'][(u, v)]
+
                 return True
             else:
                 return False
@@ -683,7 +706,7 @@ class ResourceManager:
 
     def allocate_node_resource(self, node_id, vnf_type, cpu_need, mem_need=0.0):
         """
-        扣除节点计算资源
+        扣除节点计算资源（修复版 - 同步更新 self.nodes）
         :param node_id: 节点 ID
         :param vnf_type: VNF 类型 (部分逻辑可能需要)
         :param cpu_need: CPU 需求
@@ -708,6 +731,13 @@ class ResourceManager:
                         # 回滚 CPU 扣除
                         self.C[node_id] += cpu_need
                         return False
+
+                # ✅ 关键修复：同步更新 self.nodes 字典
+                if hasattr(self, 'nodes'):
+                    if 'cpu' in self.nodes:
+                        self.nodes['cpu'][node_id] = self.C[node_id]
+                    if 'memory' in self.nodes:
+                        self.nodes['memory'][node_id] = self.M[node_id]
 
                 return True
             else:

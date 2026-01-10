@@ -283,7 +283,7 @@ def verify_events(events_filename):
                   f"到达={e['arrive_event']}, "
                   f"离开={e['leave_event']}")
             count += 1
-            if count >= 5:
+            if count >= 25:
                 break
 
 

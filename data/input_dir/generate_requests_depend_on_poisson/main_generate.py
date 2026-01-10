@@ -11,19 +11,20 @@ import pickle
 import os
 
 # ========== 1. 核心网络配置 (论文/MATLAB一致) ==========
-NODE_TRAFFIC_LIST = [16, 21, 22, 24, 25, 26, 27, 28]
+NODE_TRAFFIC_LIST = [2, 5, 6, 10, 15, 16, 21, 24]
 
 # ========== 2. 时间与负载参数 ==========
 TIME_INTERVAL = 5.0  # 时间间隔 5秒
 
 # 🔥 【关键修改】提高到达率 + 增大时间槽
-LAMBDA_PER_INTERVAL = 280.0  # 每间隔50个请求（原来7.0）
-LAMBDA_RATE = LAMBDA_PER_INTERVAL / TIME_INTERVAL  # 10 req/s
+LAMBDA_PER_INTERVAL = 5.0  # 每间隔56个请求
+
+LAMBDA_RATE = LAMBDA_PER_INTERVAL / TIME_INTERVAL
 
 # 🔥 【关键修改】时间槽配置
 TIME_SLOT_DELTA = 0.1  # 100ms（原来10ms）
-# 效果：5秒 = 50个时间槽，50个请求 → 平均每槽1个请求
-# 每个时间槽可能有0-5个请求（泊松分布）
+MIN_LIFETIME = 1.0  # 最小存活时间 1秒
+MAX_LIFETIME = 6.0  # 最大存活时间 6秒
 
 # ========== 3. 业务请求参数 ==========
 NUM_DESTINATIONS = 5
@@ -180,11 +181,12 @@ def generate_all_requests(num_intervals, lamda, seed=None, phase_name="Unknown")
                 cpu_needs.append(c)
                 mem_needs.append(m)
 
-            base_slots = 1 + np.random.exponential(MEAN_LIFETIME - 1)
-            while base_slots > 6:
-                base_slots = 1 + np.random.exponential(MEAN_LIFETIME - 1)
+            # 🔥 修改这部分 - 生成1-6秒的存活时间
+            # 方法1：使用均匀分布
+            lifetime_seconds = random.uniform(MIN_LIFETIME, MAX_LIFETIME)
 
-            lifetime_seconds = base_slots * TIME_INTERVAL
+            # 或者方法2：使用整数秒
+            # lifetime_seconds = random.randint(int(MIN_LIFETIME), int(MAX_LIFETIME))
 
             req = generate_single_request(
                 req_id=0,

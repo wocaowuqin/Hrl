@@ -1,3 +1,4 @@
+
 # core/trainer/phase3_rl_trainer.py
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -9,6 +10,7 @@ Phase 3 RL Trainer - Goal-Conditioned HRL + DAgger + 🔥 时间槽系统
 2. 🛡️ 崩溃保护：捕获 Agent 内部错误，防止训练中断。
 3. 📊 进度条：显示真实累计 Acc (接纳率) 和 Blk (阻塞率)。
 4. 🔥 时间槽系统：支持离散时间模拟、批量请求处理、资源自动释放
+5. 🔧 修复Loss为0的问题：确保网络更新和梯度回传正常进行
 ===============================================================================
 """
 
@@ -48,9 +50,14 @@ class Phase3RLTrainer:
         self.max_episodes = phase3_cfg.get("episodes", 1000)
         self.save_freq = phase3_cfg.get("save_every", 100)
 
+        # 🔧 新增：训练参数
+        self.max_steps_per_episode = phase3_cfg.get("max_steps", 600)
+        self.update_frequency = phase3_cfg.get("update_frequency", 4)  # 每4步更新一次
+        self.warmup_steps = phase3_cfg.get("warmup_steps", 100)  # 预热步数
+
         # 1. Epsilon 配置
         epsilon_cfg = phase3_cfg.get("epsilon", {})
-        self.epsilon_initial = epsilon_cfg.get("initial", 0.5)
+        self.epsilon_initial = epsilon_cfg.get("initial", 0.7)
         self.epsilon_final = epsilon_cfg.get("final", 0.01)
         self.epsilon_decay_steps = epsilon_cfg.get("decay_steps", 5000)
 
@@ -77,12 +84,16 @@ class Phase3RLTrainer:
             "blocking_rates": [],
             "resource_levels": [],
             "subgoal_completion_rate": [],
-            # 🔥 新增：时间槽统计
             "time_slots_covered": [],
             "decision_steps": [],
-            "requests_per_episode": []
+            "requests_per_episode": [],
+            "losses": [],
+            "high_losses": [],
+            "low_losses": []
+
         }
         self.global_step = 0
+        self.total_updates = 0  # 🔧 新增：总更新次数
 
         # 🔥 新增：时间槽相关统计
         self.timeslot_stats = {
@@ -210,6 +221,8 @@ class Phase3RLTrainer:
     def run(self):
         """运行训练主循环"""
         logger.info(f"🚀 Starting Training: DAgger={self.use_dagger}, Beta={self.beta}")
+        logger.info(
+            f"📊 训练参数: episodes={self.max_episodes}, warmup={self.warmup_steps}, update_freq={self.update_frequency}")
 
         # 🔥 加载时间槽数据
         if self.use_timeslot:
@@ -246,14 +259,23 @@ class Phase3RLTrainer:
                     total_failed += 1
 
                 # 3. 计算累计指标
-                cum_acc = total_success / total_episodes
-                cum_blk = total_failed / total_episodes
+                cum_acc = total_success / total_episodes if total_episodes > 0 else 0.0
+                cum_blk = total_failed / total_episodes if total_episodes > 0 else 0.0
 
                 # 4. 记录到 Stats (用于绘图)
                 self.stats["rewards"].append(ep_reward)
                 self.stats["acceptance_rates"].append(1.0 if is_success else 0.0)
                 self.stats["blocking_rates"].append(0.0 if is_success else 1.0)
                 self.stats["resource_levels"].append(curr_res_level)
+
+                # 🔥 [新增] 记录 Loss
+                avg_loss = ep_info.get('avg_loss', 0.0)
+                avg_high_loss = ep_info.get('avg_high_loss', 0.0)
+                avg_low_loss = ep_info.get('avg_low_loss', 0.0)
+
+                self.stats["losses"].append(avg_loss)
+                self.stats["high_losses"].append(avg_high_loss)
+                self.stats["low_losses"].append(avg_low_loss)
 
                 # 🔥 新增：时间槽统计
                 if self.use_timeslot:
@@ -266,6 +288,9 @@ class Phase3RLTrainer:
                 self.writer.add_scalar("Train/CumulativeAcc", cum_acc, ep)
                 self.writer.add_scalar("Train/CumulativeBlk", cum_blk, ep)
                 self.writer.add_scalar("Train/Resource", curr_res_level, ep)
+                self.writer.add_scalar("Train/Loss", avg_loss, ep)
+                self.writer.add_scalar("Train/HighLoss", avg_high_loss, ep)
+                self.writer.add_scalar("Train/LowLoss", avg_low_loss, ep)
 
                 # 🔥 新增：时间槽指标
                 if self.use_timeslot:
@@ -285,7 +310,10 @@ class Phase3RLTrainer:
                     "Exp": f"{expert_usage_pct:.0f}%",
                     "Acc": f"{cum_acc:.1%}",
                     "Blk": f"{cum_blk:.1%}",
-                    "Res": f"{curr_res_level:.0f}%"
+                    "Res": f"{curr_res_level:.0f}%",
+                    "Loss": f"{avg_loss:.4f}",
+                    "HiLoss": f"{avg_high_loss:.4f}",
+                    "LoLoss": f"{avg_low_loss:.4f}"
                 }
 
                 # 🔥 如果启用时间槽，添加时间槽信息
@@ -294,6 +322,13 @@ class Phase3RLTrainer:
                     postfix["DS"] = ep_info.get('decision_steps', 0)
 
                 pbar.set_postfix(postfix)
+
+                # 7. 显示训练状态摘要
+                if (ep + 1) % 50 == 0:
+                    logger.info(f"\n📊 Episode {ep + 1} 训练状态:")
+                    logger.info(f"   累计更新次数: {self.total_updates}")
+                    logger.info(f"   经验缓冲区: High={len(self.agent.high_memory)}, Low={len(self.agent.low_memory)}")
+                    logger.info(f"   Loss: High={avg_high_loss:.6f}, Low={avg_low_loss:.6f}")
 
                 # 保存模型
                 if (ep + 1) % self.save_freq == 0:
@@ -316,18 +351,23 @@ class Phase3RLTrainer:
         # 训练结束保存
         self.agent.save(str(self.output_dir / "rl_model_final.pth"))
         logger.info(f"✅ Training Complete. Final Acc: {total_success / total_episodes:.2%}")
+        logger.info(f"📊 最终统计: 总更新次数={self.total_updates}, 平均Loss={np.mean(self.stats['losses']):.6f}")
 
         # 🔥 打印最终时间槽统计
         if self.use_timeslot:
             self._print_final_timeslot_stats()
 
     def _run_episode(self, episode_idx: int):
-        """运行一个episode（集成黑名单 + DAgger + 🔥 时间槽系统）"""
+        """运行一个episode（集成黑名单 + DAgger + 🔥 时间槽系统 + Loss监控）"""
         import numpy as np
         import random
 
+        # 🔧 新增：预热检查
+        if self.agent.steps_done < self.warmup_steps:
+            logger.debug(f"🔥 预热阶段: {self.agent.steps_done}/{self.warmup_steps}")
+
         # 获取最大步数
-        max_steps = getattr(self, 'max_steps_per_episode', getattr(self.env, 'max_steps', 600))
+        max_steps = self.max_steps_per_episode
 
         # ✅ 重置环境
         reset_result = self.env.reset()
@@ -355,6 +395,11 @@ class Phase3RLTrainer:
         decision_steps = 0  # 🔥 决策步数（不是时间！）
         episode_reward = 0
 
+        # 🔥 Loss 统计容器
+        episode_losses = []
+        episode_high_losses = []
+        episode_low_losses = []
+
         # DAgger 统计
         expert_steps = 0
         masked_expert_steps = 0
@@ -362,31 +407,33 @@ class Phase3RLTrainer:
         # 初始化 step_info
         step_info = {'success': False, 'request_completed': False}
 
+        # 🔧 新增：用于监控经验存储
+        stored_high_transitions = 0
+        stored_low_transitions = 0
+
         while not done and steps < max_steps:
             # DAgger 逻辑
-            beta = getattr(self, 'beta', 0.0)
-            use_dagger = getattr(self, 'use_dagger', False)
+            beta = self.beta
+            use_dagger = self.use_dagger
             use_expert = False
             expert_action = None
 
             # 🔥🔥🔥 关键修复：从 state 中提取 action_mask 🔥🔥🔥
             action_mask = None
 
-            # 方式1: 从PyG Data对象中提取（你的环境用这种）
+            # 方式1: 从PyG Data对象中提取
             if hasattr(state, 'action_mask'):
                 action_mask = state.action_mask
-                # 转换为numpy数组
                 if hasattr(action_mask, 'cpu'):
                     action_mask = action_mask.cpu().numpy()
-                # 去掉多余维度 [1, N] -> [N]
                 if action_mask.ndim > 1:
                     action_mask = action_mask.squeeze()
 
-            # 方式2: 从step_info中提取（后备）
+            # 方式2: 从step_info中提取
             elif 'action_mask' in step_info:
                 action_mask = step_info['action_mask']
 
-            # 方式3: 直接调用环境方法（最后兜底）
+            # 方式3: 直接调用环境方法
             if action_mask is None and hasattr(self.env, 'get_low_level_action_mask'):
                 action_mask = self.env.get_low_level_action_mask()
 
@@ -412,11 +459,11 @@ class Phase3RLTrainer:
                     else:
                         masked_expert_steps += 1
 
-            # ✅ Agent 选择动作（现在action_mask不是None了）
+            # ✅ Agent 选择动作
             high_action, low_action, action_info = self.agent.select_action(
                 state=state,
                 unconnected_dests=unconnected_dests,
-                action_mask=action_mask,  # 🔥 现在这个不是None了
+                action_mask=action_mask,
                 use_expert=use_expert,
                 expert_action=expert_action,
                 blacklist_info=blacklist_info
@@ -424,7 +471,6 @@ class Phase3RLTrainer:
 
             # 🛡️ 防御：如果 Agent 返回 -1 (无效)，手动处理
             if low_action == -1:
-                # 强制结束当前 Episode，视为失败
                 logger.warning(f"⚠️ Agent returned -1 (No Valid Actions). Terminating Episode {episode_idx}.")
                 return episode_reward, {
                     'success': False,
@@ -432,7 +478,10 @@ class Phase3RLTrainer:
                     'message': 'no_valid_actions',
                     'time_slot': current_time_slot,
                     'decision_steps': decision_steps,
-                    'time_slots_covered': current_time_slot - initial_time_slot
+                    'time_slots_covered': current_time_slot - initial_time_slot,
+                    'avg_loss': 0.0,
+                    'avg_high_loss': 0.0,
+                    'avg_low_loss': 0.0
                 }
 
             # 执行动作
@@ -465,16 +514,18 @@ class Phase3RLTrainer:
                 if "资源不足" in reason or "访问超限" in reason:
                     self.agent.record_failure(low_action, reason)
 
-            # 存储经验
-            if action_info.get('source', '').startswith('agent'):
-                # High-Level Buffer
-                if action_info.get('high_level_decision', False):
-                    goal = unconnected_dests[high_action] if unconnected_dests and high_action < len(
-                        unconnected_dests) else -1
+            # 🔧 修复：总是存储经验，无论是专家还是agent的选择
+            # High-Level Buffer
+            if action_info.get('high_level_decision', False):
+                goal = unconnected_dests[high_action] if unconnected_dests and high_action < len(
+                    unconnected_dests) else -1
+                if goal != -1:
                     self.agent.store_transition_high(state, goal, reward, next_state, done or truncated)
+                    stored_high_transitions += 1
 
-                # Low-Level Buffer
-                self.agent.store_transition_low(state, low_action, reward, next_state, done or truncated)
+            # Low-Level Buffer
+            self.agent.store_transition_low(state, low_action, reward, next_state, done or truncated)
+            stored_low_transitions += 1
 
             # 更新状态
             state = next_state
@@ -484,34 +535,57 @@ class Phase3RLTrainer:
             episode_reward += reward
             steps += 1
 
-            # 定期更新网络
-            if steps % 4 == 0:
-                self.agent.update_policies()
+            # 🔧 修复：定期更新网络（确保有足够经验）
+            if steps % self.update_frequency == 0:
+                # 🔥 确保经验缓冲区有足够数据
+                has_enough_high_exp = len(self.agent.high_memory) >= self.agent.batch_size // 4
+                has_enough_low_exp = len(self.agent.low_memory) >= self.agent.batch_size
+
+                if has_enough_low_exp:
+                    # 🔧 调用更新并获取详细的损失信息
+                    loss_dict = self.agent.update_policies()
+
+                    if loss_dict:
+                        # 记录各种损失
+                        high_loss = loss_dict.get('high_loss', 0.0)
+                        low_loss = loss_dict.get('low_loss', 0.0)
+                        total_loss = loss_dict.get('total_loss', 0.0)
+
+                        # 只记录非零的损失
+                        if high_loss > 0:
+                            episode_high_losses.append(high_loss)
+                        if low_loss > 0:
+                            episode_low_losses.append(low_loss)
+                        if total_loss > 0:
+                            episode_losses.append(total_loss)
+
+                        self.total_updates += 1
+
+                        # 🔧 调试：定期打印更新信息
+                        if self.total_updates % 100 == 0:
+                            logger.debug(
+                                f"🔄 Update #{self.total_updates}: HighLoss={high_loss:.6f}, LowLoss={low_loss:.6f}")
+
+                # 🔧 如果经验不足，打印警告
+                elif self.total_updates < 10 and steps > 50:
+                    logger.debug(f"⚠️ 经验不足: High={len(self.agent.high_memory)}, Low={len(self.agent.low_memory)}")
 
             if truncated: done = True
 
         # ============================================================
         # 🔥🔥🔥 关键修复：Episode 结束统计
         # ============================================================
-        # 1. 从info中获取明确的成功状态
         is_success = step_info.get('request_success', None)
-
-        # 2. 如果环境没有明确设置，则用旧逻辑判断
         if is_success is None:
             is_success = step_info.get('request_completed', False) or step_info.get('success', False)
 
-        # 3. 检查环境是否已经处理了归档
         env_already_archived = False
         if hasattr(self.env, 'current_request'):
-            # 如果 current_request 已经是 None，说明环境已经归档了
             env_already_archived = (self.env.current_request is None)
 
-        # 4. 只在请求未被归档时才调用 _archive_request
         if not env_already_archived:
-            # 环境还没归档，由Trainer来归档
             if hasattr(self.env, 'current_request') and self.env.current_request:
                 req_id = self.env.current_request.get('id', '?')
-
                 if not is_success:
                     logger.info(f"🔄 [Episode清理] 请求 {req_id} 失败，执行回滚...")
                     self.env._archive_request(success=False)
@@ -519,30 +593,36 @@ class Phase3RLTrainer:
                     logger.info(f"✅ [Episode清理] 请求 {req_id} 成功，归档资源...")
                     self.env._archive_request(success=True)
 
-                # 重置环境状态以便下一个 Episode
                 self.env.current_request = None
                 self.env.current_branch_id = None
                 self.env.current_tree = {}
                 self.env.nodes_on_tree = set()
                 self.env.branch_states = {}
-                # 清空本轮账本
-                if hasattr(self.env, 'curr_ep_node_allocs'):
-                    self.env.curr_ep_node_allocs = []
-                if hasattr(self.env, 'curr_ep_link_allocs'):
-                    self.env.curr_ep_link_allocs = []
+                if hasattr(self.env, 'curr_ep_node_allocs'): self.env.curr_ep_node_allocs = []
+                if hasattr(self.env, 'curr_ep_link_allocs'): self.env.curr_ep_link_allocs = []
         else:
-            # 环境已经归档，Trainer不需要再次归档
             logger.info(f"ℹ️ [Episode清理] 环境已归档，跳过Trainer归档")
 
         # ============================================================
-        # 🔥 构建完整的 episode_info（包含时间槽信息）
+        # 🔥 构建完整的 episode_info（包含时间槽信息和Loss）
         # ============================================================
+
+        # 计算平均 Loss
+        avg_loss = np.mean(episode_losses) if episode_losses else 0.0
+        avg_high_loss = np.mean(episode_high_losses) if episode_high_losses else 0.0
+        avg_low_loss = np.mean(episode_low_losses) if episode_low_losses else 0.0
+
         episode_info = {
             'steps': steps,
             'success': is_success,
             'blocking_rate': 0.0 if is_success else 1.0,
             'expert_usage': expert_steps / steps if steps > 0 else 0,
             'masked_expert': masked_expert_steps,
+            'stored_high': stored_high_transitions,
+            'stored_low': stored_low_transitions,
+            'avg_loss': avg_loss,
+            'avg_high_loss': avg_high_loss,
+            'avg_low_loss': avg_low_loss,
 
             # 🔥 时间槽信息
             'current_time_slot': current_time_slot,
@@ -550,7 +630,7 @@ class Phase3RLTrainer:
             'time_slots_covered': current_time_slot - initial_time_slot,
             'decision_steps': decision_steps,
             'request_id': request_id,
-            'requests_processed': 1  # 默认每个episode处理1个请求
+            'requests_processed': 1
         }
 
         # 🔥 更新时间槽统计
@@ -560,17 +640,20 @@ class Phase3RLTrainer:
 
         # 简单日志
         status_icon = "✅" if is_success else "❌"
-        if is_success or episode_idx % 10 == 0:  # 减少日志刷屏
-            if self.use_timeslot:
-                logger.info(
-                    f"Ep {episode_idx} | {status_icon} | "
-                    f"Rw: {episode_reward:.1f} | "
-                    f"Steps: {steps} | "
-                    f"TS: {current_time_slot} | "
-                    f"DS: {decision_steps}"
-                )
-            else:
-                logger.info(f"Ep {episode_idx} | {status_icon} | Rw: {episode_reward:.1f} | Steps: {steps}")
+        if is_success or episode_idx % 10 == 0:
+            logger.info(
+                f"Ep {episode_idx} | {status_icon} | "
+                f"Rw: {episode_reward:.1f} | "
+                f"Steps: {steps} | "
+                f"HiLoss: {avg_high_loss:.4f} | "
+                f"LoLoss: {avg_low_loss:.4f} | "
+                f"TS: {current_time_slot} | "
+                f"DS: {decision_steps}"
+            )
+
+            # 🔧 调试：打印经验存储情况
+            if stored_low_transitions == 0:
+                logger.warning(f"⚠️ Episode {episode_idx}: 没有存储任何Low-Level经验!")
 
         return episode_reward, episode_info
 
@@ -638,3 +721,4 @@ class Phase3RLTrainer:
                 logger.info(f"时间槽效率: {efficiency:.2f} (时间槽/决策步)")
 
         logger.info(f"{'=' * 60}\n")
+

@@ -129,10 +129,7 @@ def generate_single_request(req_id, source, dest, all_vnf,
         memory_origin.append(mem)
 
     # 🔥 请求持续时间（原逻辑：1 + 指数分布，限制 ≤ 6）
-    while True:
-        lifetime = 1 + random.expovariate(1.0 / (mean_lifetime - 1))
-        if lifetime <= 6:
-            break
+    lifetime = 1 + random.random() * 5
 
     leave_time = arrive_time + lifetime
 

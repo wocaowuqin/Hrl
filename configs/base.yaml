@@ -37,9 +37,9 @@ topology:
 #NODE_IMPORTANT = [1,2,3,4,5,6,7,8,9,10,12,13,14,15,16,17,18,19,20, 21, 22,23, 24, 25, 26, 27, 28]
 # 4. 资源容量
 capacities:
-  cpu: 150.0
-  memory: 140.0
-  bandwidth: 70.0
+  cpu: 55.0
+  memory: 45.0
+  bandwidth: 90.0
 
 # 5. 环境参数
 environment:

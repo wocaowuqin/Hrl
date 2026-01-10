@@ -7,6 +7,8 @@ SFC_HIRL_Env - 完整可运行的主环境类（分层强化学习 + 多播感�
 """
 import os
 import logging
+import time
+
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Set
@@ -15,12 +17,13 @@ import pickle
 import torch
 
 # 导入自定义模块
-from envs.modules.resource import ResourceManager
+from envs.modules.AllResourceManager import FusedResourceManager as ResourceManager
 from envs.modules.data_loader import DataLoader
 from envs.modules.path_manager import PathManager
 from envs.modules.event_handler import EventHandler
 from envs.modules.policy_helper import PolicyHelper
 from envs.modules.failure_visualizer import FailureVisualizer
+from envs.modules.visualize_multicast_tree import MulticastTreeVisualizer
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 class SimpleTopologyManager:
@@ -146,27 +149,39 @@ class RequestLifecycleManager:
 
     def check_and_release_expired(self, current_time):
         """
-        检查并释放过期的请求
-
-        这是核心方法！只基于请求的实际过期时间
-
-        Args:
-            current_time: 当前时间
-
-        Returns:
-            list: 被释放的请求ID列表
+        检查并释放过期的请求 - 带详细日志版本
         """
         expired_req_ids = []
 
+        # 🔥 记录释放前的资源状态
+        res_before = self.env.get_resource_utilization() if hasattr(self, 'env') else None
+
         # 遍历所有活跃请求
         for req_id, req_info in list(self.active_requests.items()):
-            # 🔥 关键：只检查请求是否真的过期
             if current_time > req_info['expire_time']:
                 expired_req_ids.append(req_id)
+
+                # 🔥 详细日志
+                expire_time = req_info['expire_time']
+                arrival_time = req_info['arrival_time']
+                print(f"   ⏱️ 请求 {req_id} 已过期: "
+                      f"到达={arrival_time:.2f}s, "
+                      f"过期={expire_time:.2f}s, "
+                      f"当前={current_time:.2f}s")
 
         # 释放过期请求的资源
         for req_id in expired_req_ids:
             self._release_request_resources(req_id, current_time)
+
+        # 🔥 释放后的资源状态
+        if expired_req_ids:
+            res_after = self.env.get_resource_utilization() if hasattr(self, 'env') else None
+            print(f"♻️ [过期释放] 释放了 {len(expired_req_ids)} 个请求")
+            if res_before is not None and res_after is not None:
+                change = res_after - res_before
+                print(f"   资源变化: {res_before:.1f}% → {res_after:.1f}% "
+                      f"({'+' if change > 0 else ''}{change:.1f}%)")
+            print(f"   请求ID: {expired_req_ids}")
 
         return expired_req_ids
 
@@ -364,6 +379,18 @@ class SFC_HIRL_Env(gym.Env):
         self.vnf_deployment_history = {}
         logger.info(f"✅ 环境初始化完成: n={self.n}, L={self.L}, K_vnf={self.K_vnf}")
 
+        self.enable_visualization = True  # 设为 False 可以关闭
+        if self.enable_visualization:
+            try:
+                import os
+                os.makedirs('visualization/success', exist_ok=True)
+                os.makedirs('visualization/fail', exist_ok=True)
+
+                self.visualizer = MulticastTreeVisualizer(self)
+                logger.info("✅ 可视化器已启用")
+            except Exception as e:
+                logger.warning(f"⚠️ 可视化器初始化失败: {e}")
+                self.enable_visualization = False
     def _init_infrastructure(self):
         """初始化拓扑、维度和资源管理器"""
         # --- 加载拓扑 ---
@@ -428,6 +455,9 @@ class SFC_HIRL_Env(gym.Env):
         """初始化数据加载、奖励计算、策略助手等"""
         self.data_loader = DataLoader(self.config)
         self.event_handler = EventHandler(resource_manager=self.resource_mgr)
+
+        self.request_manager = RequestLifecycleManager(self)
+        logger.info("✅ 请求生命周期管理器已初始化")
 
         # --- Policy Helper ---
         input_dir = Path(self.config.get('path', {}).get('input_dir', 'data/input_dir'))
@@ -814,6 +844,10 @@ class SFC_HIRL_Env(gym.Env):
         if should_hard_reset:
             print(f"\n🧹 [Hard Reset] 执行物理重置 ({phase})")
             if hasattr(self, 'resource_mgr'): self.resource_mgr.reset()
+            if hasattr(self, 'request_manager'):
+                self.request_manager.active_requests.clear()
+                self.request_manager.requests_by_slot.clear()
+
             self.leave_heap = []
             self.current_slot_index = 0
             self.time_step = 0.0
@@ -827,6 +861,7 @@ class SFC_HIRL_Env(gym.Env):
                 self.global_request_index = 0
 
         # 3. 初始化当前请求的状态容器
+        self.visit_history = []
         self.nodes_on_tree = set()
         self.current_tree = {
             'tree': {},
@@ -905,21 +940,63 @@ class SFC_HIRL_Env(gym.Env):
             'move_follow': 0,  # MOVE 跟随推荐路径
             'move_deviate': 0,  # MOVE 偏离推荐路径
             'total_steps': 0,
+            'repeat_visits': 0,
+            'tx_success': 0, 'tx_fail': 0,
+            'virtual_deploy': 0, 'actual_deploy': 0,
         }
+
+
         return self.get_state(), info
 
-    def step(self, action):
-        """🔥 [统一入口 V4.3 完整Debug+防崩溃版]"""
+    def _print_reward_debug(self, reward, info):
+        """打印奖励诊断信息"""
 
-        # 1. 路由决策层级
+        # 🔥 根据奖励值判断（最可靠）
+        if reward >= 150:
+            success = True
+        elif reward <= -50:
+            success = False
+        else:
+            success = info.get('success', reward > 0)
+
+        # 🔥🔥🔥 修复：优先读 current_request，读不到（已归档）就读 info 中的备份
+        if self.current_request:
+            req_id = self.current_request.get('id', '?')
+        else:
+            req_id = info.get('request_id', '?')  # <--- 从 info 读取备份 ID
+
+        if success:
+            status = "✅成功"
+            emoji = "🎉"
+        else:
+            status = "❌失败"
+            emoji = "💔"
+            error = info.get('error', 'unknown')
+            # print(f"   失败原因: {error}") # 可选：太吵可以注释掉
+
+        print(f"{emoji} [奖励诊断] 请求 {req_id} {status}: reward={reward:.1f}")
+
+    def step(self, action):
+        """🔥 [统一入口 V4.4 ID快照版]"""
+
+        # 🔥🔥🔥 1. 先拍快照 (防止子函数把请求删了导致 ID 丢失)
+        current_req_id = self.current_request.get('id', '?') if self.current_request else '?'
+
+        # 2. 路由决策层级
         if self.current_branch_id is None:
             obs, reward, done, truncated, info = self.step_high_level(action)
         else:
             obs, reward, done, truncated, info = self.step_low_level(action)
 
-        # 🛑🛑🛑 【关键修复】安全刹车 🛑🛑🛑
-        # 如果子函数已经把请求归档了(None)，必须立刻返回，否则后面打印日志时会报 NoneType 错
+        # 🔥🔥🔥 2. 把快照塞进 info (供诊断使用)
+        if info is None: info = {}
+        info['request_id'] = current_req_id
+
+        # 🛑🛑🛑 【安全刹车】 🛑🛑🛑
         if done or self.current_request is None:
+            # 现在 info 里有 request_id 了，打印出来就是对的了
+            if done:
+                self._print_reward_debug(reward, info)
             return obs, reward, done, truncated, info
 
         # ========================================================
@@ -930,291 +1007,633 @@ class SFC_HIRL_Env(gym.Env):
         connected = self.current_tree.get('connected_dests', set())
         current_node = self.current_node_location
 
-        # 只有 VNF 处理完 (3/3) 且当前在目的地，才触发吸附
         if progress >= 1.0 and current_node in dests and current_node not in connected:
-            # 执行环境内部的连接逻辑
             connect_ok = self._connect_destination(current_node)
             if connect_ok:
-                # 更新局部变量以进入下方的结算逻辑
                 connected = self.current_tree.get('connected_dests', set())
-                reward += 100.0  # 给予极高的即时奖励引导
+                reward += 100.0
                 info['reached_new_dest'] = True
                 print(f"✨ [Auto Connect] 进度满且踩到目的地 {current_node}，强制吸附结算！")
 
-        # 2. 检查任务是否完成 (所有目的地物理连接)
+        # 3. 检查任务是否完成 (所有目的地物理连接)
         if not done and len(connected) >= len(dests) and len(dests) > 0:
-            print(f"\n🏭 [质检流水线] 请求 {self.current_request.get('id')} 物理连接完成，开始验证...")
+            print(f"\n🏭 [质检流水线] 请求 {current_req_id} 物理连接完成，开始验证...")
 
             # A. 剪枝
             pruned_tree, valid_nodes, prune_success, parent_map = self._prune_redundant_branches_with_vnf()
             if not prune_success:
-                # 如果剪枝发现孤岛，给重罚
+                self._print_reward_debug(-100.0,
+                                         {'success': False, 'error': 'island_topology', 'request_id': current_req_id})
                 return obs, -100.0, True, False, {'success': False, 'error': 'island_topology'}
 
-            # B. SFC 路径验证 (严格质检)
+            # B. SFC 路径验证
             sfc_ok, sfc_errors = self._validate_sfc_paths(parent_map)
             if not sfc_ok:
                 print("❌ [SFC验证失败]")
                 for e in sfc_errors: print(f"   {e}")
-                # 如果 SFC 路径不通，可能是模型绕路太远，给重罚
+                self._print_reward_debug(-200.0,
+                                         {'success': False, 'error': 'incomplete_sfc', 'request_id': current_req_id})
                 return obs, -200.0, True, False, {'success': False, 'error': 'incomplete_sfc'}
 
-            # C. 统一扣费 (Commit)
+            # C. 统一扣费
             self.current_tree['tree'] = pruned_tree
             self.nodes_on_tree = valid_nodes
 
             if not self._commit_resources(pruned_tree, valid_nodes):
+                self._print_reward_debug(-50.0, {'success': False, 'error': 'resource_commit_fail',
+                                                 'request_id': current_req_id})
                 return obs, -50.0, True, False, {'success': False, 'error': 'resource_commit_fail'}
 
             # D. 成功归档
             self._archive_request(success=True)
             print("✅ [结算成功] 资源已扣除，任务完成")
 
+            self._print_reward_debug(200.0, {'success': True, 'request_completed': True, 'request_id': current_req_id})
             return obs, 200.0, True, False, {'success': True, 'request_completed': True}
 
         # ========================================================
         # 🔥 [核心改进 B] 徘徊惩罚补充逻辑
         # ========================================================
         if progress >= 1.0 and info.get('action_type') == 'move':
-            # 如果 VNF 完事了还在已有的树上移动且没踩到新目的地
             if current_node in self.nodes_on_tree and not info.get('reached_new_dest', False):
-                reward -= 15.0  # 对应你的 backtrack_penalty
+                reward -= 15.0
                 info['is_backtracking'] = True
+
+        # 中途打印 (可选)
+        # if done: self._print_reward_debug(reward, info)
 
         return obs, reward, done, truncated, info
 
     def step_high_level(self, action):
         """
-        🔥 [V11.6 修复版] 高层决策 - 修复 Mask 丢失问题
+        🔥 [V19.0] 高层决策 - 初始化防回头机制
         """
-        # 解析动作
         if isinstance(action, (tuple, list, np.ndarray)):
             subgoal_idx = int(action[0])
         else:
             subgoal_idx = int(action)
 
-        # 检查是否有当前请求
         if self.current_request is None:
-            # 即使没请求，也要返回 Mask 防止崩溃
             mask = np.ones(self.n, dtype=np.bool_)
             return self.get_state(), 0.0, True, False, {'no_request': True, 'action_mask': mask}
 
-        # 获取目的地列表
         dests = self.current_request.get('dest', [])
         if not dests:
             mask = np.ones(self.n, dtype=np.bool_)
             return self.get_state(), 0.0, True, False, {'no_destinations': True, 'action_mask': mask}
 
-        # 获取已连接的目的地
         connected = self.current_tree.get('connected_dests', set())
 
-        # 🔥 确保 unadded_dest_indices 已初始化
         if not hasattr(self, 'unadded_dest_indices'):
             self.unadded_dest_indices = set(range(len(dests)))
 
-        # 🔥 移除已连接的目的地索引
         for i, dest in enumerate(dests):
             if dest in connected:
                 self.unadded_dest_indices.discard(i)
 
-        # 检查是否还有未连接的目的地
         if not self.unadded_dest_indices:
-            # 所有目的地已连接，请求完成
             mask = np.ones(self.n, dtype=np.bool_)
             return self.get_state(), 0.0, True, False, {'all_connected': True, 'action_mask': mask}
 
-        # 🔥 选择目标节点
+        # VNF 检查
+        if self.current_branch_id is not None:
+            vnf_list = self.current_request.get('vnf', [])
+            current_node = self.current_node_location
+            vnf_progress = self._get_path_vnf_progress(current_node)
+            vnf_complete = (vnf_progress >= len(vnf_list))
+
+            if not vnf_complete:
+                # print(f"⚠️ [高层阻断] VNF未完成 ({vnf_progress}/{len(vnf_list)})")
+                low_level_mask = self.get_low_level_action_mask()
+                return self.get_state(), -5.0, False, False, {
+                    'vnf_incomplete': True, 'action_mask': low_level_mask
+                }
+
+        # 选择目标
         if subgoal_idx < len(self.unadded_dest_indices):
             dest_idx = sorted(self.unadded_dest_indices)[subgoal_idx]
         else:
-            # 如果索引超出范围，选择第一个
             dest_idx = sorted(self.unadded_dest_indices)[0]
 
         target_node = dests[dest_idx]
 
-        # 🔥 生成新的分支ID
         if not hasattr(self, '_branch_counter'):
             self._branch_counter = 0
         self._branch_counter += 1
         new_branch_id = f"branch_{self._branch_counter}"
 
-        self.current_branch_id = new_branch_id
+        # 🔥 智能选择分支起点
+        remaining_dests = [d for d in dests if d not in connected]
+        branch_start_node = self._select_best_fork_node(remaining_dests)
 
-        # 🔥🔥🔥 关键修复：存储分支状态（包括target_node）
+        if branch_start_node is None:
+            branch_start_node = self.current_node_location
+
+        # 设置当前分支状态
+        self.current_branch_id = new_branch_id
+        self.current_node_location = branch_start_node  # 移动到分支起点
+
+        # 记录分支信息
         if not hasattr(self, 'branch_states'):
             self.branch_states = {}
 
         self.branch_states[new_branch_id] = {
-            'target_node': target_node,  # 🔥 低层需要这个！
+            'target_node': target_node,
+            'start_node': branch_start_node,
             'dest_idx': dest_idx,
-            'created_at': self.decision_step,
-            'completed': False,
-            'failed': False,
-            'timeout': False,
-            'looping': False
+            'created_at': self.decision_step
         }
 
-        print(f"🌿 [高层] 新分支 {new_branch_id} -> {target_node}")
+        print(f"🌿 [智能分支] {new_branch_id}: 从{branch_start_node}出发 -> {target_node}")
 
-        # 🔥 重置低层计数器
-        if not hasattr(self, '_current_goal_steps'):
-            self._current_goal_steps = 0
-        else:
-            self._current_goal_steps = 0
+        # 重置状态
+        self._current_goal_steps = 0
+        self._node_visit_count = {}
+        self._prev_node = None
 
-        if not hasattr(self, '_vnf_complete_steps'):
-            self._vnf_complete_steps = 0
-        else:
-            self._vnf_complete_steps = 0
-
-        if hasattr(self, '_recent_positions'):
-            self._recent_positions = []
-
-        # 🔥🔥🔥 核心修复：在这里计算 Mask！🔥🔥🔥
-        # 因为下一步马上就是 Low-Level Agent 决策，它需要这个 Mask
         low_level_mask = self.get_low_level_action_mask()
-
-        # 返回状态继续低层决策
         info = {
             'branch_created': True,
             'target': target_node,
-            'branch_id': new_branch_id,
-            'action_mask': low_level_mask  # <--- 必须加上这一行！
+            'action_mask': low_level_mask
         }
-
         return self.get_state(), 0.0, False, False, info
 
     def step_low_level(self, action):
         """
-        🔥 [V17.0 清理版] 低层决策
-        不再在此处检查资源释放，完全依赖 TS 切换时的检查。
+        🔥 [V24.0 精简版] 核心改进：枢纽优先部署
         """
         target_node = int(action)
         current_node = self.current_node_location
         mask = self.get_low_level_action_mask()
 
+        # 🔥 快速失败检测（保持原逻辑）
+        if hasattr(self, '_failed_no_bandwidth') and self._failed_no_bandwidth:
+            print(f"\n❌ [快速失败] 检测到带宽不足或死循环，立即终止")
+            print(f"   当前位置: {current_node}")
+
+            delattr(self, '_failed_no_bandwidth')
+            if hasattr(self, '_reopen_count'):
+                delattr(self, '_reopen_count')
+
+            self._rollback_resources()
+            self._archive_request(success=False, already_rolled_back=True)
+
+            return self.get_state(), -150.0, True, True, {'error': 'no_bandwidth_or_deadloop'}
+
+        if np.sum(mask) == 0:
+            print(f"💀 [系统卡死] Mask兜底后仍为0，强制结束")
+            self._rollback_resources()
+            self._archive_request(success=False, already_rolled_back=True)
+            return self.get_state(), -100.0, True, True, {'error': 'deadlock_after_fallback'}
+
+        if mask[target_node] == 0:
+            if not hasattr(self, 'invalid_step_count'):
+                self.invalid_step_count = 0
+            self.invalid_step_count += 1
+
+            if self.invalid_step_count > 10:
+                print(f"🔁 [循环卡死] 连续 10 次非法动作，强制结束")
+                self._rollback_resources()
+                return self.get_state(), -100.0, True, True, {'error': 'stuck'}
+
+            return self.get_state(), -10.0, False, False, {'info': 'invalid'}
+        else:
+            self.invalid_step_count = 0
+
         info = {'success': False, 'action_mask': mask, 'decision_steps': self.decision_step}
-        reward = -0.1
+        reward = -0.05
         done, truncated = False, False
         self.decision_step += 1
 
-        # --- 1. 动态惩罚 (Reward 引导) ---
-        if not hasattr(self, '_node_visit_count'): self._node_visit_count = {}
-        self._node_visit_count[current_node] = self._node_visit_count.get(current_node, 0) + 1
-        visits = self._node_visit_count[current_node]
+        if not hasattr(self, 'action_stats'):
+            self.action_stats = {
+                'stay': 0, 'move': 0,
+                'stay_deploy': 0, 'stay_connect': 0, 'stay_waste': 0,
+                'move_follow': 0, 'move_deviate': 0,
+                'total_steps': 0, 'repeat_visits': 0,
+                'tx_success': 0, 'tx_fail': 0,
+                'virtual_deploy': 0, 'actual_deploy': 0
+            }
 
-        if visits > 2:
-            penalty = -0.5 * (visits - 2)
-            reward += penalty
+        if not hasattr(self, 'visit_history'):
+            self.visit_history = []
+        self.action_stats['total_steps'] += 1
 
-        # 熔断保护
-        if visits > 50:
-            print(f"🛑 [Loop Break] 节点{current_node} 滞留 >50 次，强制结束")
-            self._archive_request(success=False)
-            return self.get_state(), -100.0, True, True, info
+        if self.current_request and not hasattr(self, '_current_tx_id'):
+            req_id = self.current_request.get('id', f'req_{int(time.time())}')
+            self._current_tx_id = self.resource_mgr.begin_transaction(req_id)
 
-        # --- 2. 业务逻辑 ---
+        # 状态信息
         vnf_list = self.current_request.get('vnf', [])
         vnf_progress = self._get_path_vnf_progress(current_node)
         vnf_complete = (vnf_progress >= len(vnf_list))
         dests = self.current_request.get('dest', [])
         connected = self.current_tree.get('connected_dests', set())
         is_unconnected_dest = (current_node in dests) and (current_node not in connected)
+        remaining_dests = [d for d in dests if d not in connected]
 
-        # STAY
+        # 🔥 新增：获取当前节点度数，用于智能决策
+        current_neighbors = self.resource_mgr.get_neighbors(current_node)
+        current_degree = len(current_neighbors)
+
+        # 🔥 新增：记录部署节点度数
+        if not hasattr(self, '_deployment_node_degree'):
+            self._deployment_node_degree = None
+
+        # ================================================================
+        # STAY 动作 - 新增枢纽优先逻辑
+        # ================================================================
         if target_node == current_node:
             info['action_type'] = 'stay'
+            self.action_stats['stay'] += 1
+
             if vnf_complete:
                 if is_unconnected_dest:
                     self._connect_destination(current_node)
-                    reward += 300.0
+                    self.action_stats['stay_connect'] += 1
+
+                    base_reward = 50.0
+                    progress = len(self.current_tree['connected_dests']) / max(1, len(dests))
+                    reward += base_reward + progress * 100.0
+
+                    if len(remaining_dests) <= 2:
+                        reward += 50.0
+                        print(f"🎯 [残局连接] 剩余{len(remaining_dests)}个目的地")
+
                     if len(self.current_tree['connected_dests']) >= len(dests):
+                        if hasattr(self, '_current_tx_id'):
+                            self.resource_mgr.commit_transaction(self._current_tx_id)
+                            delattr(self, '_current_tx_id')
+
                         if self._finalize_request_with_pruning():
                             info.update({'request_completed': True, 'request_success': True})
-                            reward += 700.0
+                            reward += 800.0
                             done = True
                         else:
-                            reward -= 100.0
+                            reward = -150.0
                             done = True
+                            print(f"💔 [结算失败] 资源不足，给予重罚")
                     else:
-                        reward += 100.0
+                        reward += 20.0
                         self.current_branch_id = None
                         self._node_visit_count = {}
+                        self._prev_node = None
+                        self.visit_history = []
                 else:
+                    self.action_stats['stay_waste'] += 1
                     reward -= 5.0
             else:
-                if self._try_deploy(current_node):
-                    reward += 15.0
-                else:
-                    reward -= 5.0
+                # 🔥 新增：部署前智能检查
+                bw_req = self.current_request.get('bw_origin', 1.0)
 
-        # MOVE
+                # 🔥 检查1：当前节点是否适合部署（核心修复）
+                if current_degree <= 2 and bw_req > 2.0:
+                    # 边缘节点部署大带宽VNF - 高危行为
+                    print(f"⚠️ [边缘部署警告] 节点{current_node}(度{current_degree})不适合部署带宽{bw_req}的VNF")
+                    reward -= 8.0
+                    info['edge_deploy_warning'] = True
+                elif current_degree <= 1:
+                    # 叶子节点绝对不能部署
+                    print(f"❌ [叶子节点部署] 节点{current_node}是叶子节点，禁止部署")
+                    reward -= 10.0
+                    done = True  # 直接终止，避免浪费步数
+                    self._rollback_resources()
+                    return self.get_state(), reward, done, truncated, info
+                else:
+                    # 🔥 检查2：预判能否服务所有目的地
+                    can_serve_all = True
+                    if len(dests) > 1 and bw_req > 3.0:
+                        # 对于多目的地大带宽请求，检查当前节点是否有足够出路
+                        good_exits = 0
+                        for neighbor in current_neighbors:
+                            if self.resource_mgr.has_link(current_node, neighbor):
+                                # 检查带宽
+                                if hasattr(self.resource_mgr, 'check_link_resource'):
+                                    if self.resource_mgr.check_link_resource(current_node, neighbor, bw_req):
+                                        # 检查邻居度数
+                                        n_neighbors = self.resource_mgr.get_neighbors(neighbor)
+                                        if len(n_neighbors) >= 2:  # 邻居不要太边缘
+                                            good_exits += 1
+
+                        needed_exits = min(3, len(dests))
+                        if good_exits < needed_exits:
+                            can_serve_all = False
+                            print(f"⚠️ [出口不足] 节点{current_node}只有{good_exits}个优质出口，需要{needed_exits}")
+                            reward -= 5.0
+
+                    if can_serve_all:
+                        # 正常部署逻辑
+                        self.action_stats['virtual_deploy'] += 1
+                        if self._try_deploy(current_node):
+                            if hasattr(self, '_current_tx_id'):
+                                current_vnf_type = vnf_list[vnf_progress]
+                                cpu_reqs = self.current_request.get('cpu_origin', [])
+                                mem_reqs = self.current_request.get('memory_origin', [])
+                                c = cpu_reqs[current_vnf_type] if current_vnf_type < len(cpu_reqs) else 0
+                                m = mem_reqs[current_vnf_type] if current_vnf_type < len(mem_reqs) else 0
+
+                                if self.resource_mgr.reserve_node_resource(self._current_tx_id, current_node,
+                                                                           current_vnf_type, c, m):
+                                    self.resource_mgr.commit_transaction(self._current_tx_id)
+                                    self.action_stats['actual_deploy'] += 1
+                                    self.action_stats['stay_deploy'] += 1
+
+                                    # 🔥 记录部署节点度数
+                                    self._deployment_node_degree = current_degree
+                                    print(f"✅ [实际部署] 节点{current_node}(度{current_degree}) VNF{current_vnf_type}")
+
+                                    # 🔥 新增：中心性奖励
+                                    centrality_bonus = min(current_degree, 8) * 3.0
+                                    reward += 15.0 + centrality_bonus
+
+                                    self._current_tx_id = self.resource_mgr.begin_transaction(
+                                        f"req_{int(time.time())}_next")
+                                else:
+                                    self.action_stats['stay_waste'] += 1
+                                    reward -= 3.0
+                            else:
+                                reward += 10.0
+                        else:
+                            self.action_stats['stay_waste'] += 1
+                            reward -= 2.0
+
+        # ================================================================
+        # MOVE 动作 - 保持原逻辑，添加中心性引导
+        # ================================================================
         else:
             info['action_type'] = 'move'
-            if self.resource_mgr.has_link(current_node, target_node):
-                self.current_node_location = target_node
-                edge_key = tuple(sorted([current_node, target_node]))
-                self.current_tree.setdefault('tree', {})[edge_key] = self.current_request.get('bw_origin', 1.0)
-                self.nodes_on_tree.add(target_node)
+            self.action_stats['move'] += 1
 
-                if vnf_complete and is_unconnected_dest:
-                    reward += 50.0
+            if self.resource_mgr.has_link(current_node, target_node):
+                if target_node in self.visit_history:
+                    self.action_stats['repeat_visits'] += 1
+                    reward -= 2.0
+
+                self.visit_history.append(target_node)
+                edge_key = tuple(sorted([current_node, target_node]))
+                tree_edges = self.current_tree.get('tree', {})
+                bw_need = self.current_request.get('bw_origin', 1.0)
+
+                if edge_key not in tree_edges:
+                    if hasattr(self, '_current_tx_id'):
+                        if self.resource_mgr.reserve_link_resource(self._current_tx_id, current_node,
+                                                                   target_node, bw_need):
+                            if self.resource_mgr.commit_transaction(self._current_tx_id):
+                                self.current_node_location = target_node
+                                tree_edges[edge_key] = bw_need
+                                self.nodes_on_tree.add(target_node)
+
+                                self._current_tx_id = self.resource_mgr.begin_transaction(
+                                    f"req_{int(time.time())}_move")
+
+                                info['new_link_added'] = True
+                                info['success'] = True
+                                reward += 0.5
+                            else:
+                                reward -= 5.0
+                                info['commit_failed'] = True
+                        else:
+                            reward -= 10.0
+                            info['link_reserve_failed'] = True
+                            return self.get_state(), reward, done, truncated, info
+                    else:
+                        if self.resource_mgr.allocate_link_resource(current_node, target_node, bw_need):
+                            self.current_node_location = target_node
+                            tree_edges[edge_key] = bw_need
+                            self.nodes_on_tree.add(target_node)
+                            info['success'] = True
+                            reward += 0.5
+                        else:
+                            reward -= 10.0
+                            info['fallback_failed'] = True
                 else:
-                    reward -= 0.05
+                    self.current_node_location = target_node
+                    info['success'] = True
+                    reward += 0.1
+
+                    if hasattr(self, '_prev_node'):
+                        if self._prev_node == current_node:
+                            self.action_stats['move_follow'] += 1
+                        else:
+                            self.action_stats['move_deviate'] += 1
+
+                    self._prev_node = current_node
+
+                if not hasattr(self, '_node_visit_count'):
+                    self._node_visit_count = {}
+                self._node_visit_count[target_node] = self._node_visit_count.get(target_node, 0) + 1
+
             else:
                 reward -= 10.0
+                info['no_link'] = True
 
-        if not done and not truncated:
-            info['action_mask'] = self.get_low_level_action_mask()
-        else:
-            info['action_mask'] = np.zeros(self.n, dtype=np.float32)
+        # ================================================================
+        # 🔥 新增：部署后的智能检查（不增加新方法）
+        # ================================================================
+        if not done and vnf_complete and self._deployment_node_degree is not None:
+            if self._deployment_node_degree <= 2:
+                current_connected = self.current_tree.get('connected_dests', set())
+                current_remaining = [d for d in dests if d not in current_connected]
 
-        info['time_slot'] = self.current_time_slot
-        info['time_step'] = self.time_step
+                if len(current_remaining) >= 2:
+                    print(
+                        f"⚠️ [边缘部署预警] 在度数{self._deployment_node_degree}的节点部署，可能无法完成剩余{len(current_remaining)}个目的地")
+
+                    # 简单检查：是否能从当前位置到达任意剩余目的地
+                    reachable = False
+                    for d in current_remaining[:2]:
+                        path = self._a_star_search_with_tree_awareness(self.current_node_location, d)
+                        if path and len(path) > 1:
+                            reachable = True
+                            break
+
+                    if not reachable:
+                        print(f"⛔ [边缘部署熔断] 从边缘节点{self.current_node_location}无法到达目的地")
+                        self._rollback_resources()
+                        self._archive_request(success=False, already_rolled_back=True)
+                        return self.get_state(), -180.0, True, True, {'error': 'edge_deployment_fatal'}
+
+        # 超时检查
+        if hasattr(self, '_current_goal_steps') and self._current_goal_steps > 600:
+            print(f"⏰ [超时终止] 步数过多({self._current_goal_steps})，强制结束")
+            if hasattr(self, 'action_stats'):
+                print(f"📊 统计: 总步数={self.action_stats['total_steps']}, "
+                      f"部署={self.action_stats['actual_deploy']}, "
+                      f"连接={self.action_stats['stay_connect']}")
+
+            self._rollback_resources()
+            return self.get_state(), -150.0, True, True, info
 
         return self.get_state(), reward, done, truncated, info
 
     def get_low_level_action_mask(self):
         """
-        🔥 [V16.3 防崩溃版]
-        增加：对 self.current_request 为 None 的情况进行防御
+        🔥 [V24.0 精简版] 核心改进：
+        1. 部署阶段：禁止在低度数节点部署大带宽VNF
+        2. 路由阶段：加强目的地引导
+        3. 智能兜底：避免死循环
         """
         mask = np.zeros(self.n, dtype=np.float32)
 
-        # 🔥🔥🔥 核心修复：如果没有请求（例如刚结算完），直接返回全0或全1掩码
         if self.current_request is None:
-            # 返回全1防止某些算法除以0，或者全0表示无动作
-            # 由于此时 episode 已经 done，这个 mask 不会影响训练
             mask[:] = 1.0
             return mask
 
-        current_node = self.current_node_location
-
-        # 1. 物理：邻居全开
-        neighbors = self.resource_mgr.get_neighbors(current_node)
-        for n in neighbors:
-            mask[n] = 1.0
-
-        # 2. 逻辑：STAY 仅在有用时开
-        vnf_list = self.current_request.get('vnf', [])
-        vnf_progress = self._get_path_vnf_progress(current_node)
-        vnf_complete = (vnf_progress >= len(vnf_list))
-
+        current = self.current_node_location
         dests = self.current_request.get('dest', [])
         connected = self.current_tree.get('connected_dests', set())
 
-        can_deploy = not vnf_complete
-        can_connect = (current_node in dests) and (current_node not in connected) and vnf_complete
+        vnf_list = self.current_request.get('vnf', [])
+        vnf_progress = self._get_path_vnf_progress(current)
+        vnf_complete = (vnf_progress >= len(vnf_list))
 
-        if can_deploy or can_connect:
-            mask[current_node] = 1.0
+        remaining_dests = [d for d in dests if d not in connected]
+        is_unconnected_dest = (current in remaining_dests)
+
+        # 获取邻居和当前节点度数
+        if hasattr(self, 'resource_mgr'):
+            neighbors = self.resource_mgr.get_neighbors(current)
+            current_neighbors = neighbors
+            current_degree = len(current_neighbors)
         else:
-            mask[current_node] = 0.0
+            neighbors = []
+            current_degree = 0
 
-        # 3. 兜底
+        # ================================
+        # 1) 基础连通性 + 带宽检查
+        # ================================
+        bw_req = self.current_request.get('bw_origin', 1.0)
+        tree_edges = self.current_tree.get('tree', {})
+
+        for n in neighbors:
+            edge = tuple(sorted([current, n]))
+            is_on_tree = (edge in tree_edges)
+
+            if not self.resource_mgr.has_link(current, n):
+                continue
+
+            if not is_on_tree:
+                if hasattr(self.resource_mgr, 'check_link_resource'):
+                    if not self.resource_mgr.check_link_resource(current, n, bw_req):
+                        continue
+
+            mask[n] = 0.5
+
+        # ================================
+        # 2) VNF部署阶段（枢纽优先）
+        # ================================
+        if not vnf_complete:
+            print(
+                f"🔧 [部署阶段] 节点{current}(度{current_degree}) VNF进度{vnf_progress}/{len(vnf_list)} 带宽需求{bw_req}")
+
+            # 🔥 关键修复：根据带宽需求动态调整部署策略
+            if bw_req > 5.0:
+                # 大带宽需求：必须在高度数节点部署
+                if current_degree >= 4:
+                    mask[current] = 5.0  # 中心节点高权重
+                    print(f"   ✅ 大带宽需求，当前节点度{current_degree}适合部署")
+                elif current_degree >= 3:
+                    mask[current] = 1.5  # 中等节点中等权重
+                else:
+                    mask[current] = 0.1  # 边缘节点几乎禁止
+                    print(f"   ⚠️ 大带宽需求，当前节点度{current_degree}不适合部署")
+            elif bw_req > 2.0:
+                # 中等带宽：避免在叶子节点部署
+                if current_degree >= 3:
+                    mask[current] = 3.0
+                elif current_degree == 2:
+                    mask[current] = 1.0
+                else:
+                    mask[current] = 0.1  # 叶子节点禁止
+            else:
+                # 小带宽：允许在更多节点部署
+                mask[current] = 2.0 if current_degree >= 2 else 0.5
+
+            # 🔥 邻居移动权重：引导向更高度数节点
+            for n in neighbors:
+                if mask[n] == 0.0:
+                    continue
+
+                if n in dests and n in connected:
+                    mask[n] = 0.0
+                    continue
+
+                # 获取邻居度数
+                n_neighbors = self.resource_mgr.get_neighbors(n)
+                n_degree = len(n_neighbors)
+
+                # 🔥 核心逻辑：向更中心的节点移动
+                if n_degree > current_degree:
+                    # 向更高度数节点移动：额外奖励
+                    degree_bonus = min((n_degree - current_degree) * 0.5, 2.0)
+                    if n not in self.nodes_on_tree:
+                        mask[n] = 1.5 + degree_bonus
+                    else:
+                        mask[n] = 0.7 + degree_bonus
+                    print(f"   ↗️ 节点{n}(度{n_degree})比当前更中心，推荐前往")
+                elif n_degree < 3 and bw_req > 2.0:
+                    # 避免向边缘节点移动（大带宽需求时）
+                    mask[n] *= 0.3
+                    print(f"   ↘️ 节点{n}(度{n_degree})太边缘，降低权重")
+
+        # ================================
+        # 3) 路由阶段（VNF完成）
+        # ================================
+        else:
+            if is_unconnected_dest:
+                mask[current] = 10.0
+            else:
+                mask[current] = 0.0
+
+            cached_nodes = getattr(self, '_cached_path_nodes', set())
+
+            for n in neighbors:
+                if mask[n] > 0 and n in cached_nodes:
+                    mask[n] = max(mask[n], 4.0)
+
+                if n in remaining_dests:
+                    if len(remaining_dests) <= 2:
+                        mask[n] = 10.0
+                    else:
+                        mask[n] = max(mask[n], 3.0)
+
+                if n in connected and n in dests:
+                    mask[n] = 0.0
+
+        # ================================
+        # 4) 防止回头
+        # ================================
+        if hasattr(self, '_prev_node') and self._prev_node is not None:
+            p = self._prev_node
+            if p in neighbors and mask[p] > 0:
+                mask[p] *= 0.1
+
+        # ================================
+        # 5) 兜底机制
+        # ================================
         if np.sum(mask) == 0:
-            mask[current_node] = 1.0
+            print(f"\n⚠️ [Mask全0兜底] 当前节点{current}(度{current_degree})")
 
+            # 首先尝试重新开放被带宽检查屏蔽的邻居
+            reopened = 0
+            for n in neighbors:
+                if self.resource_mgr.has_link(current, n):
+                    # 放宽带宽检查：尝试使用最小带宽(1.0)检查
+                    if hasattr(self.resource_mgr, 'check_link_resource'):
+                        if self.resource_mgr.check_link_resource(current, n, 1.0):
+                            mask[n] = 0.3
+                            reopened += 1
+                            print(f"   ✅ 放宽带宽检查，开放节点{n}")
+
+            # 如果还是没有，允许STAY
+            if np.sum(mask) == 0:
+                mask[current] = 0.1
+                print(f"   ⚠️ 无可用邻居，允许STAY")
+            else:
+                print(f"   🔄 重新开放了{reopened}个节点")
+
+        mask = np.clip(mask, 0.0, 10.0)
         return mask
     def get_state(self):
         """
@@ -1358,10 +1777,34 @@ class SFC_HIRL_Env(gym.Env):
     def _init_path_planner(self):
         """初始化路径规划缓存"""
         self._path_cache = {}
-    def _a_star_search(self, start, goal):
-        """标准的 A* 搜索算法 - 修复版"""
+
+    def _a_star_search_with_tree_awareness(self, start, goal):
+        """
+        🔥 [智能A*搜索 V2.1] 添加超时机制，防止长时间搜索
+        """
         if start == goal:
             return [start]
+
+        # 缓存检查
+        cache_key = (start, goal, frozenset(self.nodes_on_tree))
+        if hasattr(self, '_path_cache') and cache_key in self._path_cache:
+            return self._path_cache[cache_key]
+
+        # 🔥 检查失败缓存
+        if hasattr(self, '_failed_paths_cache'):
+            if (start, goal) in self._failed_paths_cache:
+                return None
+
+        # 检查是否已经在同一棵树上
+        if start in self.nodes_on_tree and goal in self.nodes_on_tree:
+            tree_path = self._find_path_on_tree(start, goal)
+            if tree_path:
+                if hasattr(self, '_path_cache'):
+                    self._path_cache[cache_key] = tree_path
+                return tree_path
+
+        bw_req = self.current_request.get('bw_origin', 1.0) if self.current_request else 1.0
+        tree_edges = self.current_tree.get('tree', {})
 
         import heapq
         open_set = []
@@ -1371,35 +1814,154 @@ class SFC_HIRL_Env(gym.Env):
         g_score = {start: 0}
 
         def heuristic(n):
-            return 0
+            base_dist = self._get_distance(n, goal)
+            tree_bonus = -5 if n in self.nodes_on_tree else 0
+            visit_penalty = 0
+            if hasattr(self, '_node_visit_count'):
+                visit_penalty = self._node_visit_count.get(n, 0) * 2
+            return max(0, base_dist + tree_bonus + visit_penalty)
 
         f_score = {start: heuristic(start)}
+
+        # 🔥 添加访问计数
+        visited_count = 0
+        max_visits = 30  # 最多访问30个节点
 
         while open_set:
             current_f, current = heapq.heappop(open_set)
 
+            # 🔥 超时检查
+            visited_count += 1
+            if visited_count > max_visits:
+                # 缓存失败结果
+                if not hasattr(self, '_failed_paths_cache'):
+                    self._failed_paths_cache = set()
+                self._failed_paths_cache.add((start, goal))
+                return None
+
             if current == goal:
-                # 重建路径
                 path = [current]
                 while current in came_from:
                     current = came_from[current]
                     path.append(current)
                 path.reverse()
+
+                if hasattr(self, '_path_cache'):
+                    self._path_cache[cache_key] = path
                 return path
 
-            # 🔥 修复：直接遍历所有节点，检查是否有链接
+            # 获取邻居
             neighbors = []
             for v in range(self.n):
                 if v != current and self.resource_mgr.has_link(current, v):
+                    edge = tuple(sorted([current, v]))
+                    is_on_tree = (edge in tree_edges)
+
+                    if not is_on_tree:
+                        if hasattr(self.resource_mgr, 'check_link_resource'):
+                            if not self.resource_mgr.check_link_resource(current, v, bw_req):
+                                continue
+
                     neighbors.append(v)
 
             for neighbor in neighbors:
-                tentative_g = g_score[current] + 1
+                move_cost = 1.0
+                if neighbor not in self.nodes_on_tree:
+                    move_cost = 2.0
+                elif current in self.nodes_on_tree and neighbor in self.nodes_on_tree:
+                    move_cost = 0.5
+
+                tentative_g = g_score[current] + move_cost
+
                 if neighbor not in g_score or tentative_g < g_score[neighbor]:
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g
                     f_score[neighbor] = tentative_g + heuristic(neighbor)
                     heapq.heappush(open_set, (f_score[neighbor], neighbor))
+
+        # 搜索失败，缓存结果
+        if not hasattr(self, '_failed_paths_cache'):
+            self._failed_paths_cache = set()
+        self._failed_paths_cache.add((start, goal))
+
+        if hasattr(self, 'action_stats'):
+            print(f"⚠️ [A*失败] 从{start}到{goal}找不到带宽充足的路径（需要带宽{bw_req}）")
+
+        return None
+    def _select_best_fork_node(self, remaining_dests):
+        """
+        智能选择分支节点：基于A*路径和树结构
+        """
+        if not remaining_dests or not hasattr(self, 'nodes_on_tree'):
+            return None
+
+        tree_nodes = list(self.nodes_on_tree)
+        if not tree_nodes:
+            # 如果没有树节点，从源点开始
+            return self.current_request.get('source', 0)
+
+        best_node = None
+        best_score = float('inf')
+
+        for tree_node in tree_nodes:
+            # 计算从该树节点到所有剩余目的地的总路径长度
+            total_path_length = 0
+            reachable_count = 0
+
+            for dest in remaining_dests:
+                path = self._a_star_search_with_tree_awareness(tree_node, dest)
+                if path:
+                    total_path_length += len(path) - 1
+                    reachable_count += 1
+
+            if reachable_count == len(remaining_dests):
+                # 所有目的地都可从该节点到达
+                # 考虑节点访问次数（避免热点）
+                visit_penalty = self._node_visit_count.get(tree_node, 0) * 5
+                score = total_path_length + visit_penalty
+
+                if score < best_score:
+                    best_score = score
+                    best_node = tree_node
+
+        # 如果找不到最佳节点，选择离源点最近的树节点
+        if best_node is None:
+            source = self.current_request.get('source', 0)
+            distances = [(self._get_distance(node, source), node) for node in tree_nodes]
+            distances.sort()
+            best_node = distances[0][1] if distances else tree_nodes[0]
+
+        print(f"🌳 [智能分支] 选择节点{best_node}作为分支点，可到达{len(remaining_dests)}个目的地")
+        return best_node
+    def _find_path_on_tree(self, start, goal):
+        """
+        在当前树上寻找路径（不建新边）
+        """
+        if start == goal:
+            return [start]
+
+        # 构建树上邻接表
+        tree_adj = {}
+        tree = self.current_tree.get('tree', {})
+        for (u, v), bw in tree.items():
+            tree_adj.setdefault(u, []).append(v)
+            tree_adj.setdefault(v, []).append(u)
+
+        # BFS搜索
+        from collections import deque
+        visited = {start}
+        queue = deque([(start, [start])])
+
+        while queue:
+            current, path = queue.popleft()
+
+            if current == goal:
+                return path
+
+            for neighbor in tree_adj.get(current, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, path + [neighbor]))
 
         return None
     def _get_distance(self, u, v):
@@ -1447,61 +2009,93 @@ class SFC_HIRL_Env(gym.Env):
                 return (self.topo[from_node, to_node] > 0)
         except:
             return True
+
     def _check_node_resources(self, node_id: int) -> bool:
         """
-        检查节点资源是否充足 (修复版: 增加索引越界保护)
+        🔥 [V3.5 修复版] 检查资源（含虚拟预扣）
+        解决“草图画得太满，落地时资源不足”的问题
         """
         try:
             if self.current_request is None:
                 return True
 
-            # 获取当前VNF需求
+            # 1. 获取当前要部署的 VNF 的资源需求
+            # ---------------------------------------------------
             vnf_list = self.current_request.get('vnf', [])
-            if not vnf_list:
-                return True
 
-            # 获取当前需要部署的VNF索引
-            deployed_count = len([k for k in self.current_tree.get('placement', {}).keys() if isinstance(k, tuple)])
-            if deployed_count >= len(vnf_list):
-                return True  # 所有VNF已部署
+            # 计算当前是第几个 VNF (根据 placement 的数量推断)
+            # 注意：这里假设是按顺序部署。如果是乱序，需要传参进来，但通常 Agent 是顺序的
+            deployed_count = 0
+            placement = self.current_tree.get('placement', {})
+            for k in placement.keys():
+                # 过滤掉非部署记录
+                if isinstance(k, tuple) and len(k) >= 2:
+                    deployed_count += 1
 
             vnf_idx = deployed_count
 
-            # 🔥 [安全修正] 确保索引不越界
-            # 有些数据可能是 cpu_reqs[vnf_type] 而不是 [vnf_idx]，这里假设是按顺序的 [idx]
-            cpu_reqs = self.current_request.get('vnf_cpu', []) or \
-                       self.current_request.get('cpu_origin', []) or \
-                       self.current_request.get('cpu', [1.0] * len(vnf_list))
+            # 如果已经部署完了，就不需要检查了
+            if vnf_idx >= len(vnf_list):
+                return True
 
-            # 安全获取需求值
-            if isinstance(cpu_reqs, (list, np.ndarray)):
-                if vnf_idx < len(cpu_reqs):
-                    required_cpu = float(cpu_reqs[vnf_idx])
-                else:
-                    required_cpu = 1.0  # 默认值
-            else:
-                required_cpu = float(cpu_reqs)
+            # 获取需求值
+            cpu_reqs = self.current_request.get('cpu_origin', []) or \
+                       self.current_request.get('vnf_cpu', [])
+            mem_reqs = self.current_request.get('memory_origin', []) or \
+                       self.current_request.get('mem_origin', [])
 
-            # 获取节点可用资源
-            available_cpu = 100.0  # 默认值
+            # 安全获取当前 VNF 的需求
+            req_cpu = float(cpu_reqs[vnf_idx]) if vnf_idx < len(cpu_reqs) else 1.0
+            req_mem = float(mem_reqs[vnf_idx]) if vnf_idx < len(mem_reqs) else 1.0
 
-            if hasattr(self, 'resource_mgr'):
-                if hasattr(self.resource_mgr, 'nodes') and isinstance(self.resource_mgr.nodes, list):
-                    if 0 <= node_id < len(self.resource_mgr.nodes):
-                        available_cpu = self.resource_mgr.nodes[node_id].get('cpu', 100.0)
-                # ... 其他获取方式保持不变 ...
+            # 2. 🔥 [核心] 计算当前请求已在草图上预订的资源 (Virtual Reserved)
+            # ---------------------------------------------------
+            reserved_cpu = 0.0
+            reserved_mem = 0.0
 
-            # 留10%余量
-            return available_cpu >= required_cpu * 1.1
+            for key, info in placement.items():
+                # 只统计当前节点 (node_id) 的预订情况
+                p_node = info.get('node')
+                if p_node == node_id:
+                    reserved_cpu += info.get('cpu_used', 0.0)
+                    reserved_mem += info.get('mem_used', 0.0)
+
+            # 3. 获取物理剩余资源 (Physical Available)
+            # ---------------------------------------------------
+            avail_cpu = 0.0
+            avail_mem = 0.0
+
+            # 适配 resource_mgr 的不同实现结构
+            nodes_data = self.resource_mgr.nodes
+            if isinstance(nodes_data, list):  # List[Dict]
+                node_info = nodes_data[node_id]
+                avail_cpu = node_info.get('cpu', 0.0)
+                avail_mem = node_info.get('memory', node_info.get('mem', 0.0))
+            elif isinstance(nodes_data, dict):  # SOA Dict
+                avail_cpu = nodes_data.get('cpu', [])[node_id]
+                avail_mem = nodes_data.get('memory', [])[node_id]
+
+            # 4. 最终判定：物理余额 - 虚拟预扣 >= 当前需求
+            # ---------------------------------------------------
+            # 加上 1.05 倍的安全因子，防止浮点数误差
+            cpu_ok = (avail_cpu - reserved_cpu) >= (req_cpu * 1.05)
+            mem_ok = (avail_mem - reserved_mem) >= (req_mem * 1.05)
+
+            # 调试日志 (可选，排查问题时打开)
+            # if not cpu_ok:
+            #     print(f"🛑 [资源预警] 节点{node_id} 拒绝部署 VNF{vnf_idx}")
+            #     print(f"   物理余: {avail_cpu:.2f}, 草图占: {reserved_cpu:.2f}, 需: {req_cpu:.2f}")
+
+            return cpu_ok and mem_ok
 
         except Exception as e:
-            # print(f"⚠️ 资源检查警告: {e}")
-            return True  # 出错时放行，避免中断训练
+            # print(f"⚠️ 资源检查报错: {e}")
+            return False
 
     def _try_deploy(self, node):
         """
-        🔥 [V12.1 完整虚拟部署版]
-        职责：仅验证资源可行性并记录位置，不实际扣除物理资源，彻底解决双重扣费问题。
+        🔥 [V12.5 修复版] 强制使用带预扣的资源检查
+        彻底解决“假装有资源”导致的 Overbooking 问题
         """
         if self.current_request is None or self.current_branch_id is None:
             return False
@@ -1521,28 +2115,26 @@ class SFC_HIRL_Env(gym.Env):
         next_vnf_idx = current_progress
         next_vnf_type = vnf_list[next_vnf_idx]
 
-        # 4. 资源预检：根据请求中的原始需求检查 CPU 和内存
-        cpu_needs = self.current_request.get('cpu_origin', [1.0] * len(vnf_list))
-        mem_needs = self.current_request.get('memory_origin', [1.0] * len(vnf_list))
+        # 4. 获取资源需求
+        cpu_needs = self.current_request.get('cpu_origin', []) or self.current_request.get('vnf_cpu', [])
+        mem_needs = self.current_request.get('memory_origin', []) or self.current_request.get('mem_origin', [])
 
-        c_req = cpu_needs[next_vnf_idx] if next_vnf_idx < len(cpu_needs) else 1.0
-        m_req = mem_needs[next_vnf_idx] if next_vnf_idx < len(mem_needs) else 1.0
+        # 安全获取需求值
+        c_req = float(cpu_needs[next_vnf_idx]) if next_vnf_idx < len(cpu_needs) else 1.0
+        m_req = float(mem_needs[next_vnf_idx]) if next_vnf_idx < len(mem_needs) else 1.0
 
-        # 调用资源管理器检查剩余量 (1.1 倍安全余量)
-        if hasattr(self.resource_mgr, 'check_node_resource'):
-            if not self.resource_mgr.check_node_resource(node, next_vnf_type, c_req * 1.1, m_req * 1.1):
-                return False
-        else:
-            # 兜底检查：直接读属性
-            avail_c = self.resource_mgr.C[node] if hasattr(self.resource_mgr, 'C') else 100.0
-            if avail_c < c_req:
-                return False
+        # =================================================================
+        # 🔥🔥🔥 核心修改点：调用带“虚拟账本”的检查函数
+        # =================================================================
+        # 这一步会计算：物理剩余 - (当前请求已在草图中预订的资源) >= 新需求 ?
+        if not self._check_node_resources(node):
+            # 调试日志：如果被拒绝，说明算上预扣后资源不足
+            # print(f"🚫 [虚拟部署拒绝] 节点{node} 无法容纳 VNF{next_vnf_type} (预扣不足)")
+            return False
 
-        # 5. 🔥 执行虚拟部署记录 (Placement)
-        # 存储格式: (节点ID, VNF类型, 分支ID) -> VNF链索引
+        # 5. 执行虚拟部署记录 (Placement)
         key = (node, next_vnf_type, self.current_branch_id)
 
-        # 记录详细方案信息，供结算阶段 _finalize_request_with_pruning 使用
         if 'placement' not in self.current_tree:
             self.current_tree['placement'] = {}
 
@@ -1593,31 +2185,127 @@ class SFC_HIRL_Env(gym.Env):
 
         return released_count
 
-    def _archive_request(self, success=False):
-        """🔥 [V16.2 记账版] 成功时保存资源快照，失败时回滚"""
-        if self.current_request is None: return
-        req = self.current_request
+    def _archive_request(self, success=False, already_rolled_back=False):
+        """
+        🔥 [V16.4 防重复版] 成功时保存资源快照并加入跟踪，失败时回滚
 
+        Args:
+            success: 请求是否成功
+            already_rolled_back: 是否已经回滚过（防止重复回滚）
+        """
+        if self.current_request is None:
+            return
+
+        req = self.current_request
+        req_id = req.get('id', id(req))
+        if self.enable_visualization and hasattr(self, 'visualizer'):
+            try:
+                subdir = 'success' if success else 'fail'
+                save_path = f'visualization/{subdir}/request_{req_id}.png'
+
+                self.visualizer.visualize_request_tree(
+                    request=self.current_request,
+                    save_path=save_path,
+                    show=False
+                )
+
+                if success or req_id % 100 == 0:
+                    print(f"🎨 [可视化] 已保存: {save_path}")
+            except Exception as e:
+                pass  # 可视化失败不影响训练
         if success:
-            # === 成功：保存账本 ===
+            # =====================================================================
+            # 成功分支：保存账本 + 添加到生命周期管理器
+            # =====================================================================
             import copy
+
             req['resources_allocated'] = {
                 'placement': copy.deepcopy(self.current_tree.get('placement', {})),
                 'tree': copy.deepcopy(self.current_tree.get('tree', {}))
             }
+
             if hasattr(self, 'request_manager'):
-                self.request_manager.add_request(req)
+                try:
+                    self.request_manager.add_request(req)
+
+                    arrival = req.get('arrival_time', self.time_step)
+                    lifetime = req.get('lifetime', 5.0)
+                    expire_time = arrival + lifetime
+
+                    print(f"📝 [生命周期] 请求 {req_id} 已加入跟踪")
+                    print(f"   到达时间: {arrival:.2f}s")
+                    print(f"   生存时长: {lifetime:.2f}s")
+                    print(f"   过期时间: {expire_time:.2f}s")
+                except Exception as e:
+                    print(f"⚠️ [生命周期] 请求 {req_id} 添加失败: {e}")
+            else:
+                print(f"⚠️ [生命周期] request_manager 未初始化！")
 
             self.total_requests_accepted += 1
             if hasattr(self, 'served_dest_count'):
                 self.served_dest_count += len(req.get('dest', []))
+
+            print(f"✅ [归档成功] 请求 {req_id} 已完成，等待过期释放")
+
         else:
-            # === 失败：回滚 ===
-            self._rollback_request_resources(req)
+            # =====================================================================
+            # 失败分支：回滚虚拟资源（除非已经回滚过）
+            # =====================================================================
+            if already_rolled_back:
+                print(f"ℹ️ [归档失败] 请求 {req_id} 失败（资源已回滚，跳过重复回滚）")
+            else:
+                print(f"❌ [归档失败] 请求 {req_id} 失败，开始回滚虚拟资源...")
+
+                # 调用现有的回滚方法
+                self._rollback_request_resources(req)
+
+                # 额外回滚当前树占用的虚拟资源
+                placement = self.current_tree.get('placement', {})
+                tree_edges = self.current_tree.get('tree', {})
+
+                restored_cpu = 0.0
+                restored_bw = 0.0
+
+                # 回滚节点资源
+                for key, info in placement.items():
+                    if isinstance(key, tuple) and len(key) >= 2:
+                        node = key[0]
+                        vnf_type = key[1]
+
+                        if isinstance(info, dict):
+                            c = info.get('cpu_used', 1.0)
+                            m = info.get('mem_used', 1.0)
+                        else:
+                            c, m = 1.0, 1.0
+
+                        if hasattr(self.resource_mgr, 'release_node_resource'):
+                            try:
+                                self.resource_mgr.release_node_resource(node, vnf_type, c, m)
+                                restored_cpu += c
+                            except Exception as e:
+                                print(f"⚠️ 回滚节点 {node} 资源失败: {e}")
+
+                # 回滚链路资源
+                bw = req.get('bw_origin', 1.0)
+                for edge_key in tree_edges.keys():
+                    u, v = edge_key
+                    if hasattr(self.resource_mgr, 'release_link_resource'):
+                        try:
+                            self.resource_mgr.release_link_resource(u, v, bw)
+                            restored_bw += bw
+                        except Exception as e:
+                            print(f"⚠️ 回滚链路 {edge_key} 资源失败: {e}")
+
+                if restored_cpu > 0 or restored_bw > 0:
+                    print(f"♻️ [虚拟资源回滚] 节点: +{restored_cpu:.1f} CPU | 链路: +{restored_bw:.1f} BW")
 
         # 重置状态
-        self.current_tree = {'hvt': np.zeros((self.n, self.K_vnf), dtype=np.float32),
-                             'tree': {}, 'placement': {}, 'connected_dests': set()}
+        self.current_tree = {
+            'hvt': np.zeros((self.n, self.K_vnf), dtype=np.float32),
+            'tree': {},
+            'placement': {},
+            'connected_dests': set()
+        }
         self.current_request = None
         self.current_branch_id = None
         self.nodes_on_tree = set()
@@ -2153,55 +2841,111 @@ class SFC_HIRL_Env(gym.Env):
         print(f"   当前已连接: {self.current_tree['connected_dests']}")
 
     def _validate_sfc_paths(self, parent_map):
-        """🕵️ [SFC 质检] 验证 VNF 链完整性"""
-        if not self.current_request: return False, ["No request"]
+        """
+        🔥 [增强版] 验证 SFC 路径完整性
+
+        严格检查：
+        1. 每条路径必须经过完整的 VNF 链
+        2. VNF 必须按顺序部署
+        3. 不允许跳过 VNF
+        """
+        if not self.current_request:
+            return False, ["No request"]
 
         source = self.current_request['source']
         dests = self.current_request.get('dest', [])
         required_vnfs = self.current_request.get('vnf', [])
 
-        if not required_vnfs: return True, []
+        # 如果没有 VNF 要求，直接通过
+        if not required_vnfs:
+            return True, []
 
         # 构建节点 VNF 映射
-        node_vnf_dict = {}
+        node_vnf_dict = {}  # {node: [vnf_types]}
         placement = self.current_tree.get('placement', {})
+
         for key, info in placement.items():
             if isinstance(key, tuple) and len(key) >= 2:
                 n, v = key[0], key[1]
-                if n not in node_vnf_dict: node_vnf_dict[n] = []
+                if n not in node_vnf_dict:
+                    node_vnf_dict[n] = []
                 node_vnf_dict[n].append(v)
 
+        print(f"\n🔍 [SFC 验证] 开始验证路径...")
+        print(f"   源节点: {source}")
+        print(f"   目的地: {dests}")
+        print(f"   所需 VNF 链: {required_vnfs}")
+        print(f"   已部署 VNF: {node_vnf_dict}")
+
         errors = []
+
+        # 验证每个目的地的路径
         for dest in dests:
-            # 回溯路径
+            # 1. 回溯路径
             path = []
             curr = dest
             while curr is not None:
                 path.append(curr)
-                if curr == source: break
+                if curr == source:
+                    break
                 curr = parent_map.get(curr)
 
+            # 2. 检查路径完整性
             if not path or path[-1] != source:
-                errors.append(f"Dest {dest}: Path broken")
+                error = f"Dest {dest}: Path broken (无法从源节点到达)"
+                errors.append(error)
+                print(f"   ❌ {error}")
                 continue
 
             path.reverse()  # Source -> Dest
+            print(f"   📍 目的地 {dest} 的路径: {path}")
 
-            # 验证顺序
-            vnf_ptr = 0
+            # 3. ✅ 严格验证：收集路径上的 VNF，检查是否完整且有序
+            path_vnfs = []  # 按路径顺序收集到的 VNF
+
             for node in path:
-                if vnf_ptr >= len(required_vnfs): break
-                deployed = node_vnf_dict.get(node, [])
-                while vnf_ptr < len(required_vnfs):
-                    if required_vnfs[vnf_ptr] in deployed:
-                        vnf_ptr += 1
-                    else:
-                        break
+                if node in node_vnf_dict:
+                    # 这个节点部署了 VNF
+                    deployed = node_vnf_dict[node]
+                    for vnf in deployed:
+                        path_vnfs.append((node, vnf))
+                        print(f"      节点 {node}: VNF {vnf}")
 
-            if vnf_ptr < len(required_vnfs):
-                errors.append(f"Dest {dest}: Missing VNFs starting from {required_vnfs[vnf_ptr]}")
+            # 4. 检查是否包含所有必需的 VNF
+            collected_vnf_types = [vnf for (node, vnf) in path_vnfs]
 
-        return (len(errors) == 0), errors
+            # 检查每个必需的 VNF 是否都在路径上
+            for req_vnf in required_vnfs:
+                if req_vnf not in collected_vnf_types:
+                    error = f"Dest {dest}: 缺少 VNF {req_vnf}（路径VNF: {collected_vnf_types}）"
+                    errors.append(error)
+                    print(f"   ❌ {error}")
+                    break
+            else:
+                # 5. ✅ 关键修复：检查 VNF 的顺序是否正确
+                # 提取路径上 VNF 的索引序列
+                vnf_indices = []
+                for vnf in collected_vnf_types:
+                    if vnf in required_vnfs:
+                        vnf_indices.append(required_vnfs.index(vnf))
+
+                # 检查索引是否单调递增（VNF 按顺序经过）
+                if vnf_indices != sorted(vnf_indices):
+                    error = f"Dest {dest}: VNF 顺序错误（期望: {required_vnfs}, 实际: {collected_vnf_types}）"
+                    errors.append(error)
+                    print(f"   ❌ {error}")
+                else:
+                    print(f"   ✅ 目的地 {dest} 路径验证通过")
+
+        success = (len(errors) == 0)
+
+        if success:
+            print(f"✅ [SFC 验证] 所有路径验证通过")
+        else:
+            print(f"❌ [SFC 验证] 发现 {len(errors)} 个错误")
+
+        return success, errors
+
     def _advance_to_next_active_slot(self):
         """
         ⏩ [修复版] 时间槽推进逻辑
@@ -2234,20 +2978,45 @@ class SFC_HIRL_Env(gym.Env):
 
                 # 更新物理时间
                 self.current_time_slot = self.current_slot_index
-                self.time_step = self.current_slot_index * self.delta_t
+
+                # ✅✅✅ 关键修复1：字典访问方式
+                if self.slot_queue:
+                    first_req = self.slot_queue[0]
+
+                    # ✅ 使用字典键访问，不是属性访问
+                    if isinstance(first_req, dict):
+                        self.time_step = float(first_req.get('arrival_time',
+                                                             self.current_slot_index * self.delta_t))
+                    else:
+                        # 如果是对象（某些情况下），使用属性访问
+                        self.time_step = float(getattr(first_req, 'arrival_time',
+                                                       self.current_slot_index * self.delta_t))
+                else:
+                    # 队列为空（不应该发生，但保险起见）
+                    self.time_step = self.current_slot_index * self.delta_t
 
                 print(
-                    f"⏩ [时间推进] Slot {start_slot} -> {self.current_slot_index} | 加载 {len(self.slot_queue)} 个请求 | Time: {self.time_step:.2f}s")
+                    f"⏩ [时间推进] Slot {start_slot} -> {self.current_slot_index} | "
+                    f"Time: {self.time_step:.2f}s | 加载 {len(self.slot_queue)} 个请求")
 
-                # 🔥 触发资源回收 (清理上一个时间槽的过期资源)
-                self._manual_release_resources()
+                # ✅✅✅ 关键修复2：调用生命周期管理器的释放方法
+                if hasattr(self, 'request_manager'):
+                    try:
+                        expired_ids = self.request_manager.check_and_release_expired(self.time_step)
+                        if expired_ids:
+                            print(f"♻️ [时间切片] 释放了 {len(expired_ids)} 个过期请求")
+                            print(f"   过期ID: {expired_ids}")
+                            print(f"   当前Res: {self.get_resource_utilization():.1f}%")
+                    except Exception as e:
+                        print(f"⚠️ [时间切片] 释放失败: {e}")
+                else:
+                    print(f"⚠️ [时间切片] request_manager 未初始化")
 
-                # 🔥 关键：准备好下一个槽的索引 (供下一次调用使用)
+                # 🔥 准备好下一个槽的索引 (供下一次调用使用)
                 self.current_slot_index += 1
                 return
 
             # C. 当前槽为空，继续寻找下一个
-            # print(f"   Slot {self.current_slot_index} 无请求，跳过...")
             self.current_slot_index += 1
 
     def _get_next_request_online(self):
@@ -2278,15 +3047,27 @@ class SFC_HIRL_Env(gym.Env):
 
         # === 核心：检测时间槽切换 ===
         if new_time_slot != old_time_slot:
-            # print(f"\n⏰ [Online TS] {old_time_slot} -> {new_time_slot}")
-
             # A. 更新时间
             self.time_step = new_arrival_time
             self.current_time_slot = new_time_slot
 
+            # 🔥 打印时间推进信息
+            print(f"⏩ [时间推进] Slot {old_time_slot} -> {new_time_slot} | "
+                  f"Time: {self.time_step:.2f}s | "
+                  f"Res: {self.get_resource_utilization():.1f}%")
+
             # B. 触发资源释放
             if hasattr(self, 'request_manager'):
-                self.request_manager.check_and_release_expired(self.time_step)
+                expired_ids = self.request_manager.check_and_release_expired(self.time_step)
+
+                # 🔥 如果没有释放，说明原因
+                if not expired_ids and self.request_manager.active_requests:
+                    earliest = min(
+                        info['expire_time']
+                        for info in self.request_manager.active_requests.values()
+                    )
+                    print(f"   ℹ️ 无过期请求 (最早过期: {earliest:.2f}s)")
+                    print(f"   当前活跃请求: {len(self.request_manager.active_requests)} 个")
         else:
             self.time_step = new_arrival_time
 
@@ -2364,18 +3145,15 @@ class SFC_HIRL_Env(gym.Env):
         return None
 
     def _commit_resources(self, pruned_tree, valid_nodes):
-        """💳 [统一算账] 两阶段提交资源"""
+        """💳 [统一算账] 两阶段提交资源 - 增强诊断版"""
         req = self.current_request
         bw_req = req.get('bw_origin', 1.0)
 
         pending_links = []
         pending_nodes = []
 
-        # Phase 1: Check
+        # Phase 1: Collect pending allocations
         for (u, v) in pruned_tree.keys():
-            if hasattr(self.resource_mgr, 'check_link_resource'):
-                if not self.resource_mgr.check_link_resource(u, v, bw_req):
-                    return False
             pending_links.append((u, v, bw_req))
 
         placement = self.current_tree.get('placement', {})
@@ -2383,25 +3161,50 @@ class SFC_HIRL_Env(gym.Env):
             if isinstance(key, tuple) and len(key) >= 2:
                 n, v_type = key[0], key[1]
                 if n in valid_nodes:  # 只提交有效节点
-                    c = info.get('cpu_used', 0)
-                    m = info.get('mem_used', 0)
-                    # check node resource...
+                    c = info.get('cpu_used', 1.0)
+                    m = info.get('mem_used', 1.0)
                     pending_nodes.append((n, v_type, c, m))
 
-        # Phase 2: Allocate
+        # Phase 2: Allocate with detailed logging
         self.curr_ep_link_allocs = []
         self.curr_ep_node_allocs = []
 
-        for u, v, bw in pending_links:
-            self.resource_mgr.allocate_link_resource(u, v, bw)
-            self.curr_ep_link_allocs.append((u, v, bw))
+        total_cpu = 0.0
+        total_mem = 0.0
+        total_bw = 0.0
 
-        for n, v, c, m in pending_nodes:
-            self.resource_mgr.allocate_node_resource(n, v, c, m)
-            self.curr_ep_node_allocs.append((n, v, c, m))
+        print(f"\n💳 [开始扣费] 节点={len(pending_nodes)}, 链路={len(pending_links)}")
+
+        # 分配链路资源
+        for u, v, bw in pending_links:
+            result = self.resource_mgr.allocate_link_resource(u, v, bw)
+
+            if result is not False:  # None 或 True 都视为成功（兼容没返回值的情况）
+                self.curr_ep_link_allocs.append((u, v, bw))
+                total_bw += bw
+                if len(self.curr_ep_link_allocs) <= 3:  # 只打印前3条
+                    print(f"   💰 链路({u},{v}): -{bw:.1f} BW (result={result})")
+            else:
+                print(f"   ❌ 链路({u},{v}) 分配失败")
+
+        if len(pending_links) > 3:
+            print(f"   ... 还有 {len(pending_links) - 3} 条链路")
+
+        # 分配节点资源
+        for n, v_type, c, m in pending_nodes:
+            result = self.resource_mgr.allocate_node_resource(n, v_type, c, m)
+
+            if result is not False:
+                self.curr_ep_node_allocs.append((n, v_type, c, m))
+                total_cpu += c
+                total_mem += m
+                print(f"   💰 节点{n}[VNF{v_type}]: -{c:.1f} CPU, -{m:.1f} Mem (result={result})")
+            else:
+                print(f"   ❌ 节点{n}[VNF{v_type}] 分配失败")
+
+        print(f"💳 [扣费汇总] CPU:{total_cpu:.1f} | Mem:{total_mem:.1f} | BW:{total_bw:.1f}")
 
         return True
-
     def _check_deployment_validity(self, node_id):
         """
         检查节点是否可以部署VNF
@@ -2579,30 +3382,45 @@ class SFC_HIRL_Env(gym.Env):
             plt.pause(1.0)  # 稍微停顿
         plt.close()
 
-    def _connect_destination(self, node):
+    def _connect_destination(self, dest_node):
         """
-        🔥 执行目的地连接逻辑
-        将当前节点标记为已连接，并记录到多播树中
+        🔥 [增强版] 连接目的地 - 增加 VNF 完整性检查
         """
-        if node not in self.current_request.get('dest', []):
+        if self.current_request is None:
             return False
 
-        # 初始化连接集合（防止 key 缺失）
-        if 'connected_dests' not in self.current_tree:
-            self.current_tree['connected_dests'] = set()
+        dests = self.current_request.get('dest', [])
+        if dest_node not in dests:
+            print(f"⚠️ 节点 {dest_node} 不是有效的目的地")
+            return False
 
-        # 记录连接
-        if node not in self.current_tree['connected_dests']:
-            self.current_tree['connected_dests'].add(node)
+        # ✅ 关键修复：在连接目的地前，验证 VNF 是否部署完整
+        required_vnfs = self.current_request.get('vnf', [])
+        if required_vnfs:
+            placement = self.current_tree.get('placement', {})
 
-            # 将该节点及其到达路径正式标记为“树上节点”
-            self.nodes_on_tree.add(node)
+            # 统计已部署的 VNF
+            deployed_vnf_types = set()
+            for key, info in placement.items():
+                if isinstance(key, tuple) and len(key) >= 2:
+                    vnf_type = key[1]
+                    deployed_vnf_types.add(vnf_type)
 
-            # 如果有 parent_map，可以回溯路径加入 nodes_on_tree
-            # 这里简化处理，具体的路径维护逻辑应在 step_low_level 中已完成
+            required_vnf_set = set(required_vnfs)
 
-            return True
-        return False
+            if not required_vnf_set.issubset(deployed_vnf_types):
+                missing = required_vnf_set - deployed_vnf_types
+                print(f"❌ [连接阻断] 目的地 {dest_node} - VNF 未完整部署")
+                print(f"   所需 VNF: {required_vnfs}")
+                print(f"   已部署: {list(deployed_vnf_types)}")
+                print(f"   缺少: {list(missing)}")
+                return False
+
+        # VNF 完整，可以连接
+        self.current_tree.setdefault('connected_dests', set()).add(dest_node)
+        print(f"✅ [连接成功] 目的地 {dest_node} 已连接 (VNF 完整)")
+
+        return True
     def _get_current_progress(self):
         """
         🔥 计算当前 SFC 部署进度比例 [0.0 - 1.0]
@@ -2648,6 +3466,60 @@ class SFC_HIRL_Env(gym.Env):
             self.edge_index = self.edge_index.to(self.device)
             self.edge_attr = self.edge_attr.to(self.device)
 
+    def _rollback_resources(self):
+        """
+        🔥 [V18.1 完美融合版] 统一回滚 + 状态清理
+        - 接口：兼容 V18.0 (无参数，直接读 self.current_request)
+        - 逻辑：包含 V15.0 的完整状态清理 (current_tree重置)，防止残留
+        """
+        if not hasattr(self, 'current_tree') or self.current_request is None:
+            return
+
+        placement = self.current_tree.get('placement', {})
+        tree_edges = self.current_tree.get('tree', {})
+        bw = self.current_request.get('bw_origin', 1.0)
+
+        restored_cpu = 0.0
+        restored_bw = 0.0
+
+        # 1. 回滚节点资源
+        for key, info_dict in placement.items():
+            if isinstance(key, tuple) and len(key) >= 2:
+                node, vnf_type = key[0], key[1]
+                # 兼容格式
+                if isinstance(info_dict, dict):
+                    c = info_dict.get('cpu_used', 1.0)
+                    m = info_dict.get('mem_used', 1.0)
+                else:
+                    c, m = 1.0, 1.0
+
+                if hasattr(self.resource_mgr, 'release_node_resource'):
+                    self.resource_mgr.release_node_resource(node, vnf_type, c, m)
+                    restored_cpu += c
+
+        # 2. 回滚链路资源
+        for edge_key in tree_edges.keys():
+            if isinstance(edge_key, tuple) and len(edge_key) == 2:
+                u, v = edge_key
+                if hasattr(self.resource_mgr, 'release_link_resource'):
+                    self.resource_mgr.release_link_resource(u, v, bw)
+                    restored_bw += bw
+
+        if restored_cpu > 0 or restored_bw > 0:
+            print(f"♻️ [资源回滚] 节点: +{restored_cpu:.1f} CPU | 链路: +{restored_bw:.1f} BW")
+
+        # ==========================================
+        # 🔥 V15.0 的核心遗产：状态清理
+        # ==========================================
+        # 必须重置，否则下一个请求会继承上一个请求的残留树结构
+        self.current_tree = {
+            'hvt': np.zeros((self.n, self.K_vnf), dtype=np.float32),
+            'tree': {},
+            'placement': {},
+            'connected_dests': set()
+        }
+        self.nodes_on_tree = set()
+        if hasattr(self, '_node_visit_count'): self._node_visit_count = {}
     def _rollback_request_resources(self, req):
         """
         🔥 [V15.0 补丁] 强制回滚：彻底释放当前请求占用的所有资源
@@ -2852,19 +3724,18 @@ class SFC_HIRL_Env(gym.Env):
 #最终树减枝
     def _prune_redundant_branches_with_vnf(self):
         """
-        ✂️ [修复版] 剪枝冗余分支（支持VNF节点）
+        ✂️ [V5.0 精简稳定版] 剪枝冗余分支 + 基础资源检查
 
-        功能：
-        1. 识别从源节点到所有目的地+VNF节点的必要路径。
-        2. 删除多余的“死胡同”分支。
-        3. 自动释放被剪掉的链路资源。
-        4. 返回父节点映射表供 SFC 质检使用。
+        核心功能：
+        1. 反向剪枝，保留关键路径
+        2. 检查剪枝后链路资源是否足够
+        3. 如果资源不足，剪枝失败
 
         返回：
         - pruned_tree: dict, 剪枝后的树边
         - valid_nodes: set, 有效节点集合
         - success: bool, 剪枝是否成功
-        - parent_map: dict, 父节点映射 {child: parent} (用于后续质检)
+        - parent_map: dict, 父节点映射 {child: parent}
         """
         # 1. 基础检查
         if not self.current_request:
@@ -2872,83 +3743,86 @@ class SFC_HIRL_Env(gym.Env):
 
         source = self.current_request.get('source')
         dests = set(self.current_request.get('dest', []))
+        vnf_list = self.current_request.get('vnf', [])
         placement = self.current_tree.get('placement', {})
         raw_edges = self.current_tree.get('tree', {})
 
         if not raw_edges:
-            # 没有边，也就没有父节点映射
             return {}, {source}, False, None
 
-        print(f"\n✂️ [剪枝开始]")
+        print(f"\n✂️ [剪枝开始] V5.0")
         print(f"   源节点: {source}")
         print(f"   目的地: {list(dests)}")
+        print(f"   VNF链: {vnf_list}")
         print(f"   原始边数: {len(raw_edges)}")
 
-        # 2. 构建邻接表 (Adjacency List)
+        # 2. 构建邻接表
         from collections import defaultdict, deque
-
         adj = defaultdict(list)
-        for (u, v) in raw_edges.keys():
-            adj[u].append(v)
-            adj[v].append(u)
+        for edge_key in raw_edges.keys():
+            if isinstance(edge_key, tuple) and len(edge_key) == 2:
+                u, v = edge_key
+                adj[u].append(v)
+                adj[v].append(u)
 
-        # 3. BFS 构建父节点映射 (Parent Map)
+        # 3. BFS构建父节点映射
         parent = {source: None}
         queue = deque([source])
         visited = {source}
 
         while queue:
             curr = queue.popleft()
-            for neighbor in adj[curr]:
+            for neighbor in adj.get(curr, []):
                 if neighbor not in visited:
                     visited.add(neighbor)
                     parent[neighbor] = curr
                     queue.append(neighbor)
 
-        # 4. 识别关键节点 (Critical Nodes)
-        # 关键节点 = 所有目的地 + 所有已部署VNF的节点
+        # 4. 识别VNF部署节点
         vnf_nodes = set()
         for key in placement.keys():
-            # 兼容 (node, vnf) 和 (node, vnf, branch)
-            if isinstance(key, tuple) and len(key) >= 1:
+            if isinstance(key, tuple) and len(key) >= 2:
                 node_id = key[0]
-                vnf_nodes.add(node_id)
+                vnf_id = key[1]
+                if isinstance(node_id, int) and isinstance(vnf_id, int):
+                    # 检查这个VNF是否在VNF链中
+                    for vnf in vnf_list:
+                        if vnf == vnf_id:
+                            vnf_nodes.add(node_id)
+                            break
 
+        # 5. 识别关键节点
         critical_nodes = dests | vnf_nodes
 
         print(f"   VNF节点: {list(vnf_nodes)}")
         print(f"   关键节点: {list(critical_nodes)}")
 
-        # 5. 连通性检查
-        # 如果有关键节点无法从源节点到达，说明树是断裂的
+        # 6. 连通性检查
         unreachable = [n for n in critical_nodes if n not in visited]
         if unreachable:
             print(f"   ❌ 关键节点不可达: {unreachable}")
             return {}, set(), False, None
 
-        # 6. 反向回溯标记有效边 (Backtracking)
+        # 7. 反向回溯标记有效边
         valid_edges = set()
         valid_nodes = {source}
 
-        for target in critical_nodes:
-            curr = target
-            # 从目标回溯到源节点
-            while curr != source and curr is not None:
+        # 从每个关键节点回溯到源节点
+        for node in critical_nodes:
+            curr = node
+            while curr is not None and curr != source:
                 p = parent.get(curr)
                 if p is None:
-                    break  # 异常断开
+                    break
 
+                # 创建边（排序以确保唯一性）
                 edge = tuple(sorted([p, curr]))
-
-                if edge in valid_edges:
-                    break  # 这条路径已经标记过了，不用重复走
-
                 valid_edges.add(edge)
                 valid_nodes.add(curr)
                 valid_nodes.add(p)
                 curr = p
 
-        # 7. 生成剪枝后的树
+        # 8. 生成剪枝后的树
         pruned_tree = {}
         for edge in valid_edges:
             if edge in raw_edges:
@@ -2961,60 +3835,183 @@ class SFC_HIRL_Env(gym.Env):
         print(f"   保留边: {len(pruned_tree)} 条")
         print(f"   有效节点: {len(valid_nodes)} 个")
 
-        # 8. 释放被剔除的链路资源 (Resource Release)
-        if removed_count > 0:
-            required_bw = self.current_request.get('bw_origin', 1.0)
-            released_count = 0
+        # 9. 🔥 关键改进：检查剪枝后所有链路的资源是否足够
+        bw_need = self.current_request.get('bw_origin', 1.0)
+        print(f"🔍 [链路检查] 检查剪枝后链路资源 (带宽需求: {bw_need})")
 
+        insufficient_links = []
+        for (u, v) in pruned_tree.keys():
+            if hasattr(self.resource_mgr, 'check_link_resource'):
+                if not self.resource_mgr.check_link_resource(u, v, bw_need):
+                    insufficient_links.append((u, v))
+                    print(f"   ❌ 链路 {u}-{v} 带宽不足")
+
+        if insufficient_links:
+            print(f"❌ [剪枝失败] {len(insufficient_links)} 条链路带宽不足")
+            return {}, set(), False, None
+
+        print(f"✅ [链路检查] 所有链路资源充足")
+
+        # 10. 释放被剔除的链路资源
+        if removed_count > 0:
+            released_count = 0
             for edge_key in raw_edges.keys():
                 if edge_key not in pruned_tree:
-                    u, v = edge_key
-                    # 释放链路带宽
-                    if hasattr(self, 'resource_mgr') and hasattr(self.resource_mgr, 'release_link_resource'):
-                        self.resource_mgr.release_link_resource(u, v, required_bw)
-                    released_count += 1
+                    if isinstance(edge_key, tuple) and len(edge_key) == 2:
+                        u, v = edge_key
+                        if hasattr(self, 'resource_mgr') and hasattr(self.resource_mgr, 'release_link_resource'):
+                            self.resource_mgr.release_link_resource(u, v, bw_need)
+                        released_count += 1
 
-            print(f"♻️  [资源释放] {released_count} 条边，带宽 {released_count * required_bw:.1f}")
+            print(f"♻️  [资源释放] {released_count} 条边，带宽 {released_count * bw_need:.1f}")
 
-        # 🔥🔥🔥 修复核心：必须返回 4 个值，包括 parent 字典 🔥🔥🔥
         return pruned_tree, valid_nodes, True, parent
-    def _validate_pruned_tree(self, pruned_tree, source, critical_nodes):
+    def _are_nodes_connected_in_edges(self, node1, node2, edges):
         """
-        验证剪枝后的树是否满足基本要求
+        检查两个节点在给定边集中是否连通
+        """
+        if node1 == node2:
+            return True
 
-        检查项：
-        1. 所有关键节点都在树中
-        2. 从源节点可达所有关键节点
+        # 构建临时邻接表
+        from collections import defaultdict, deque
+        adj = defaultdict(list)
+        for (u, v) in edges:
+            adj[u].append(v)
+            adj[v].append(u)
+
+        # BFS检查连通性
+        visited = set()
+        queue = deque([node1])
+        visited.add(node1)
+
+        while queue:
+            curr = queue.popleft()
+            for neighbor in adj.get(curr, []):
+                if neighbor == node2:
+                    return True
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+
+        return False
+    def _find_shortest_path_between_nodes(self, start, end, valid_nodes, raw_edges):
+        """
+        在有效节点和原始边集中查找最短路径
+        """
+        # 只考虑在valid_nodes中的节点
+        from collections import defaultdict, deque
+        adj = defaultdict(list)
+
+        # 只添加连接两个valid_nodes的边
+        for edge_key in raw_edges.keys():
+            if isinstance(edge_key, tuple) and len(edge_key) == 2:
+                u, v = edge_key
+                if u in valid_nodes and v in valid_nodes:
+                    adj[u].append(v)
+                    adj[v].append(u)
+
+        # BFS查找路径
+        if start not in adj or end not in adj:
+            return None
+
+        queue = deque([(start, [start])])
+        visited = {start}
+
+        while queue:
+            curr, path = queue.popleft()
+            if curr == end:
+                return path
+
+            for neighbor in adj.get(curr, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, path + [neighbor]))
+
+        return None
+    def _remove_cycles_from_pruned_tree(self, pruned_tree, valid_nodes, source):
+        """
+        从剪枝后的树中移除环，确保是树结构
         """
         if not pruned_tree:
-            return False
+            return pruned_tree, valid_nodes
 
-        # 收集树中所有节点
-        tree_nodes = {source}
-        for (u, v) in pruned_tree.keys():
-            tree_nodes.add(u)
-            tree_nodes.add(v)
-
-        # 检查关键节点是否都在树中
-        missing = []
-        for node in critical_nodes:
-            if node not in tree_nodes:
-                missing.append(node)
-
-        if missing:
-            print(f"❌ [剪枝验证] 缺失关键节点: {missing}")
-            return False
-
-        # 检查连通性（BFS从源节点）
-        from collections import deque, defaultdict
-
+        # 构建邻接表
+        from collections import defaultdict, deque
         adj = defaultdict(list)
         for (u, v) in pruned_tree.keys():
             adj[u].append(v)
             adj[v].append(u)
 
+        # 使用BFS构建树，移除形成环的边
         visited = {source}
+        parent = {source: None}
+        tree_edges = set()
+        removed_edges = []
+
         queue = deque([source])
+        while queue:
+            curr = queue.popleft()
+            for neighbor in adj.get(curr, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    parent[neighbor] = curr
+                    edge = tuple(sorted([curr, neighbor]))
+                    tree_edges.add(edge)
+                    queue.append(neighbor)
+                elif neighbor != parent[curr]:
+                    # 发现环，跳过这条边
+                    edge = tuple(sorted([curr, neighbor]))
+                    if edge in pruned_tree and edge not in tree_edges:
+                        removed_edges.append(edge)
+
+        # 重新构建剪枝树
+        new_pruned_tree = {}
+        for edge in tree_edges:
+            if edge in pruned_tree:
+                new_pruned_tree[edge] = pruned_tree[edge]
+            elif (edge[1], edge[0]) in pruned_tree:
+                new_pruned_tree[edge] = pruned_tree[(edge[1], edge[0])]
+
+        # 更新有效节点（只包含树中的节点）
+        new_valid_nodes = set(visited)
+
+        if removed_edges:
+            print(f"   🔍 移除了 {len(removed_edges)} 条环边")
+            for edge in removed_edges[:5]:  # 只显示前5条
+                print(f"     移除环边: {edge}")
+
+        return new_pruned_tree, new_valid_nodes
+    def _validate_pruned_tree_strict(self, pruned_tree, source, dests, vnf_list, placement):
+        """
+        严格验证剪枝后的树
+        """
+        if not pruned_tree:
+            return False
+
+        # 检查树结构：n个节点应有n-1条边
+        nodes_in_tree = {source}
+        for (u, v) in pruned_tree.keys():
+            nodes_in_tree.add(u)
+            nodes_in_tree.add(v)
+
+        expected_edges = len(nodes_in_tree) - 1
+        if len(pruned_tree) != expected_edges:
+            print(f"❌ [树结构验证] 异常：{len(nodes_in_tree)}个节点，{len(pruned_tree)}条边，应有{expected_edges}条")
+            return False
+
+        # 检查所有目的地可达
+        from collections import defaultdict, deque
+        adj = defaultdict(list)
+        for edge_key in pruned_tree.keys():
+            if isinstance(edge_key, tuple) and len(edge_key) == 2:
+                u, v = edge_key
+                adj[u].append(v)
+                adj[v].append(u)
+
+        visited = set()
+        queue = deque([source])
+        visited.add(source)
 
         while queue:
             curr = queue.popleft()
@@ -3023,109 +4020,159 @@ class SFC_HIRL_Env(gym.Env):
                     visited.add(neighbor)
                     queue.append(neighbor)
 
-        # 检查所有关键节点是否可达
-        unreachable = []
-        for node in critical_nodes:
-            if node not in visited:
-                unreachable.append(node)
-
-        if unreachable:
-            print(f"❌ [剪枝验证] 不可达关键节点: {unreachable}")
+        missing_dests = [d for d in dests if d not in visited]
+        if missing_dests:
+            print(f"❌ [连通性验证] 缺失目的地: {missing_dests}")
             return False
 
+        # 检查VNF节点是否可达
+        if vnf_list:
+            vnf_nodes = set()
+            for key in placement.keys():
+                if isinstance(key, tuple) and len(key) >= 2:
+                    node_id = key[0]
+                    vnf_id = key[1]
+                    if isinstance(node_id, int) and isinstance(vnf_id, int):
+                        for vnf in vnf_list:
+                            if vnf == vnf_id:
+                                vnf_nodes.add(node_id)
+                                break
+
+            missing_vnf = [n for n in vnf_nodes if n not in visited]
+            if missing_vnf:
+                print(f"❌ [VNF可达性] 缺失VNF节点: {missing_vnf}")
+                return False
+
+        # 检查是否有环（使用DFS）
+        if self._has_cycle_in_adj(adj):
+            print("❌ [环检测] 剪枝后的树中存在环")
+            return False
+
+        print("✅ [剪枝验证] 所有验证通过")
         return True
-    def _release_redundant_resources(self, raw_edges, pruned_tree):
+    def _has_cycle_in_adj(self, adj):
         """
-        释放剪枝掉的冗余边占用的资源
-
-        Args:
-            raw_edges: 原始树的边集
-            pruned_tree: 剪枝后的树
+        检查邻接表中是否有环
         """
-        req = self.current_request
-        if not req:
-            return
+        visited = set()
 
-        required_bw = req.get('bw_origin', 1.0)
-        released_count = 0
-        released_bw = 0.0
+        def dfs(node, parent):
+            visited.add(node)
+            for neighbor in adj.get(node, []):
+                if neighbor == parent:
+                    continue
+                if neighbor in visited:
+                    return True
+                if dfs(neighbor, node):
+                    return True
+            return False
 
-        # 找出被剪枝的边
-        for edge_key in raw_edges.keys():
-            if edge_key not in pruned_tree:
-                u, v = edge_key
+        for node in adj.keys():
+            if node not in visited:
+                if dfs(node, None):
+                    return True
 
-                # 释放链路资源
-                if hasattr(self.resource_mgr, 'release_link_resource'):
-                    try:
-                        self.resource_mgr.release_link_resource(u, v, required_bw)
-                        released_count += 1
-                        released_bw += required_bw
-                    except Exception as e:
-                        print(f"⚠️ 释放边 {edge_key} 资源失败: {e}")
+        return False
 
-        if released_count > 0:
-            print(f"♻️  [资源释放] {released_count} 条边，带宽 {released_bw:.1f}")
     def _finalize_request_with_pruning(self):
         """
-        🔥 [V12.2 兼容结算版] 原子性物理结算
+        🔥 [V14.1 释放再预留版] 解决资源双重计费问题
         """
-        if self.current_request is None:
-            return False
-
+        if self.current_request is None: return False
         req_id = self.current_request.get('id', 'unknown')
-        pruned_tree, valid_nodes, success, _ = self._prune_redundant_branches_with_vnf()
-        if not success:
+
+        # 1. 释放当前持有的所有物理资源 (由 MOVE/STAY 累积提交的)
+        # 我们必须先释放，才能在后续的事务中重新分配最优方案
+        # 注意：这需要我们准确记录了当前占用的资源
+        current_tree_edges = self.current_tree.get('tree', {})
+        current_placement = self.current_tree.get('placement', {})
+
+        # 释放链路
+        bw = self.current_request.get('bw_origin', 1.0)
+        for (u, v) in current_tree_edges.keys():
+            self.resource_mgr.release_link_resource(u, v, bw)
+
+        # 释放节点
+        for key, info in current_placement.items():
+            if isinstance(key, tuple) and len(key) >= 2:
+                node, vnf = key[0], key[1]
+                # 获取 info 中的 cpu/mem
+                c = info.get('cpu_used', 1.0) if isinstance(info, dict) else 1.0
+                m = info.get('mem_used', 1.0) if isinstance(info, dict) else 1.0
+                self.resource_mgr.release_node_resource(node, vnf, c, m)
+
+        print(f"♻️ [结算中间态] 释放暂存资源，准备重组")
+
+        # 2. 尝试剪枝方案 (Plan A)
+        pruned_tree, valid_nodes, prune_success, _ = self._prune_redundant_branches_with_vnf()
+
+        tx_id = self.resource_mgr.begin_transaction(req_id)
+        final_tree = None
+
+        try:
+            plan_success = False
+            # 尝试 Plan A
+            if prune_success:
+                try:
+                    if self._try_reserve_resources(tx_id, current_placement, pruned_tree, valid_nodes):
+                        final_tree = pruned_tree
+                        plan_success = True
+                except:
+                    self.resource_mgr.rollback_transaction(tx_id)
+                    tx_id = self.resource_mgr.begin_transaction(req_id)  # Reset TX
+
+            # 尝试 Plan B (原始方案) - 如果 Plan A 失败
+            if not plan_success:
+                print(f"⚠️ [结算] 剪枝不可用，回退原始方案")
+                # 原始方案即刚才释放的那些，理论上一定能成功(除非并发抢占)
+                all_nodes = set()  # 简单起见，假设所有placement节点有效
+                if self._try_reserve_resources(tx_id, current_placement, current_tree_edges,
+                                               None):  # None valid_nodes means check all
+                    final_tree = current_tree_edges
+                else:
+                    raise Exception("原始资源无法回收 (并发冲突?)")
+
+            # 3. 提交最终方案
+            if self.resource_mgr.commit_transaction(tx_id):
+                print(f"✅ [结算完成] 请求 {req_id} 成功")
+                self.current_tree['tree'] = final_tree
+                return True
+
+        except Exception as e:
+            print(f"❌ [结算崩溃] {e}")
+            self.resource_mgr.rollback_transaction(tx_id)
             return False
 
-        self.current_tree['tree'] = pruned_tree
-        placement = self.current_tree.get('placement', {})
-        temp_node_allocs = []
-
-        # ------------------------------------------------------------
-        # 步骤: 节点资源原子分配
-        # ------------------------------------------------------------
+        return False
+    def _try_reserve_resources(self, tx_id, placement, tree_edges, valid_nodes):
+        """
+        辅助方法：尝试预留一套资源方案
+        抛出异常表示失败
+        """
+        # --- A. 预留节点资源 ---
         for key, info in placement.items():
-            node = key[0]
-            vnf_type = key[1]
+            if not isinstance(key, tuple) or len(key) < 2: continue
+            node, vnf_type = key[0], key[1]
+            if node not in valid_nodes: continue
 
-            # 🔥 修复核心：从 info 字典中读取资源需求
+            # 获取需求
+            c, m = 1.0, 1.0
             if isinstance(info, dict):
-                c = info.get('cpu_used', 1.0)
-                m = info.get('mem_used', 1.0)
+                c, m = info.get('cpu_used', 1.0), info.get('mem_used', 1.0)
             else:
-                # 兜底：如果 info 只是个索引整数
                 idx = info
                 cpu_needs = self.current_request.get('cpu_origin', [])
                 mem_needs = self.current_request.get('memory_origin', [])
                 c = cpu_needs[idx] if idx < len(cpu_needs) else 1.0
                 m = mem_needs[idx] if idx < len(mem_needs) else 1.0
 
-            # 只有在有效节点（剪枝后保留）上才分配资源
-            if node in valid_nodes:
-                if self.resource_mgr.allocate_node_resource(node, vnf_type, c, m):
-                    temp_node_allocs.append((node, vnf_type, c, m))
-                else:
-                    # 任何一项失败则全体回滚
-                    for r_node, r_vt, r_c, r_m in temp_node_allocs:
-                        self.resource_mgr.release_node_resource(r_node, r_vt, r_c, r_m)
-                    return False
+            if not self.resource_mgr.reserve_node_resource(tx_id, node, vnf_type, c, m):
+                raise Exception(f"节点 {node} 资源不足")
 
-        # ------------------------------------------------------------
-        # 步骤: 链路资源原子分配 (保持原有逻辑)
-        # ------------------------------------------------------------
+        # --- B. 预留链路资源 ---
         bw = self.current_request.get('bw_origin', 1.0)
-        temp_link_allocs = []
-        for (u, v) in pruned_tree.keys():
-            if self.resource_mgr.allocate_link_resource(u, v, bw):
-                temp_link_allocs.append((u, v, bw))
-            else:
-                for r_u, r_v, r_bw in temp_link_allocs:
-                    self.resource_mgr.release_link_resource(r_u, r_v, r_bw)
-                for r_node, r_vt, r_c, r_m in temp_node_allocs:
-                    self.resource_mgr.release_node_resource(r_node, r_vt, r_c, r_m)
-                return False
+        for (u, v) in tree_edges.keys():
+            if not self.resource_mgr.reserve_link_resource(tx_id, u, v, bw):
+                raise Exception(f"链路 {u}-{v} 带宽不足")
 
-        self.curr_ep_node_allocs = temp_node_allocs
-        self.curr_ep_link_allocs = temp_link_allocs
         return True

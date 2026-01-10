@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+
+# !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 HRL Agent (重构版 - 完全修复)
@@ -205,6 +206,20 @@ class HRLAgent:
         self.adaptive_epsilon = config.get('hrl', {}).get('adaptive_epsilon', True)
         self.min_epsilon_low = 0.01
 
+        # 🔥 新增：训练稳定性参数
+        self.clip_grad_norm = training_cfg.get('clip_grad_norm', 1.0)
+        self.tau = training_cfg.get('tau', 0.005)  # 软更新系数
+        self.huber_delta = training_cfg.get('huber_delta', 1.0)  # Huber loss delta
+
+        # 🔥 新增：损失统计
+        self.high_loss_history = deque(maxlen=100)
+        self.low_loss_history = deque(maxlen=100)
+        self.gradient_norms = deque(maxlen=100)
+
+        # 🔥 新增：黑名单学习相关
+        self.failed_nodes_counter = {}  # 记录节点失败次数
+        self.blacklist_history = []  # 黑名单历史记录
+
     def select_action(
             self,
             state: Dict,
@@ -354,6 +369,7 @@ class HRLAgent:
                 low_action = random.randint(0, self.n_actions - 1)
 
             return 0, low_action, info
+
     def _need_new_subgoal(self, state: Dict, unconnected_dests: Optional[list]) -> bool:
         """判断是否需要新的subgoal"""
         # 1. 没有subgoal
@@ -485,6 +501,7 @@ class HRLAgent:
 
         # logger.warning(f"Using random embedding fallback (Batch Size: {batch_size})")
         return torch.randn(batch_size, self.state_dim, device=self.device)
+
     def _extract_subgoal_from_expert(self, expert_action: int, unconnected_dests: list) -> int:
         """从专家动作提取subgoal"""
         if unconnected_dests and expert_action in unconnected_dests:
@@ -595,15 +612,42 @@ class HRLAgent:
     def store_transition_low(
             self, state: Dict, action: int, reward: float, next_state: Dict, done: bool
     ):
-        """存储Low-Level经验"""
+        """存储Low-Level经验 (集成强力缩放)"""
+        # 🔥 [关键修复] 强力奖励缩放 + 截断
+        # 原始奖励可能高达 2500+，我们将其压缩到 [-5, 10] 区间
+        scaled_reward = reward * 0.01  # 缩小100倍 (2500 -> 25.0)
+
+        # 硬截断，防止极端值破坏 Q 值估计
+        max_reward = 10.0
+        min_reward = -5.0
+        scaled_reward = max(min_reward, min(max_reward, scaled_reward))
+
+        # 🔥 [可选] 添加 Intrinsic Reward (好奇心奖励)
+        if self.config.get('hrl', {}).get('use_intrinsic_reward', False):
+            try:
+                # 简单的状态差异作为好奇心
+                with torch.no_grad():
+                    state_emb = self._extract_state_embedding(state)
+                    next_state_emb = self._extract_state_embedding(next_state)
+                    prediction_error = F.mse_loss(state_emb, next_state_emb).item()
+                    # 限制内在奖励幅度
+                    intrinsic_reward = min(0.1, prediction_error * 0.5)
+                    scaled_reward += intrinsic_reward
+            except Exception:
+                pass
+
         self.low_memory.append({
             'state': state,
             'action': action,
-            'reward': reward,
+            'reward': scaled_reward,  # 使用缩放后的奖励
             'next_state': next_state,
             'done': done,
             'goal_emb': self.current_goal_emb
         })
+
+        # 缓冲区监控 (调试用)
+        if len(self.low_memory) % 5000 == 0:
+            logger.info(f"📊 Low Buffer Size: {len(self.low_memory)}")
 
     # ============================================
     # 向后兼容：保留旧接口
@@ -631,24 +675,41 @@ class HRLAgent:
         return total_loss
 
     def update_policies(self) -> Dict[str, float]:
-        """更新策略（新接口）"""
+        """更新策略（集成监控与调度）"""
         losses = {}
+        self.update_count += 1
 
         # High-Level更新
+        high_loss = 0.0
         if len(self.high_memory) >= self.batch_size // 4:
             high_loss = self._update_high_level()
             losses['high_loss'] = high_loss
+            if high_loss > 0:
+                self.high_loss_history.append(high_loss)
 
         # Low-Level更新
+        low_loss = 0.0
         if len(self.low_memory) >= self.batch_size:
             low_loss = self._update_low_level()
             losses['low_loss'] = low_loss
+            if low_loss > 0:
+                self.low_loss_history.append(low_loss)
 
-        # 更新target networks
-        self._update_target_networks()
+        losses['total_loss'] = losses.get('high_loss', 0) + low_loss
 
-        # 更新epsilon
+        # 🔥 软更新 target networks (更稳定)
+        self._soft_update_target_networks()
+
+        # 定期硬更新 target networks
+        if self.update_count % self.target_update_freq == 0:
+            self._hard_update_target_networks()
+
+        # 更新 epsilon
         self._update_epsilon()
+
+        # 🔥 监控训练状态
+        if self.update_count % 100 == 0:
+            self._log_training_stats()
 
         return losses
 
@@ -664,7 +725,6 @@ class HRLAgent:
 
             # 3. 准备数据
             # 提取 Graph Embedding
-            # 注意：如果 graph embedding 计算较慢，这里会是瓶颈
             state_embs = [self._get_graph_embedding(x['state']) for x in batch]
             next_state_embs = [self._get_graph_embedding(x['next_state']) for x in batch]
 
@@ -694,13 +754,30 @@ class HRLAgent:
 
                 target_q = rewards + (1 - dones) * self.gamma * next_q
 
+                # 🔥 限制目标Q值范围
+                target_q = torch.clamp(target_q, -10.0, 50.0)
+
             # 6. 计算 Loss & 更新
-            loss = F.smooth_l1_loss(curr_q, target_q)
+            # 🔥 使用Huber Loss提高稳定性
+            loss = F.smooth_l1_loss(curr_q, target_q, reduction='mean')
+
+            # 检查 Loss 有效性
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning("❌ High-Level Loss 出现NaN/Inf，跳过更新")
+                return 0.0
 
             self.optimizer_high.zero_grad()
             loss.backward()
+
+            # 🔥 梯度监控
+            total_grad_norm = 0.0
+            for param in self.high_policy.parameters():
+                if param.grad is not None:
+                    total_grad_norm += param.grad.norm().item()
+            self.gradient_norms.append(total_grad_norm)
+
             # 梯度裁剪
-            nn.utils.clip_grad_norm_(self.high_policy.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(self.high_policy.parameters(), self.clip_grad_norm)
             self.optimizer_high.step()
 
             return loss.item()
@@ -712,8 +789,7 @@ class HRLAgent:
             return 0.0
 
     def _update_low_level(self) -> float:
-        """更新Low-Level策略 (Goal-Conditioned Double DQN)"""
-        # 1. 检查样本数量
+        """更新Low-Level策略 (集成 Q值截断、梯度裁剪、自适应LR)"""
         if len(self.low_memory) < self.batch_size:
             return 0.0
 
@@ -722,8 +798,9 @@ class HRLAgent:
             batch = random.sample(self.low_memory, self.batch_size)
 
             # 3. 准备数据
-            state_embs = [self._get_graph_embedding(x['state']) for x in batch]
-            next_state_embs = [self._get_graph_embedding(x['next_state']) for x in batch]
+            # 使用新添加的 _extract_state_embedding 方法
+            state_embs = [self._extract_state_embedding(x['state']) for x in batch]
+            next_state_embs = [self._extract_state_embedding(x['next_state']) for x in batch]
 
             state_tensor = torch.cat(state_embs, dim=0).to(self.device)
             next_state_tensor = torch.cat(next_state_embs, dim=0).to(self.device)
@@ -732,37 +809,23 @@ class HRLAgent:
             rewards = torch.tensor([x['reward'] for x in batch], device=self.device).float().unsqueeze(1)
             dones = torch.tensor([x['done'] for x in batch], device=self.device).float().unsqueeze(1)
 
-            # =======================================================
-            # 🔥 [关键修复] 过滤掉 action = -1 的无效数据
-            # =======================================================
+            # 🔥 [修复] 过滤无效动作 (-1)
             valid_mask = (actions >= 0).squeeze()
+            if valid_mask.sum() == 0: return 0.0
 
-            # 如果整个 batch 都是无效动作（极端情况），跳过
-            if valid_mask.sum() == 0:
-                return 0.0
-
-            # 只保留有效的数据
             state_tensor = state_tensor[valid_mask]
             next_state_tensor = next_state_tensor[valid_mask]
             actions = actions[valid_mask]
             rewards = rewards[valid_mask]
             dones = dones[valid_mask]
 
-            # 重新过滤 batch 列表，以便后续处理 goal_embs
-            # valid_mask 是 tensor，转回 numpy 或 list 索引处理比较麻烦
-            # 更简单的做法是：先处理好 tensor，再处理 goal_embs
-            # =======================================================
+            # 🔥 [修复] Reward 二次检查 (防止存入后的异常值)
+            rewards = torch.clamp(rewards, -10.0, 10.0)
 
             # 处理 Goal Embedding
             goal_embs = []
-            # 注意：这里我们得重新遍历 batch，或者用 mask 筛选
-            # 简单起见，我们直接遍历 batch 并应用同样的 mask 逻辑
-            # 但上面的 valid_mask 是基于 actions tensor 的
-            # 所以我们可以这样做：
-
             valid_indices = torch.nonzero(valid_mask).squeeze().cpu().tolist()
-            if not isinstance(valid_indices, list):  # 单个元素时可能是 int
-                valid_indices = [valid_indices]
+            if not isinstance(valid_indices, list): valid_indices = [valid_indices]
 
             for idx in valid_indices:
                 x = batch[idx]
@@ -770,10 +833,8 @@ class HRLAgent:
                 if g is None:
                     g = torch.zeros(1, self.goal_dim, device=self.device)
                 else:
-                    g = g.to(self.device)  # 确保在设备上
+                    g = g.to(self.device)
                     if g.dim() == 1: g = g.unsqueeze(0)
-
-                    # 维度安全检查
                     if g.size(1) != self.goal_dim:
                         if g.size(1) > self.goal_dim:
                             g = g[:, :self.goal_dim]
@@ -782,49 +843,101 @@ class HRLAgent:
                             g = torch.cat([g, padding], dim=1)
                 goal_embs.append(g)
 
-            goal_tensor = torch.cat(goal_embs, dim=0)
+            goal_tensor = torch.cat(goal_embs, dim=0).to(self.device)
 
             # 4. 计算 Current Q
-            # LowPolicy forward 返回: (logits, value)
-            curr_logits, _ = self.low_policy(state_tensor, goal_tensor)
+            policy_output = self.low_policy(state_tensor, goal_tensor)
+            if isinstance(policy_output, tuple):
+                curr_q_values = policy_output[0]
+            else:
+                curr_q_values = policy_output
 
-            # 🔥 现在 actions 里没有 -1 了，gather 不会报错
-            curr_q = curr_logits.gather(1, actions)
+            curr_q = curr_q_values.gather(1, actions)
+
+            # 🔥 [监控] Q 值异常检测
+            if torch.isnan(curr_q).any() or torch.isinf(curr_q).any():
+                logger.error("❌ Q 值出现 NaN/Inf，触发重置！")
+                self.reset_network_parameters()
+                return 0.0
 
             # 5. 计算 Target Q (Double DQN)
             with torch.no_grad():
                 # Online Net 选动作
-                next_logits, _ = self.low_policy(next_state_tensor, goal_tensor)
-                next_actions = next_logits.argmax(dim=1, keepdim=True)
+                next_output = self.low_policy(next_state_tensor, goal_tensor)
+                next_q_online = next_output[0] if isinstance(next_output, tuple) else next_output
+                next_actions = next_q_online.argmax(dim=1, keepdim=True)
 
                 # Target Net 评价值
-                target_logits, _ = self.target_low_policy(next_state_tensor, goal_tensor)
-                next_q = target_logits.gather(1, next_actions)
+                target_output = self.target_low_policy(next_state_tensor, goal_tensor)
+                next_q_target = target_output[0] if isinstance(target_output, tuple) else target_output
+                next_q = next_q_target.gather(1, next_actions)
+
+                # 🔥 [关键修复] Target Q 截断
+                # 理论最大 Q ≈ 10 / (1-0.99) = 1000
+                # 这里限制在 [-20, 100] 防止过估计
+                next_q = torch.clamp(next_q, -20.0, 100.0)
 
                 target_q = rewards + (1 - dones) * self.gamma * next_q
 
+                # 🔥 [关键修复] 最终 Target 二次截断
+                target_q = torch.clamp(target_q, -20.0, 120.0)
+
             # 6. 计算 Loss & 更新
-            loss = F.smooth_l1_loss(curr_q, target_q)
+            # 🔥 [修复] 使用 Huber Loss (Smooth L1 Loss) 提高稳定性
+            loss = F.smooth_l1_loss(curr_q, target_q, reduction='mean')
+
+            # 检查 Loss 有效性
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning("❌ Low-Level Loss 出现NaN/Inf，跳过更新")
+                return 0.0
 
             self.optimizer_low.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.low_policy.parameters(), 1.0)
+
+            # 🔥 [修复] 梯度监控与裁剪
+            total_grad_norm = 0.0
+            for param in self.low_policy.parameters():
+                if param.grad is not None:
+                    total_grad_norm += param.grad.norm().item()
+
+            self.gradient_norms.append(total_grad_norm)
+
+            # 严格裁剪梯度
+            nn.utils.clip_grad_norm_(self.low_policy.parameters(), self.clip_grad_norm)
+
             self.optimizer_low.step()
 
-            return loss.item()
+            # 🔥 [修复] 自适应学习率微调 (简单版)
+            loss_val = loss.item()
+            if loss_val < 1e-4:  # Loss 太小，可能是学习率太低或陷入局部极小
+                for param_group in self.optimizer_low.param_groups:
+                    param_group['lr'] = min(param_group['lr'] * 1.02, 1e-3)
+            elif loss_val > 5.0:  # Loss 太大
+                for param_group in self.optimizer_low.param_groups:
+                    param_group['lr'] = max(param_group['lr'] * 0.98, 1e-5)
+
+            return loss_val
 
         except Exception as e:
             logger.error(f"[Update Low Level] Error: {e}")
             import traceback
             traceback.print_exc()
             return 0.0
-    def _update_target_networks(self):
-        """更新target networks"""
-        self.update_count += 1
 
-        if self.update_count % self.target_update_freq == 0:
-            self.target_high_policy.load_state_dict(self.high_policy.state_dict())
-            self.target_low_policy.load_state_dict(self.low_policy.state_dict())
+    def _soft_update_target_networks(self):
+        """软更新target networks（更稳定）"""
+        # 软更新High-Level
+        for target_param, param in zip(self.target_high_policy.parameters(), self.high_policy.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+
+        # 软更新Low-Level
+        for target_param, param in zip(self.target_low_policy.parameters(), self.low_policy.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+
+    def _hard_update_target_networks(self):
+        """硬更新target networks"""
+        self.target_high_policy.load_state_dict(self.high_policy.state_dict())
+        self.target_low_policy.load_state_dict(self.low_policy.state_dict())
 
     def _update_epsilon(self):
         """更新epsilon"""
@@ -837,6 +950,16 @@ class HRLAgent:
         self.epsilon_low = self.epsilon_low_start + (
                 self.epsilon_low_end - self.epsilon_low_start
         ) * progress
+
+    def _log_training_stats(self):
+        """记录训练统计"""
+        if len(self.high_loss_history) > 0 and len(self.low_loss_history) > 0:
+            avg_high_loss = np.mean(self.high_loss_history)
+            avg_low_loss = np.mean(self.low_loss_history)
+            avg_grad_norm = np.mean(self.gradient_norms) if self.gradient_norms else 0.0
+
+            logger.debug(f"📊 训练统计: HighLoss={avg_high_loss:.4f}, LowLoss={avg_low_loss:.4f}, "
+                         f"GradNorm={avg_grad_norm:.2f}, ε_low={self.epsilon_low:.3f}")
 
     def update_epsilon(self):
         """向后兼容的epsilon更新"""
@@ -953,38 +1076,6 @@ class HRLAgent:
             logger.error(f"[Select Low Action] Error: {e}")
             return random.randint(0, self.n_actions - 1)
 
-    def _extract_state_embedding(self, state):
-        """🔥 修复 Data 对象无法直接投影的问题"""
-        try:
-            # A. 处理 PyG Data 对象
-            if hasattr(state, 'x') and hasattr(state, 'edge_index'):
-                if self.encoder is not None:
-                    return self._get_graph_embedding(state)
-
-                # 如果没有 Encoder，手动池化节点特征
-                x = state.x
-                state_tensor = torch.mean(x, dim=0, keepdim=True)  # [1, node_feat_dim]
-
-            # B. 处理已经是 Tensor 或 Numpy 的情况
-            else:
-                state_tensor = self._prepare_state(state)
-                if state_tensor.dim() == 1: state_tensor = state_tensor.unsqueeze(0)
-
-            # 🔥 统一投影到 hidden_dim (128)
-            if state_tensor.size(-1) != self.state_dim:
-                if not hasattr(self, '_state_projection'):
-                    self._state_projection = nn.Linear(state_tensor.size(-1), self.state_dim).to(self.device)
-
-                with torch.no_grad():
-                    # 确保输入是 Tensor 而非 Data 对象
-                    state_tensor = self._state_projection(state_tensor.to(self.device))
-
-            return state_tensor
-
-        except Exception as e:
-            logger.error(f"提取state embedding失败: {e}")
-            return torch.zeros(1, self.state_dim, device=self.device)
-
     def _prepare_state(self, state):
         """辅助方法：将状态转换为tensor"""
         if isinstance(state, dict):
@@ -995,6 +1086,7 @@ class HRLAgent:
         else:
             # 已经是tensor
             return state
+
     # ============================================
     # 4. 新增 record_failure 方法
     # ============================================
@@ -1065,6 +1157,40 @@ class HRLAgent:
             'blacklist_history_size': len(self.blacklist_history)
         }
 
+    def _extract_state_embedding(self, state):
+        """🔥 [新增] 提取状态嵌入（兼容性方法）"""
+        try:
+            return self._get_graph_embedding(state)
+        except Exception as e:
+            logger.error(f"[Extract State Embedding] Error: {e}")
+            # 返回随机嵌入作为 fallback，确保维度匹配
+            return torch.randn(1, self.state_dim, device=self.device)
+
+    def reset_network_parameters(self):
+        """🔥 [新增] 重置网络参数（用于训练异常时的自愈）"""
+        logger.warning("🔄 [Auto-Fix] 正在重置网络参数...")
+
+        # 重置 High-Level 网络
+        if hasattr(self.high_policy, 'reset_parameters'):
+            self.high_policy.reset_parameters()
+        self.target_high_policy.load_state_dict(self.high_policy.state_dict())
+
+        # 重置 Low-Level 网络
+        if hasattr(self.low_policy, 'reset_parameters'):
+            self.low_policy.reset_parameters()
+        self.target_low_policy.load_state_dict(self.low_policy.state_dict())
+
+        # 重置优化器 (恢复初始学习率)
+        training_cfg = self.config.get('training', {})
+        lr_high = training_cfg.get('lr_high', 1e-4)
+        lr_low = training_cfg.get('lr_low', 1e-4)
+
+        self.optimizer_high = optim.Adam(self.high_policy.parameters(), lr=lr_high)
+        self.optimizer_low = optim.Adam(self.low_policy.parameters(), lr=lr_low)
+
+        logger.info("✅ 网络参数重置完成")
+
+
 # ============================================
 # 向后兼容：保留旧接口
 # ============================================
@@ -1102,5 +1228,4 @@ def create_goal_conditioned_agent(config, phase=3, goal_strategy='adaptive', enc
         goal_strategy=goal_strategy,
         **kwargs
     )
-
 
