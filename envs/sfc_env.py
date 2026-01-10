@@ -895,7 +895,17 @@ class SFC_HIRL_Env(gym.Env):
             'time_step': self.time_step,
             'request_id': req.get('id') if req else None
         }
-
+        # 🔥 诊断计数器
+        self.action_stats = {
+            'stay': 0,  # STAY 总次数
+            'move': 0,  # MOVE 总次数
+            'stay_deploy': 0,  # STAY 用于部署
+            'stay_connect': 0,  # STAY 连接目的地
+            'stay_waste': 0,  # STAY 无效操作
+            'move_follow': 0,  # MOVE 跟随推荐路径
+            'move_deviate': 0,  # MOVE 偏离推荐路径
+            'total_steps': 0,
+        }
         return self.get_state(), info
 
     def step(self, action):
