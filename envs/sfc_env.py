@@ -24,6 +24,7 @@ from envs.modules.event_handler import EventHandler
 from envs.modules.policy_helper import PolicyHelper
 from envs.modules.failure_visualizer import FailureVisualizer
 from envs.modules.visualize_multicast_tree import MulticastTreeVisualizer
+from envs.modules.HRL_Coordinator import HRL_Coordinator
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 class SimpleTopologyManager:
