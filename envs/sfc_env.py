@@ -626,6 +626,130 @@ class SFC_HIRL_Env(gym.Env):
             'edge_index': gym.spaces.Box(low=0, high=self.n, shape=(2, self.n * self.n), dtype=np.int64),
         })
         self.action_space = gym.spaces.Discrete(self.n)
+    def _init_mab_components(self):
+        """
+        初始化 MAB 智能剪枝组件
+        """
+        # 1. 读取配置
+        mab_conf = self.config.get('mab_pruning', {})
+
+        # 2. 设置基本参数
+        self.use_mab_pruning = mab_conf.get('enabled', True)
+        self.mab_rounds = mab_conf.get('rounds', 20)
+
+        # 🔥🔥🔥 [修复这里] 补上缺失的 enable_mab_learning 属性 🔥🔥🔥
+        # 默认为 True，表示允许 MAB 在运行过程中学习和更新
+        self.enable_mab_learning = mab_conf.get('learning', True)
+
+        # 3. 实例化 MAB 助手
+        self.mab_pruner = MABPruningHelper(
+            exploration_param=mab_conf.get('exploration', 1.4),
+            policy=mab_conf.get('policy', 'ucb1')
+        )
+
+        # 4. 初始化统计信息
+        self.mab_action_stats = {
+            'total_selections': 0,
+            'positive_rewards': 0,
+            'negative_rewards': 0,
+            'successful_prunes': 0,
+            'failed_prunes': 0
+        }
+
+        logger.info(f"🤖 MAB组件初始化完成: Mode={self.use_mab_pruning}, Learning={self.enable_mab_learning}")
+    def _init_hrl_Coordinator(self):
+        """
+        🔧 [初始化核心] 初始化HRL_Coordinator外部的主控循环
+
+        功能：
+        1. 解析配置参数，提供安全默认值
+        2. 初始化状态同步缓存（解决时序不匹配的关键）
+        3. 建立性能监控和统计容器
+        4. 验证环境与Agent的兼容性
+        """
+        import numpy as np
+        from collections import defaultdict, deque
+
+        # ==================================================
+        # 1. 读取配置 (带默认值保护)
+        # ==================================================
+        # 确保即使config为空也能正常运行
+        cfg = self.config if self.config else {}
+
+        # 时序控制参数
+        self.max_high_steps = cfg.get('max_high_steps', 20)  # 高层最大决策次数/Episode
+        self.max_low_steps = cfg.get('max_low_steps', 50)  # 低层最大执行步数/HighStep
+
+        # 功能开关
+        self.use_masking = cfg.get('use_masking', True)  # 是否使用动作掩码
+        self.render_mode = cfg.get('render', False)  # 是否渲染/打印详细日志
+        self.save_history = cfg.get('save_history', True)  # 是否保存完整历史(用于Off-policy训练)
+
+        # 奖励缩放 (可选，用于归一化奖励)
+        self.reward_scale = cfg.get('reward_scale', 1.0)
+
+        # ==================================================
+        # 2. 设置基本参数 & 状态同步缓存
+        # ==================================================
+        # 🔥 HRL时序同步的关键缓存变量
+        self.current_high_state = None  # 当前高层状态 (State t)
+        self.next_high_state = None  # 执行后的高层状态 (State t+1)
+        self.last_high_action = None  # 上一次高层动作
+        self.last_high_reward = 0.0  # 上一次高层奖励
+        self.high_info_cache = {}  # 缓存高层Info
+
+        # 低层执行追踪
+        self.low_step_counter = 0  # 当前Episode累计低层步数
+
+        # ==================================================
+        # 3. 实例化/校验 (依赖注入检查)
+        # ==================================================
+        # 确保传入的对象是有效的，避免运行时报错
+        if not hasattr(self, 'env') or self.env is None:
+            raise ValueError("❌ HRL_Coordinator 初始化失败: 'env' 未设置")
+        if not hasattr(self, 'high_agent') or self.high_agent is None:
+            raise ValueError("❌ HRL_Coordinator 初始化失败: 'high_agent' 未设置")
+        if not hasattr(self, 'low_agent') or self.low_agent is None:
+            raise ValueError("❌ HRL_Coordinator 初始化失败: 'low_agent' 未设置")
+
+        # 简单的维度校验 (可选，防止维度不匹配)
+        try:
+            # 假设 agent 有 n 属性或者 env 有 n 属性
+            if hasattr(self.env, 'n') and hasattr(self.high_agent, 'n_nodes'):
+                assert self.env.n == self.high_agent.n_nodes, \
+                    f"⚠️ 警告: 环境节点数({self.env.n})与高层Agent配置({self.high_agent.n_nodes})不一致"
+        except Exception as e:
+            logger.warning(f"⚠️ 跳过维度兼容性检查: {e}")
+
+        # ==================================================
+        # 4. 初始化统计信息
+        # ==================================================
+        # 全局累计统计 (跨 Episode)
+        self.global_stats = defaultdict(int)
+
+        # 单个 Episode 统计 (每次 reset 会重置)
+        self.episode_stats = {
+            'total_reward': 0.0,
+            'high_steps': 0,
+            'low_steps': 0,
+            'vnf_deployments': 0,
+            'dest_connections': 0,
+            'failures': 0,
+            'success': False,
+            'reason': None  # 记录结束原因 (Success/Timeout/Failure)
+        }
+
+        # 历史记录容器 (用于 ReplayBuffer 或 调试分析)
+        # 使用 list 而不是 deque，因为通常需要保存整个 episode 的数据
+        self.history = {
+            'high_transitions': [],  # 存储 (s, a, r, s', done)
+            'low_transitions': [],
+            'rewards_trace': [],  # 奖励曲线
+            'errors': []  # 错误日志
+        }
+
+        logger.info(f"🤖 HRL_Coordinator外部的主控循环初始化完成 | "
+                    f"MaxSteps: H={self.max_high_steps}/L={self.max_low_steps}")
     def load_dataset(self, phase_or_req_file: str, events_file: Optional[str] = None) -> bool:
         """
         加载数据集（修复版）
