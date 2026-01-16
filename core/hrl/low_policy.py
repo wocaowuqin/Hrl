@@ -150,50 +150,80 @@ class GoalConditionedLowLevelPolicy(nn.Module):
 
         return logits, value
 
-    def select_action(
-            self,
-            state_emb: torch.Tensor,
-            goal_emb: Optional[torch.Tensor] = None,
-            action_mask: Optional[torch.Tensor] = None,
-            epsilon: float = 0.0
-    ) -> tuple:
+    def select_action(self, state_emb, goal_emb, action_mask=None, epsilon=0.1):
         """
-        选择动作（epsilon-greedy）
+        🔥 [修复版] 选择动作（低层动作）
 
         Args:
-            state_emb: 状态嵌入 [batch, state_dim]
-            goal_emb: Goal embedding [batch, goal_dim] (可选)
-            action_mask: 动作mask [batch, action_dim] (可选)
+            state_emb: (batch, state_dim) 状态嵌入
+            goal_emb: (batch, goal_dim) 目标嵌入
+            action_mask: (batch, n_actions) 动作mask，1=可选，0=禁止
             epsilon: 探索率
 
         Returns:
-            action: 选择的动作 [batch]
-            q_value: 对应的Q值 [batch]
+            action: int, 选择的动作
+            q_value: float, 对应的Q值
         """
-        batch_size = state_emb.size(0)
+        import torch
+        import numpy as np
 
-        # 前向传播
-        logits, _ = self.forward(state_emb, goal_emb, action_mask)
+        # 1. 前向传播获取Q值
+        with torch.no_grad():
+            policy_output = self.forward(state_emb, goal_emb)
 
-        # Epsilon-greedy
-        if self.training and torch.rand(1).item() < epsilon:
-            # 随机选择（从有效动作中）
-            if action_mask is not None:
-                valid_actions = (action_mask > 0).nonzero(as_tuple=True)[1]
-                if len(valid_actions) > 0:
-                    action = valid_actions[
-                        torch.randint(0, len(valid_actions), (batch_size,))
-                    ]
-                else:
-                    action = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+            # 兼容返回tuple的情况
+            if isinstance(policy_output, tuple):
+                q_values = policy_output[0]  # (batch, n_actions)
             else:
-                action = torch.randint(0, self.action_dim, (batch_size,), device=self.device)
+                q_values = policy_output
+
+        # 2. 🔥 关键修复：应用Mask（在argmax之前）
+        if action_mask is not None:
+            # 确保mask在正确设备上
+            if isinstance(action_mask, np.ndarray):
+                action_mask = torch.FloatTensor(action_mask).to(q_values.device)
+
+            # 确保mask维度匹配
+            if action_mask.dim() == 1:
+                action_mask = action_mask.unsqueeze(0)
+
+            if action_mask.size(1) != q_values.size(1):
+                # 维度不匹配，截断或填充
+                if action_mask.size(1) < q_values.size(1):
+                    padding = torch.zeros(
+                        action_mask.size(0),
+                        q_values.size(1) - action_mask.size(1),
+                        device=action_mask.device
+                    )
+                    action_mask = torch.cat([action_mask, padding], dim=1)
+                else:
+                    action_mask = action_mask[:, :q_values.size(1)]
+
+            # 🔥 Q值屏蔽法：mask==0的位置设为-1e9
+            masked_q_values = q_values.clone()
+            masked_q_values[action_mask == 0] = -1e9
         else:
-            # Greedy选择
-            action = torch.argmax(logits, dim=1)
+            masked_q_values = q_values
+
+        # 3. 动作选择（epsilon-greedy）
+        if np.random.rand() < epsilon:
+            # 探索：从有效动作中随机选择
+            if action_mask is not None:
+                valid_indices = torch.nonzero(action_mask[0] > 0, as_tuple=False).squeeze()
+                if valid_indices.numel() == 0:
+                    action = torch.tensor(0)
+                elif valid_indices.numel() == 1:
+                    action = valid_indices
+                else:
+                    action = valid_indices[torch.randint(len(valid_indices), (1,))]
+            else:
+                action = torch.randint(0, q_values.size(1), (1,))
+        else:
+            # 利用：选择Q值最大的
+            action = torch.argmax(masked_q_values[0])
 
         # 获取对应的Q值
-        q_value = logits.gather(1, action.unsqueeze(1)).squeeze(1)
+        q_value = masked_q_values[0, action].item()
 
         return action, q_value
 

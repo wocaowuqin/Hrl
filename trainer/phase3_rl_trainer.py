@@ -494,6 +494,42 @@ class Phase3RLTrainer:
                 next_state, reward, done, step_info = step_result
                 truncated = False
 
+            # 🔥🔥🔥 [V31.0 新增] 检测 need_high_level 信号
+            # ============================================
+            if truncated and step_info.get('need_high_level', False):
+                error_type = step_info.get('error', 'unknown')
+                logger.info(f"⚠️ [Episode {episode_idx}] 低层检测到问题: {error_type}")
+                logger.info(f"   → 返回高层重新决策（不终止episode）")
+
+                # 记录奖励
+                episode_reward += reward
+
+                # 重置agent分支状态（强制触发高层决策）
+                if hasattr(self.agent, 'current_branch_id'):
+                    self.agent.current_branch_id = None
+                if hasattr(self.agent, 'subgoal_steps'):
+                    self.agent.subgoal_steps = 999
+                if hasattr(self.agent, 'current_subgoal'):
+                    self.agent.current_subgoal = None
+
+                # 存储经验（失败的尝试也要学习）
+                if action_info.get('high_level_decision', False):
+                    goal = unconnected_dests[high_action] if unconnected_dests and high_action < len(
+                        unconnected_dests) else -1
+                    if goal != -1:
+                        self.agent.store_transition_high(state, goal, reward, next_state, False)
+                        stored_high_transitions += 1
+
+                self.agent.store_transition_low(state, low_action, reward, next_state, False)
+                stored_low_transitions += 1
+
+                # 更新状态
+                state = next_state
+                unconnected_dests = self._get_current_destinations()
+                steps += 1
+
+                # 继续循环（不终止episode）
+                continue
             # 🔥 更新时间槽信息
             new_time_slot = step_info.get('time_slot', current_time_slot)
             new_decision_steps = step_info.get('decision_steps', decision_steps)

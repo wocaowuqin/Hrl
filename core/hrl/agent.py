@@ -1029,51 +1029,94 @@ class HRLAgent:
             action_mask: Optional[np.ndarray] = None,
             blacklist_info: Optional[dict] = None
     ) -> int:
-        try:
-            # 1. 获取基础动作和权重
-            if action_mask is not None and len(action_mask) > 0:
-                valid_mask = action_mask > 0
-                valid_actions = np.where(valid_mask)[0]
-                if len(valid_actions) == 0: return random.randint(0, self.n_actions - 1)
-                action_weights = action_mask[valid_actions].copy()
-            else:
-                valid_actions = np.arange(self.n_actions)
-                action_weights = np.ones(len(valid_actions))
+        """
+        🔥 [V2.0 完全修复版] 低层动作选择（黑名单感知 + 正确的Mask处理）
 
-            # 2. 黑名单权重惩罚
+        关键修复：
+        1. ✅ Q值屏蔽法（不是权重融合）
+        2. ✅ Mask在argmax之前应用
+        3. ✅ 探索时从有效动作采样
+        """
+        try:
+            # 1. 获取状态嵌入
+            state_emb = self._extract_state_embedding(state)
+            if self.current_goal_emb is None:
+                self._generate_goal_embedding(state)
+
+            # 2. 🔥 准备完整的Mask（融合action_mask和blacklist）
+            if action_mask is not None and len(action_mask) > 0:
+                # 确保mask长度正确
+                if len(action_mask) < self.n_actions:
+                    # 如果mask太短，填充0
+                    full_mask = np.zeros(self.n_actions, dtype=np.float32)
+                    full_mask[:len(action_mask)] = action_mask
+                else:
+                    full_mask = action_mask[:self.n_actions].copy()
+            else:
+                # 没有mask，默认全部允许
+                full_mask = np.ones(self.n_actions, dtype=np.float32)
+
+            # 3. 应用黑名单（降低权重而非完全禁止）
             if blacklist_info:
                 blacklist_nodes = blacklist_info.get('nodes', [])
-                for i, action in enumerate(valid_actions):
-                    if action in blacklist_nodes: action_weights[i] *= 0.1
+                for node in blacklist_nodes:
+                    if 0 <= node < self.n_actions:
+                        full_mask[node] *= 0.1  # 降低到10%
 
-            # 3. 策略选择
+            # 4. 检查是否有有效动作
+            valid_actions = np.where(full_mask > 0)[0]
+            if len(valid_actions) == 0:
+                # 完全没有有效动作，随机返回
+                return random.randint(0, self.n_actions - 1)
+
+            # 5. 动作选择（epsilon-greedy）
             if random.random() < self.epsilon_low:
-                # 探索：基于权重的概率采样
+                # ========== 探索：基于mask权重的概率采样 ==========
+                action_weights = full_mask[valid_actions]
                 p = action_weights / action_weights.sum()
                 return int(np.random.choice(valid_actions, p=p))
+
             else:
-                # 利用：Q网络决策
+                # ========== 利用：Q网络决策 ==========
                 if self.low_policy is not None:
-                    state_emb = self._extract_state_embedding(state)
-                    if self.current_goal_emb is None: self._generate_goal_embedding(state)
-
                     with torch.no_grad():
-                        # 🔥 修复重点：处理 low_policy 返回的元组 (logits, value)
-                        policy_output = self.low_policy(state_emb, self.current_goal_emb.to(state_emb.device))
+                        # 前向传播获取Q值
+                        policy_output = self.low_policy(
+                            state_emb,
+                            self.current_goal_emb.to(state_emb.device)
+                        )
 
+                        # 处理可能的tuple返回
                         if isinstance(policy_output, tuple):
                             q_values = policy_output[0].cpu().numpy().flatten()
                         else:
                             q_values = policy_output.cpu().numpy().flatten()
 
-                    # Q值与Mask权重融合
-                    combined_scores = q_values[valid_actions] * action_weights
-                    return int(valid_actions[np.argmax(combined_scores)])
+                        # 确保Q值长度正确
+                        if len(q_values) < self.n_actions:
+                            # Q值太短，填充最小值
+                            full_q = np.full(self.n_actions, -1e9, dtype=np.float32)
+                            full_q[:len(q_values)] = q_values
+                            q_values = full_q
+                        elif len(q_values) > self.n_actions:
+                            q_values = q_values[:self.n_actions]
 
-                return int(valid_actions[np.argmax(action_weights)])
+                    # 🔥🔥🔥 关键修复：Q值屏蔽法（不是权重融合）
+                    masked_q_values = q_values.copy()
+                    masked_q_values[full_mask == 0] = -1e9  # mask==0的位置设为极小值
+
+                    # argmax选择最大Q值
+                    return int(np.argmax(masked_q_values))
+
+                else:
+                    # 没有Q网络，基于mask权重选择
+                    action_weights = full_mask[valid_actions]
+                    return int(valid_actions[np.argmax(action_weights)])
 
         except Exception as e:
             logger.error(f"[Select Low Action] Error: {e}")
+            import traceback
+            traceback.print_exc()
             return random.randint(0, self.n_actions - 1)
 
     def _prepare_state(self, state):

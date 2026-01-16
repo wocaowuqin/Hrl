@@ -166,56 +166,57 @@ class HighLevelPolicy(nn.Module):
 
         return q_values, subgoal_emb, value
 
-    def select_goal(
-            self,
-            graph_emb: torch.Tensor,
-            valid_goals: Optional[torch.Tensor] = None,
-            epsilon: float = 0.0
-    ) -> tuple:
+    def select_goal(self, state_emb, valid_goals_mask, epsilon=0.1):
         """
-        选择目标（epsilon-greedy）
+        🔥 [修复版] 选择目标（高层动作）
 
         Args:
-            graph_emb: 图嵌入 [batch, gnn_output_dim]
-            valid_goals: 有效目标mask [batch, num_goals]
+            state_emb: (batch, state_dim) 状态嵌入
+            valid_goals_mask: (batch, n_goals) 有效目标mask，1=可选，0=禁止
             epsilon: 探索率
 
         Returns:
-            goal_idx: 选择的目标索引 [batch]
-            subgoal_emb: 对应的subgoal embedding [batch, goal_dim]
+            goal_idx: int, 选择的目标索引
+            goal_emb: (1, goal_dim), 目标嵌入
         """
-        batch_size = graph_emb.size(0)
+        import torch
+        import numpy as np
 
-        # 前向传播
-        q_values, subgoal_emb, _ = self.forward(
-            graph_emb,
-            return_subgoal=True,
-            return_value=False
-        )
+        # 1. 前向传播获取Q值
+        with torch.no_grad():
+            q_values, goal_emb, _ = self.forward(state_emb, return_subgoal=True)
+            # q_values: (batch, n_goals)
 
-        # 应用mask
-        if valid_goals is not None:
-            q_values = q_values.masked_fill(valid_goals == 0, float('-inf'))
+        # 2. 🔥 关键修复：应用Mask（在argmax之前）
+        if valid_goals_mask is not None:
+            # 确保mask在正确设备上
+            if isinstance(valid_goals_mask, np.ndarray):
+                valid_goals_mask = torch.FloatTensor(valid_goals_mask).to(q_values.device)
 
-        # Epsilon-greedy
-        if self.training and torch.rand(1).item() < epsilon:
-            # 随机选择（从有效目标中）
-            if valid_goals is not None:
-                valid_indices = (valid_goals > 0).nonzero(as_tuple=True)[1]
-                if len(valid_indices) > 0:
-                    # 每个batch随机选一个
-                    goal_idx = valid_indices[
-                        torch.randint(0, len(valid_indices), (batch_size,))
-                    ]
-                else:
-                    goal_idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-            else:
-                goal_idx = torch.randint(0, self.num_goals, (batch_size,), device=self.device)
+            # 🔥 Q值屏蔽法：mask==0的位置设为-1e9
+            masked_q_values = q_values.clone()
+            masked_q_values[valid_goals_mask == 0] = -1e9
         else:
-            # Greedy选择
-            goal_idx = torch.argmax(q_values, dim=1)
+            masked_q_values = q_values
 
-        return goal_idx, subgoal_emb
+        # 3. 动作选择（epsilon-greedy）
+        if np.random.rand() < epsilon:
+            # 探索：从有效目标中随机选择
+            if valid_goals_mask is not None:
+                valid_indices = torch.nonzero(valid_goals_mask[0] > 0, as_tuple=False).squeeze()
+                if valid_indices.numel() == 0:
+                    goal_idx = torch.tensor(0)
+                elif valid_indices.numel() == 1:
+                    goal_idx = valid_indices
+                else:
+                    goal_idx = valid_indices[torch.randint(len(valid_indices), (1,))]
+            else:
+                goal_idx = torch.randint(0, q_values.size(1), (1,))
+        else:
+            # 利用：选择Q值最大的
+            goal_idx = torch.argmax(masked_q_values[0])
+
+        return goal_idx, goal_emb
 
 
 # ============================================
