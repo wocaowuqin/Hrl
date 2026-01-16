@@ -30,12 +30,13 @@ logger = logging.getLogger(__name__)
 class Phase3RLTrainer:
     """Phase 3: Goal-Conditioned RL Trainer with DAgger + Time Slot System"""
 
-    def __init__(self, env, agent, output_dir, config):
+    def __init__(self, env, agent, output_dir, config, coordinator=None):
         self.env = env
         self.agent = agent
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cfg = config
+        self.coordinator = coordinator
 
         # 🔥 初始化可视化器
         self.visualizer = None
@@ -358,15 +359,26 @@ class Phase3RLTrainer:
             self._print_final_timeslot_stats()
 
     def _run_episode(self, episode_idx: int):
-        """运行一个episode（集成黑名单 + DAgger + 🔥 时间槽系统 + Loss监控）"""
+        """
+        🔥 [V32.0 HRL Coordinator 集成版]
+
+        运行一个episode（集成 Coordinator + 黑名单 + DAgger + 时间槽系统 + Loss监控）
+
+        核心逻辑:
+        1. 优先使用 HRL Coordinator（如果可用）
+        2. Coordinator 自动管理高低层交互
+        3. 回退到直接调用 env.step（兼容模式）
+        """
         import numpy as np
         import random
 
-        # 🔧 新增：预热检查
+        # ========================================
+        # 初始化
+        # ========================================
+        # 🔧 预热检查
         if self.agent.steps_done < self.warmup_steps:
             logger.debug(f"🔥 预热阶段: {self.agent.steps_done}/{self.warmup_steps}")
 
-        # 获取最大步数
         max_steps = self.max_steps_per_episode
 
         # ✅ 重置环境
@@ -381,18 +393,17 @@ class Phase3RLTrainer:
         initial_time_slot = reset_info.get('time_slot', 0)
         current_time_slot = initial_time_slot
         request_id = reset_info.get('request_id')
-
-        # 🔥 时间槽跳转检测
         last_time_slot = current_time_slot
 
-        # 获取 mask 和 info
+        # 获取初始 mask 和 info
         action_mask = reset_info.get('action_mask')
         blacklist_info = reset_info.get('blacklist_info', {})
         unconnected_dests = self._get_current_destinations()
 
+        # Episode 状态
         done = False
         steps = 0
-        decision_steps = 0  # 🔥 决策步数（不是时间！）
+        decision_steps = 0
         episode_reward = 0
 
         # 🔥 Loss 统计容器
@@ -404,181 +415,278 @@ class Phase3RLTrainer:
         expert_steps = 0
         masked_expert_steps = 0
 
-        # 初始化 step_info
-        step_info = {'success': False, 'request_completed': False}
-
-        # 🔧 新增：用于监控经验存储
+        # 经验存储统计
         stored_high_transitions = 0
         stored_low_transitions = 0
 
+        # 初始化 step_info
+        step_info = {'success': False, 'request_completed': False}
+
+        # ========================================
+        # 🔥 检测是否使用 Coordinator
+        # ========================================
+        use_coordinator = (self.coordinator is not None)
+
+        if use_coordinator:
+            logger.debug(f"✅ Episode {episode_idx}: 使用 HRL Coordinator 模式")
+        else:
+            logger.debug(f"⚠️ Episode {episode_idx}: 使用回退模式（直接调用 env.step）")
+
+        # ========================================
+        # 主循环
+        # ========================================
         while not done and steps < max_steps:
-            # DAgger 逻辑
-            beta = self.beta
-            use_dagger = self.use_dagger
-            use_expert = False
-            expert_action = None
 
-            # 🔥🔥🔥 关键修复：从 state 中提取 action_mask 🔥🔥🔥
-            action_mask = None
+            # ============================================================
+            # 🔥🔥🔥 方案 A: 使用 HRL Coordinator
+            # ============================================================
+            if use_coordinator:
+                try:
+                    # Coordinator 自动管理高低层交互
+                    next_state, reward, done, truncated, step_info = self.coordinator.step()
 
-            # 方式1: 从PyG Data对象中提取
-            if hasattr(state, 'action_mask'):
-                action_mask = state.action_mask
-                if hasattr(action_mask, 'cpu'):
-                    action_mask = action_mask.cpu().numpy()
-                if action_mask.ndim > 1:
-                    action_mask = action_mask.squeeze()
+                    # 从 Coordinator 获取执行的动作信息
+                    if hasattr(self.coordinator, 'last_transition'):
+                        transition = self.coordinator.last_transition
+                        if transition and len(transition) == 5:
+                            trans_state, low_action, trans_reward, trans_next_state, trans_done = transition
 
-            # 方式2: 从step_info中提取
-            elif 'action_mask' in step_info:
-                action_mask = step_info['action_mask']
+                            # 存储低层经验
+                            self.agent.store_transition_low(
+                                trans_state, low_action, trans_reward, trans_next_state, trans_done
+                            )
+                            stored_low_transitions += 1
 
-            # 方式3: 直接调用环境方法
-            if action_mask is None and hasattr(self.env, 'get_low_level_action_mask'):
-                action_mask = self.env.get_low_level_action_mask()
+                    # 如果 Coordinator 触发了高层决策，可能需要单独存储
+                    if hasattr(self.coordinator, 'last_high_action'):
+                        high_action = self.coordinator.last_high_action
+                        if high_action is not None and unconnected_dests:
+                            goal = unconnected_dests[high_action] if high_action < len(unconnected_dests) else -1
+                            if goal != -1:
+                                self.agent.store_transition_high(
+                                    state, goal, reward, next_state, done or truncated
+                                )
+                                stored_high_transitions += 1
 
-            # 🔥 确保mask是numpy数组
-            if action_mask is not None:
-                if hasattr(action_mask, 'numpy'):
-                    action_mask = action_mask.numpy()
-                if isinstance(action_mask, list):
-                    action_mask = np.array(action_mask)
+                    # 更新状态
+                    state = next_state
+                    episode_reward += reward
+                    steps += 1
 
-            # 专家介入判断
-            if use_dagger and random.random() < beta:
-                expert_suggestion = self._get_expert_action(state)
-                if action_mask is None:
-                    use_expert = True
-                    expert_action = expert_suggestion
-                else:
-                    valid_actions = np.where(action_mask > 0)[0]
-                    if expert_suggestion in valid_actions:
+                    # 更新时间槽信息
+                    new_time_slot = step_info.get('time_slot', current_time_slot)
+                    new_decision_steps = step_info.get('decision_steps', decision_steps)
+
+                    if self.use_timeslot and new_time_slot != last_time_slot:
+                        if self.log_timeslot_jumps:
+                            logger.debug(f"⏰ [Ep {episode_idx}] Time Slot: {last_time_slot} → {new_time_slot}")
+                        self.timeslot_stats['timeslot_jumps'].append((last_time_slot, new_time_slot))
+                        last_time_slot = new_time_slot
+
+                    current_time_slot = new_time_slot
+                    decision_steps = new_decision_steps
+
+                    # 更新目标信息
+                    unconnected_dests = self._get_current_destinations()
+
+                except Exception as e:
+                    logger.error(f"❌ Coordinator.step 失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # 发生错误时终止 episode
+                    break
+
+            # ============================================================
+            # 🔥🔥🔥 方案 B: 回退模式（无 Coordinator）
+            # ============================================================
+            else:
+                # ----------------------------------------
+                # 1. 提取 Action Mask
+                # ----------------------------------------
+                action_mask = None
+
+                # 方式1: 从PyG Data对象中提取
+                if hasattr(state, 'action_mask'):
+                    action_mask = state.action_mask
+                    if hasattr(action_mask, 'cpu'):
+                        action_mask = action_mask.cpu().numpy()
+                    if action_mask.ndim > 1:
+                        action_mask = action_mask.squeeze()
+
+                # 方式2: 从step_info中提取
+                elif 'action_mask' in step_info:
+                    action_mask = step_info['action_mask']
+
+                # 方式3: 直接调用环境方法
+                if action_mask is None and hasattr(self.env, 'get_low_level_action_mask'):
+                    action_mask = self.env.get_low_level_action_mask()
+
+                # 🔥 确保mask是numpy数组
+                if action_mask is not None:
+                    if hasattr(action_mask, 'numpy'):
+                        action_mask = action_mask.numpy()
+                    if isinstance(action_mask, list):
+                        action_mask = np.array(action_mask)
+
+                # ----------------------------------------
+                # 2. DAgger 逻辑
+                # ----------------------------------------
+                beta = self.beta
+                use_dagger = self.use_dagger
+                use_expert = False
+                expert_action = None
+
+                if use_dagger and random.random() < beta:
+                    expert_suggestion = self._get_expert_action(state)
+                    if action_mask is None:
                         use_expert = True
                         expert_action = expert_suggestion
-                        expert_steps += 1
                     else:
-                        masked_expert_steps += 1
+                        valid_actions = np.where(action_mask > 0)[0]
+                        if expert_suggestion in valid_actions:
+                            use_expert = True
+                            expert_action = expert_suggestion
+                            expert_steps += 1
+                        else:
+                            masked_expert_steps += 1
 
-            # ✅ Agent 选择动作
-            high_action, low_action, action_info = self.agent.select_action(
-                state=state,
-                unconnected_dests=unconnected_dests,
-                action_mask=action_mask,
-                use_expert=use_expert,
-                expert_action=expert_action,
-                blacklist_info=blacklist_info
-            )
+                # ----------------------------------------
+                # 3. Agent 选择动作
+                # ----------------------------------------
+                high_action, low_action, action_info = self.agent.select_action(
+                    state=state,
+                    unconnected_dests=unconnected_dests,
+                    action_mask=action_mask,
+                    use_expert=use_expert,
+                    expert_action=expert_action,
+                    blacklist_info=blacklist_info
+                )
 
-            # 🛡️ 防御：如果 Agent 返回 -1 (无效)，手动处理
-            if low_action == -1:
-                logger.warning(f"⚠️ Agent returned -1 (No Valid Actions). Terminating Episode {episode_idx}.")
-                return episode_reward, {
-                    'success': False,
-                    'blocking_rate': 1.0,
-                    'message': 'no_valid_actions',
-                    'time_slot': current_time_slot,
-                    'decision_steps': decision_steps,
-                    'time_slots_covered': current_time_slot - initial_time_slot,
-                    'avg_loss': 0.0,
-                    'avg_high_loss': 0.0,
-                    'avg_low_loss': 0.0
-                }
+                # 🛡️ 防御：如果 Agent 返回 -1 (无效)，终止 episode
+                if low_action == -1:
+                    logger.warning(f"⚠️ Agent returned -1 (No Valid Actions). Terminating Episode {episode_idx}.")
+                    return episode_reward, {
+                        'success': False,
+                        'blocking_rate': 1.0,
+                        'message': 'no_valid_actions',
+                        'time_slot': current_time_slot,
+                        'decision_steps': decision_steps,
+                        'time_slots_covered': current_time_slot - initial_time_slot,
+                        'avg_loss': 0.0,
+                        'avg_high_loss': 0.0,
+                        'avg_low_loss': 0.0
+                    }
 
-            # 执行动作
-            step_result = self.env.step(low_action)
+                # ----------------------------------------
+                # 4. 执行动作
+                # ----------------------------------------
+                step_result = self.env.step(low_action)
 
-            # 解包结果
-            if len(step_result) == 5:
-                next_state, reward, done, truncated, step_info = step_result
-            else:
-                next_state, reward, done, step_info = step_result
-                truncated = False
+                # 解包结果
+                if len(step_result) == 5:
+                    next_state, reward, done, truncated, step_info = step_result
+                else:
+                    next_state, reward, done, step_info = step_result
+                    truncated = False
 
-            # 🔥🔥🔥 [V31.0 新增] 检测 need_high_level 信号
-            # ============================================
-            if truncated and step_info.get('need_high_level', False):
-                error_type = step_info.get('error', 'unknown')
-                logger.info(f"⚠️ [Episode {episode_idx}] 低层检测到问题: {error_type}")
-                logger.info(f"   → 返回高层重新决策（不终止episode）")
+                # ----------------------------------------
+                # 5. 🔥 检测 need_high_level 信号
+                # ----------------------------------------
+                if truncated and step_info.get('need_high_level', False):
+                    error_type = step_info.get('error', 'unknown')
+                    logger.info(f"⚠️ [Episode {episode_idx}] 低层检测到问题: {error_type}")
+                    logger.info(f"   → 返回高层重新决策（不终止episode）")
 
-                # 记录奖励
-                episode_reward += reward
+                    # 记录奖励
+                    episode_reward += reward
 
-                # 重置agent分支状态（强制触发高层决策）
-                if hasattr(self.agent, 'current_branch_id'):
-                    self.agent.current_branch_id = None
-                if hasattr(self.agent, 'subgoal_steps'):
-                    self.agent.subgoal_steps = 999
-                if hasattr(self.agent, 'current_subgoal'):
-                    self.agent.current_subgoal = None
+                    # 重置agent分支状态（强制触发高层决策）
+                    if hasattr(self.agent, 'current_branch_id'):
+                        self.agent.current_branch_id = None
+                    if hasattr(self.agent, 'subgoal_steps'):
+                        self.agent.subgoal_steps = 999
+                    if hasattr(self.agent, 'current_subgoal'):
+                        self.agent.current_subgoal = None
 
-                # 存储经验（失败的尝试也要学习）
+                    # 存储经验（失败的尝试也要学习）
+                    if action_info.get('high_level_decision', False):
+                        goal = unconnected_dests[high_action] if unconnected_dests and high_action < len(
+                            unconnected_dests) else -1
+                        if goal != -1:
+                            self.agent.store_transition_high(state, goal, reward, next_state, False)
+                            stored_high_transitions += 1
+
+                    self.agent.store_transition_low(state, low_action, reward, next_state, False)
+                    stored_low_transitions += 1
+
+                    # 更新状态
+                    state = next_state
+                    unconnected_dests = self._get_current_destinations()
+                    steps += 1
+
+                    # 继续循环（不终止episode）
+                    continue
+
+                # ----------------------------------------
+                # 6. 更新时间槽信息
+                # ----------------------------------------
+                new_time_slot = step_info.get('time_slot', current_time_slot)
+                new_decision_steps = step_info.get('decision_steps', decision_steps)
+
+                if self.use_timeslot and new_time_slot != last_time_slot:
+                    if self.log_timeslot_jumps:
+                        logger.debug(f"⏰ [Ep {episode_idx}] Time Slot: {last_time_slot} → {new_time_slot}")
+                    self.timeslot_stats['timeslot_jumps'].append((last_time_slot, new_time_slot))
+                    last_time_slot = new_time_slot
+
+                current_time_slot = new_time_slot
+                decision_steps = new_decision_steps
+
+                # ----------------------------------------
+                # 7. 记录失败原因（黑名单学习）
+                # ----------------------------------------
+                if not step_info.get('success', True):
+                    reason = step_info.get('message', 'unknown')
+                    if "资源不足" in reason or "访问超限" in reason:
+                        self.agent.record_failure(low_action, reason)
+
+                # ----------------------------------------
+                # 8. 存储经验
+                # ----------------------------------------
+                # High-Level Buffer
                 if action_info.get('high_level_decision', False):
                     goal = unconnected_dests[high_action] if unconnected_dests and high_action < len(
                         unconnected_dests) else -1
                     if goal != -1:
-                        self.agent.store_transition_high(state, goal, reward, next_state, False)
+                        self.agent.store_transition_high(state, goal, reward, next_state, done or truncated)
                         stored_high_transitions += 1
 
-                self.agent.store_transition_low(state, low_action, reward, next_state, False)
+                # Low-Level Buffer
+                self.agent.store_transition_low(state, low_action, reward, next_state, done or truncated)
                 stored_low_transitions += 1
 
-                # 更新状态
+                # ----------------------------------------
+                # 9. 更新状态
+                # ----------------------------------------
                 state = next_state
+                action_mask = step_info.get('action_mask')
+                blacklist_info = step_info.get('blacklist_info', {})
                 unconnected_dests = self._get_current_destinations()
+                episode_reward += reward
                 steps += 1
 
-                # 继续循环（不终止episode）
-                continue
-            # 🔥 更新时间槽信息
-            new_time_slot = step_info.get('time_slot', current_time_slot)
-            new_decision_steps = step_info.get('decision_steps', decision_steps)
+                if truncated:
+                    done = True
 
-            # 🔥 检测时间槽跳转
-            if self.use_timeslot and new_time_slot != last_time_slot:
-                if self.log_timeslot_jumps:
-                    logger.debug(f"⏰ [Ep {episode_idx}] Time Slot: {last_time_slot} → {new_time_slot}")
-                self.timeslot_stats['timeslot_jumps'].append((last_time_slot, new_time_slot))
-                last_time_slot = new_time_slot
-
-            current_time_slot = new_time_slot
-            decision_steps = new_decision_steps
-
-            # 记录失败原因用于黑名单学习
-            if not step_info.get('success', True):
-                reason = step_info.get('message', 'unknown')
-                if "资源不足" in reason or "访问超限" in reason:
-                    self.agent.record_failure(low_action, reason)
-
-            # 🔧 修复：总是存储经验，无论是专家还是agent的选择
-            # High-Level Buffer
-            if action_info.get('high_level_decision', False):
-                goal = unconnected_dests[high_action] if unconnected_dests and high_action < len(
-                    unconnected_dests) else -1
-                if goal != -1:
-                    self.agent.store_transition_high(state, goal, reward, next_state, done or truncated)
-                    stored_high_transitions += 1
-
-            # Low-Level Buffer
-            self.agent.store_transition_low(state, low_action, reward, next_state, done or truncated)
-            stored_low_transitions += 1
-
-            # 更新状态
-            state = next_state
-            action_mask = step_info.get('action_mask')
-            blacklist_info = step_info.get('blacklist_info', {})
-            unconnected_dests = self._get_current_destinations()
-            episode_reward += reward
-            steps += 1
-
-            # 🔧 修复：定期更新网络（确保有足够经验）
+            # ============================================================
+            # 🔥 定期更新网络（适用于两种模式）
+            # ============================================================
             if steps % self.update_frequency == 0:
-                # 🔥 确保经验缓冲区有足够数据
-                has_enough_high_exp = len(self.agent.high_memory) >= self.agent.batch_size // 4
+                # 确保经验缓冲区有足够数据
                 has_enough_low_exp = len(self.agent.low_memory) >= self.agent.batch_size
 
                 if has_enough_low_exp:
-                    # 🔧 调用更新并获取详细的损失信息
+                    # 调用更新并获取详细的损失信息
                     loss_dict = self.agent.update_policies()
 
                     if loss_dict:
@@ -597,28 +705,29 @@ class Phase3RLTrainer:
 
                         self.total_updates += 1
 
-                        # 🔧 调试：定期打印更新信息
+                        # 定期打印更新信息
                         if self.total_updates % 100 == 0:
                             logger.debug(
                                 f"🔄 Update #{self.total_updates}: HighLoss={high_loss:.6f}, LowLoss={low_loss:.6f}")
 
-                # 🔧 如果经验不足，打印警告
+                # 如果经验不足，打印警告
                 elif self.total_updates < 10 and steps > 50:
                     logger.debug(f"⚠️ 经验不足: High={len(self.agent.high_memory)}, Low={len(self.agent.low_memory)}")
 
-            if truncated: done = True
-
-        # ============================================================
-        # 🔥🔥🔥 关键修复：Episode 结束统计
-        # ============================================================
+        # ========================================
+        # Episode 结束处理
+        # ========================================
+        # 判断成功与否
         is_success = step_info.get('request_success', None)
         if is_success is None:
             is_success = step_info.get('request_completed', False) or step_info.get('success', False)
 
+        # 检查环境是否已归档
         env_already_archived = False
         if hasattr(self.env, 'current_request'):
             env_already_archived = (self.env.current_request is None)
 
+        # 如果环境未归档，执行归档
         if not env_already_archived:
             if hasattr(self.env, 'current_request') and self.env.current_request:
                 req_id = self.env.current_request.get('id', '?')
@@ -629,20 +738,22 @@ class Phase3RLTrainer:
                     logger.info(f"✅ [Episode清理] 请求 {req_id} 成功，归档资源...")
                     self.env._archive_request(success=True)
 
+                # 清理环境状态
                 self.env.current_request = None
                 self.env.current_branch_id = None
                 self.env.current_tree = {}
                 self.env.nodes_on_tree = set()
                 self.env.branch_states = {}
-                if hasattr(self.env, 'curr_ep_node_allocs'): self.env.curr_ep_node_allocs = []
-                if hasattr(self.env, 'curr_ep_link_allocs'): self.env.curr_ep_link_allocs = []
+                if hasattr(self.env, 'curr_ep_node_allocs'):
+                    self.env.curr_ep_node_allocs = []
+                if hasattr(self.env, 'curr_ep_link_allocs'):
+                    self.env.curr_ep_link_allocs = []
         else:
             logger.info(f"ℹ️ [Episode清理] 环境已归档，跳过Trainer归档")
 
-        # ============================================================
-        # 🔥 构建完整的 episode_info（包含时间槽信息和Loss）
-        # ============================================================
-
+        # ========================================
+        # 构建 Episode Info
+        # ========================================
         # 计算平均 Loss
         avg_loss = np.mean(episode_losses) if episode_losses else 0.0
         avg_high_loss = np.mean(episode_high_losses) if episode_high_losses else 0.0
@@ -660,25 +771,32 @@ class Phase3RLTrainer:
             'avg_high_loss': avg_high_loss,
             'avg_low_loss': avg_low_loss,
 
-            # 🔥 时间槽信息
+            # 时间槽信息
             'current_time_slot': current_time_slot,
             'initial_time_slot': initial_time_slot,
             'time_slots_covered': current_time_slot - initial_time_slot,
             'decision_steps': decision_steps,
             'request_id': request_id,
-            'requests_processed': 1
+            'requests_processed': 1,
+
+            # 🔥 新增：标记使用的模式
+            'used_coordinator': use_coordinator
         }
 
-        # 🔥 更新时间槽统计
+        # 更新时间槽统计
         if self.use_timeslot:
             self.timeslot_stats['total_time_slots'] += (current_time_slot - initial_time_slot)
             self.timeslot_stats['total_decision_steps'] += decision_steps
 
-        # 简单日志
+        # ========================================
+        # 打印日志
+        # ========================================
         status_icon = "✅" if is_success else "❌"
+        mode_icon = "🤖" if use_coordinator else "🔧"
+
         if is_success or episode_idx % 10 == 0:
             logger.info(
-                f"Ep {episode_idx} | {status_icon} | "
+                f"{mode_icon} Ep {episode_idx} | {status_icon} | "
                 f"Rw: {episode_reward:.1f} | "
                 f"Steps: {steps} | "
                 f"HiLoss: {avg_high_loss:.4f} | "
@@ -687,12 +805,11 @@ class Phase3RLTrainer:
                 f"DS: {decision_steps}"
             )
 
-            # 🔧 调试：打印经验存储情况
+            # 调试：打印经验存储情况
             if stored_low_transitions == 0:
                 logger.warning(f"⚠️ Episode {episode_idx}: 没有存储任何Low-Level经验!")
 
         return episode_reward, episode_info
-
     def _get_current_destinations(self):
         """获取当前未连接的目的地列表"""
         if not hasattr(self.env, 'current_request') or self.env.current_request is None:

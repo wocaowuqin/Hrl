@@ -1284,8 +1284,17 @@ class SFC_HIRL_Env(gym.Env):
                 'message': '目的地连接目标已设定，等待低层执行'
             }
 
+    # 在 SFC_HIRL_Env 类中替换这两个方法
+
     def _is_valid_node(self, node):
-        """验证节点是否有效且存在"""
+        """
+        验证节点是否有效且存在
+
+        修复要点:
+        1. 正确检查字典结构的 resource_mgr.nodes
+        2. 兼容多种数据结构 (dict/list/ndarray)
+        3. 严格边界检查
+        """
         # 1. 基础类型和边界检查
         try:
             node = int(node)
@@ -1295,27 +1304,37 @@ class SFC_HIRL_Env(gym.Env):
         if node < 0 or node >= self.n:
             return False
 
-        # 2. 资源管理器检查 (确保与 Mask 逻辑一致)
+        # 2. 资源管理器检查
         if hasattr(self, 'resource_mgr') and self.resource_mgr is not None:
-            # 兼容不同的资源管理器实现
-            if hasattr(self.resource_mgr, 'has_node'):
-                return self.resource_mgr.has_node(node)
-            elif hasattr(self.resource_mgr, 'nodes'):
-                # 如果 nodes 是列表或字典
-                return node in self.resource_mgr.nodes
+            if hasattr(self.resource_mgr, 'nodes'):
+                nodes = self.resource_mgr.nodes
+
+                # 🔥 字典结构 {'cpu': [...], 'memory': [...]}
+                if isinstance(nodes, dict):
+                    cpu_list = nodes.get('cpu', [])
+                    if hasattr(cpu_list, '__len__'):
+                        return 0 <= node < len(cpu_list)
+                    return False
+
+                # 列表结构 [{}, {}, ...]
+                elif isinstance(nodes, list):
+                    return 0 <= node < len(nodes)
+
+                # NumPy 数组
+                elif hasattr(nodes, 'shape'):
+                    return 0 <= node < nodes.shape[0]
 
         return True
+
     def get_high_level_action_mask(self):
         """
-        🔥 [V11.7 逻辑对齐版] 高层动作掩码
+        🔥 [V11.8 节点验证版] 高层动作掩码
 
-        关键修复：
-        1. 掩码必须对应 action_space 的含义。
-        2. 当前 step_high_level 的动作是 'subgoal_idx' (第几个未连接的目的地)，
-           而不是物理节点 ID。
-        3. 所以掩码应该允许 [0, 1, ..., num_remaining-1]。
+        修复要点:
+        1. 只允许通过 _is_valid_node 验证的节点
+        2. 优先使用 DC 节点
+        3. 添加紧急兜底机制
         """
-        # 初始化全 0 掩码 (float32 适配某些 RL 库，bool 适配另一些，通常 bool 更通用)
         mask = np.zeros(self.n, dtype=np.bool_)
 
         # 异常保护
@@ -1323,33 +1342,29 @@ class SFC_HIRL_Env(gym.Env):
             mask[:] = 1
             return mask
 
-        # 1. 计算剩余未连接的目的地
-        dests = self.current_request.get('dest', [])
-        connected = self.current_tree.get('connected_dests', set())
+        # 1. 收集有效的部署节点
+        valid_nodes = []
+        for node in range(self.n):
+            # 必须是 DC 节点 (VNF 部署要求)
+            if hasattr(self, 'dc_nodes') and node not in self.dc_nodes:
+                continue
 
-        # 使用与 step_high_level 一致的逻辑来维护 unadded_dest_indices
-        if not hasattr(self, 'unadded_dest_indices'):
-            self.unadded_dest_indices = set(range(len(dests)))
-            for i, d in enumerate(dests):
-                if d in connected:
-                    self.unadded_dest_indices.discard(i)
+            # 必须通过有效性检查
+            if not self._is_valid_node(node):
+                continue
 
-        # 2. 获取有效选项的数量
-        num_valid_options = len(self.unadded_dest_indices)
+            valid_nodes.append(node)
 
-        # 3. 生成掩码
-        if num_valid_options == 0:
-            # 如果都连完了，允许动作 0 (占位，避免空掩码报错)
-            mask[0] = 1
+        # 2. 生成掩码
+        if len(valid_nodes) == 0:
+            # 🔥 紧急兜底: 如果没有有效的 DC 节点,允许所有节点
+            logger.warning(f"⚠️ 无有效DC节点,临时允许所有节点")
+            mask[:] = 1
         else:
-            # 允许选择第 0 到第 N-1 个未连接目的地
-            # 这里的 index 是逻辑索引，不是物理节点 ID
-            # 只要 num_valid_options 不超过 self.n (通常目的地数远小于节点数)，就是安全的
-            valid_range = min(num_valid_options, self.n)
-            mask[:valid_range] = 1
+            for node in valid_nodes:
+                mask[node] = 1
 
         return mask
-
     def get_high_level_state_graph(self):
         """
         🎯 [V30.1 安全访问版]

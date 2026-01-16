@@ -856,13 +856,44 @@ def main():
         except Exception as e:
             logger.warning(f"⚠️ HRL Coordinator 初始化失败: {e}")
 
-        # 4. 启动 Trainer
+        # =========================================================
+        # 🔥 初始化 HRL Coordinator
+        # =========================================================
+        from envs.modules.HRL_Coordinator import HRL_Coordinator
+
+        logger.info("🔧 初始化 HRL Coordinator...")
+        try:
+            coordinator = HRL_Coordinator(
+                env=env,
+                high_agent=agent,  # 高层策略
+                low_agent=agent,  # 低层策略 (同一个agent的不同方法)
+                config=config
+            )
+            logger.info("✅ HRL Coordinator 初始化成功")
+        except Exception as e:
+            logger.error(f"❌ HRL Coordinator 初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
+        # =========================================================
+        # 🔥 将 Coordinator 注入 Trainer
+        # =========================================================
         trainer = Phase3RLTrainer(
             env=env,
             agent=agent,
             output_dir=ckpt_dir,
-            config=config
+            config=config,
+            coordinator=coordinator  # 🔥 传入 coordinator
         )
+
+        try:
+            trainer.run()
+            logger.info("✅ Phase 3 完成")
+        except Exception as e:
+            logger.error(f"❌ Phase 3 执行失败: {e}")
+            import traceback
+            traceback.print_exc()
 
         # 注入 coordinator (如果 Trainer 支持)
         if coordinator and hasattr(trainer, 'set_coordinator'):
