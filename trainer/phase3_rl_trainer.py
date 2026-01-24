@@ -2,19 +2,9 @@
 # core/trainer/phase3_rl_trainer.py
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Phase 3 RL Trainer - Goal-Conditioned HRL + DAgger + 🔥 时间槽系统
-===============================================================================
-修复内容：
-1. ✅ 统计逻辑：改为"全局累计平均"，修复 Acc=1% 的显示问题。
-2. 🛡️ 崩溃保护：捕获 Agent 内部错误，防止训练中断。
-3. 📊 进度条：显示真实累计 Acc (接纳率) 和 Blk (阻塞率)。
-4. 🔥 时间槽系统：支持离散时间模拟、批量请求处理、资源自动释放
-5. 🔧 修复Loss为0的问题：确保网络更新和梯度回传正常进行
-===============================================================================
-"""
-
 import logging
+import os
+
 import numpy as np
 import random
 import pickle
@@ -23,13 +13,9 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torch
 from utils.visualizer import SFCVisualizer
-
 logger = logging.getLogger(__name__)
-
-
 class Phase3RLTrainer:
     """Phase 3: Goal-Conditioned RL Trainer with DAgger + Time Slot System"""
-
     def __init__(self, env, agent, output_dir, config, coordinator=None):
         self.env = env
         self.agent = agent
@@ -103,261 +89,375 @@ class Phase3RLTrainer:
             'avg_steps_per_request': 0,
             'timeslot_jumps': []
         }
-
-    def _get_network_resource_level(self):
-        """
-        🔥 [V10.17 修复版] 动态获取真实容量，不再写死 100.0
-        """
-        try:
-            rm = self.env.resource_mgr
-            # 获取 DC 节点列表
-            dc_nodes = getattr(self.env, 'dc_nodes', [])
-
-            if not dc_nodes:
-                return 0.0
-
-            total_dc_cpu = 0.0
-            total_dc_cap = 0.0
-
-            # 1. 尝试获取总容量基准 (优先用 ResourceManager 里的 C_cap)
-            # 这是一个保险逻辑：看看 rm.C_cap 是数组还是数字
-            c_cap_ref = getattr(rm, 'C_cap', 100.0)
-
-            # 遍历所有 DC 节点
-            for node in dc_nodes:
-                # --- 获取当前剩余量 (分子) ---
-                current_cpu = 0.0
-                if isinstance(rm.nodes, dict) and 'cpu' in rm.nodes:
-                    if node < len(rm.nodes['cpu']):
-                        current_cpu = rm.nodes['cpu'][node]
-                elif isinstance(rm.nodes, list):
-                    if node < len(rm.nodes):
-                        current_cpu = rm.nodes[node].get('cpu', 0)
-
-                # --- 获取该节点总容量 (分母) ---
-                # 🔥🔥🔥 之前这里写死成了 total_dc_cap += 100.0，这就是 150% 的罪魁祸首！
-                node_cap = 100.0  # 默认兜底
-
-                if hasattr(c_cap_ref, '__getitem__'):  # 如果 C_cap 是数组 [30, 55, 40...]
-                    if node < len(c_cap_ref):
-                        node_cap = float(c_cap_ref[node])
-                elif isinstance(c_cap_ref, (int, float)):  # 如果 C_cap 是标量 100.0
-                    node_cap = float(c_cap_ref)
-
-                # 累加
-                total_dc_cpu += current_cpu
-                total_dc_cap += node_cap
-
-            # 防止除以零
-            if total_dc_cap <= 0: return 0.0
-
-            # 计算百分比
-            dc_res_pct = (total_dc_cpu / total_dc_cap) * 100.0
-
-            # 再次保险：如果算出来大于 100，强行修正 (说明 C_cap 没取对)
-            if dc_res_pct > 100.0:
-                # print(f"⚠️ 资源显示异常: {dc_res_pct:.1f}% (分子{total_dc_cpu}/分母{total_dc_cap})")
-                return 100.0
-
-            return dc_res_pct
-
-        except Exception as e:
-            # print(f"资源监控出错: {e}")
-            return 0.0
-
-    def load_timeslot_data(self):
-        """
-        🔥 新增：加载时间槽数据
-        """
-        if not self.use_timeslot:
-            logger.info("⚠️ 时间槽系统未启用，跳过数据加载")
-            return False
-
-        try:
-            # 获取数据路径
-            path_cfg = self.cfg.get('path', {})
-            input_dir = Path(path_cfg.get('input_dir', 'data/input_dir'))
-
-            # 文件名
-            requests_file = input_dir / path_cfg.get('requests_file', 'phase3_requests.pkl')
-            requests_by_slot_file = input_dir / path_cfg.get('requests_by_slot_file', 'phase3_requests_by_slot.pkl')
-
-            logger.info(f"\n{'=' * 60}")
-            logger.info(f"🔥 加载时间槽数据")
-            logger.info(f"{'=' * 60}")
-            logger.info(f"请求文件: {requests_file}")
-            logger.info(f"时间槽文件: {requests_by_slot_file}")
-
-            # 加载数据
-            with open(requests_file, 'rb') as f:
-                requests = pickle.load(f)
-
-            with open(requests_by_slot_file, 'rb') as f:
-                requests_by_slot = pickle.load(f)
-
-            # 加载到环境
-            if hasattr(self.env, 'load_requests'):
-                self.env.load_requests(requests, requests_by_slot)
-                logger.info(f"✅ 时间槽数据加载成功")
-                logger.info(f"   总请求数: {len(requests)}")
-                logger.info(f"   时间槽数: {len(requests_by_slot)}")
-                logger.info(f"{'=' * 60}\n")
-                return True
-            else:
-                logger.warning("⚠️ 环境不支持 load_requests() 方法")
-                return False
-
-        except FileNotFoundError as e:
-            logger.error(f"❌ 时间槽数据文件不存在: {e}")
-            logger.info("提示: 请先运行数据生成脚本:")
-            logger.info("  python main_generate_time_slot.py")
-            logger.info("  python generate_event_time_slot.py")
-            return False
-        except Exception as e:
-            logger.error(f"❌ 加载时间槽数据失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
+        # 🔥 添加诊断开关
+        self.enable_diagnosis = config.get('enable_diagnosis', False)
+        self.diagnosis_interval = config.get('diagnosis_interval', 10)
     def run(self):
-        """运行训练主循环"""
-        logger.info(f"🚀 Starting Training: DAgger={self.use_dagger}, Beta={self.beta}")
-        logger.info(
-            f"📊 训练参数: episodes={self.max_episodes}, warmup={self.warmup_steps}, update_freq={self.update_frequency}")
+        """🚀 Phase 3 训练主循环 - 完整版含诊断"""
 
-        # 🔥 加载时间槽数据
-        if self.use_timeslot:
-            if not self.load_timeslot_data():
-                logger.error("❌ 时间槽数据加载失败，退出训练")
-                return
+        # 🔥🔥🔥 诊断代码块1：训练开始前诊断 🔥🔥🔥
+        logger.info("\n" + "=" * 80)
+        logger.info("🔍 训练前环境诊断")
+        logger.info("=" * 80)
 
-        # ============================================
-        # 🔥 全局累计计数器 (修复 Acc 显示问题)
-        # ============================================
-        total_episodes = 0
-        total_success = 0
-        total_failed = 0
+        logger.info(f"\n1️⃣ 资源管理器结构:")
+        logger.info(f"   类型: {type(self.env.resource_mgr).__name__}")
+        logger.info(f"   nodes类型: {type(self.env.resource_mgr.nodes)}")
 
-        pbar = tqdm(range(self.max_episodes), desc="RL Training")
+        if isinstance(self.env.resource_mgr.nodes, dict):
+            keys = list(self.env.resource_mgr.nodes.keys())[:5]
+            logger.info(f"   nodes键: {keys}")
 
-        for ep in pbar:
-            try:
-                # 运行一个 Episode
-                ep_reward, ep_info = self._run_episode(ep)
+            if 'cpu' in self.env.resource_mgr.nodes:
+                logger.info(f"   ⚠️ 结构: 列表字典 {{'cpu': [...], 'mem': [...]}}")
+                cpu_list = self.env.resource_mgr.nodes.get('cpu', [])
+                mem_list = self.env.resource_mgr.nodes.get('mem', [])
+                logger.info(f"   CPU列表长度: {len(cpu_list)}")
+                logger.info(f"   前3个节点CPU: {cpu_list[:3]}")
+                logger.info(f"   前3个节点Mem: {mem_list[:3]}")
+            elif 0 in self.env.resource_mgr.nodes:
+                logger.info(f"   ✅ 结构: 节点字典 {{0: {{}}, 1: {{}}, ...}}")
+                for i in range(min(3, len(self.env.resource_mgr.nodes))):
+                    node = self.env.resource_mgr.nodes.get(i, {})
+                    logger.info(f"   节点{i}: CPU={node.get('cpu', 'N/A')}, Mem={node.get('mem', 'N/A')}")
 
-                # 1. 获取资源水平
-                curr_res_level = self._get_network_resource_level()
+        logger.info(f"\n2️⃣ 环境重置测试:")
+        self.env.reset()
+        logger.info(f"   请求存在: {self.env.current_request is not None}")
+        if self.env.current_request:
+            vnf_list = self.env.current_request.get('vnf', [])
+            logger.info(f"   VNF数量: {len(vnf_list)}")
+            logger.info(f"   源节点: {self.env.current_request.get('source')}")
+            logger.info(f"   目的节点: {self.env.current_request.get('dest', [])}")
 
-                # 2. ✅ 更新全局计数器 (核心修复)
-                total_episodes += 1
+        logger.info(f"\n3️⃣ 高层动作掩码:")
+        mask = self.env.get_high_level_action_mask()
+        available = np.where(mask)[0]
+        logger.info(f"   可用动作数: {len(available)}")
+        logger.info(f"   可用节点: {available[:10]}")
 
-                # 判断成功标准：只要 env 说是 success 或 request_completed 就算成
-                is_success = ep_info.get('success', False)
+        logger.info(f"\n4️⃣ 节点详情 (前10个):")
 
-                if is_success:
-                    total_success += 1
+        # 🔥 正确获取资源
+        if isinstance(self.env.resource_mgr.nodes, dict) and 'cpu' in self.env.resource_mgr.nodes:
+            cpu_list = self.env.resource_mgr.nodes.get('cpu', [])
+            mem_list = self.env.resource_mgr.nodes.get('memory', [])
+
+            for node in range(min(10, self.env.n)):
+                is_valid = self.env._is_valid_node(node)
+                is_dc = node in getattr(self.env, 'dc_nodes', [])
+
+                cpu = cpu_list[node] if node < len(cpu_list) else 'N/A'
+                mem = mem_list[node] if node < len(mem_list) else 'N/A'
+                mask_val = mask[node]
+
+                logger.info(f"   节点{node}: 有效={'✅' if is_valid else '❌'}, DC={'✅' if is_dc else '❌'}, "
+                            f"CPU={cpu}, Mem={mem}, Mask={mask_val}")
+        else:
+            # 原来的逻辑
+            for node in range(min(10, self.env.n)):
+                is_valid = self.env._is_valid_node(node)
+                is_dc = node in getattr(self.env, 'dc_nodes', [])
+                node_info = self.env.resource_mgr.nodes.get(node, {})
+                cpu = node_info.get('cpu', 'N/A')
+                mem = node_info.get('mem', 'N/A')
+                mask_val = mask[node]
+
+                logger.info(f"   节点{node}: 有效={'✅' if is_valid else '❌'}, DC={'✅' if is_dc else '❌'}, "
+                            f"CPU={cpu}, Mem={mem}, Mask={mask_val}")
+
+        logger.info(f"\n5️⃣ 测试高层执行:")
+        if len(available) > 0:
+            test_action = available[0]
+            logger.info(f"   测试节点: {test_action}")
+
+            before_phase = getattr(self.env, 'current_phase', 'unknown')
+            before_vnf = self.env._get_total_vnf_progress()
+
+            _, reward, done, trunc, info = self.env.step_high_level(test_action)
+
+            logger.info(f"   执行前: 阶段={before_phase}, VNF进度={before_vnf}")
+            logger.info(f"   执行后: reward={reward}, done={done}, trunc={trunc}")
+            logger.info(f"   Info: {info}")
+
+            if 'error' in info:
+                logger.error(f"\n   ⚠️⚠️⚠️ 检测到错误: {info['error']}")
+                logger.error(f"   ⚠️⚠️⚠️ 这可能就是循环的原因!")
+
+        logger.info("=" * 80 + "\n")
+        # 🔥🔥🔥 诊断代码块1 结束 🔥🔥🔥
+
+        # ====================================================================
+        # 主训练循环
+        # ====================================================================
+        num_episodes = self.cfg.get('num_episodes', 1000)
+
+        for episode in range(num_episodes):
+            state = self.env.reset()
+            episode_reward = 0
+            done = False
+            step_count = 0
+
+            # 🔥🔥🔥 诊断变量 🔥🔥🔥
+            consecutive_same_high_action = 0
+            last_high_action = None
+            low_timeout_count = 0
+            high_error_count = 0
+            # 🔥🔥🔥
+
+            while not done:
+                # ============================================================
+                # 如果有 Coordinator，使用 Coordinator 执行
+                # ============================================================
+                # ============================================================
+                # 如果有 Coordinator，使用 Coordinator 执行
+                # ============================================================
+                if self.coordinator:
+                    result = self.coordinator.step()
+
+                    # 🔥 修复：处理 tuple 返回值
+                    if isinstance(result, tuple):
+                        # Coordinator.step() 返回 (state, reward, done, truncated, info)
+                        state, reward, done, truncated, info = result
+
+                        # 从 info 中提取信息
+                        high_action = info.get('high_action') if isinstance(info, dict) else None
+
+                        # 🔥🔥🔥 诊断代码块2：Coordinator结果诊断 🔥🔥🔥
+                        if high_action == last_high_action:
+                            consecutive_same_high_action += 1
+                            if consecutive_same_high_action >= 3:
+                                logger.warning(f"\n⚠️ [Episode {episode}, Step {step_count}] 循环警告!")
+                                logger.warning(f"   连续{consecutive_same_high_action}次选择节点{high_action}")
+                                logger.warning(f"   当前位置: 节点{self.env.current_node_location}")
+                                logger.warning(f"   当前阶段: {getattr(self.env, 'current_phase', 'unknown')}")
+                                vnf_list = self.env.current_request.get('vnf', []) if self.env.current_request else []
+                                logger.warning(f"   VNF进度: {self.env._get_total_vnf_progress()}/{len(vnf_list)}")
+                                logger.warning(f"   目标节点: {getattr(self.env, 'current_deployment_target', 'N/A')}")
+                                # 检查节点资源（修复版）
+                                if high_action is not None:  # 🔥 加上这个检查
+                                    if isinstance(self.env.resource_mgr.nodes,
+                                                  dict) and 'cpu' in self.env.resource_mgr.nodes:
+                                        cpu_list = self.env.resource_mgr.nodes.get('cpu', [])
+                                        mem_list = self.env.resource_mgr.nodes.get('memory', [])
+                                        cpu = cpu_list[high_action] if high_action < len(cpu_list) else 'N/A'
+                                        mem = mem_list[high_action] if high_action < len(mem_list) else 'N/A'
+                                    else:
+                                        node_info = self.env.resource_mgr.nodes.get(high_action, {})
+                                        cpu = node_info.get('cpu', 'N/A')
+                                        mem = node_info.get('mem', 'N/A')
+
+                                    logger.warning(f"   节点{high_action}资源: CPU={cpu}, Mem={mem}")
+                                    logger.warning(
+                                        f"   节点{high_action}是DC节点: {high_action in getattr(self.env, 'dc_nodes', [])}")
+                                else:
+                                    logger.warning(f"   ⚠️ high_action 是 None! info内容: {info}")
+                                # 检查节点资源（修复版）
+                                if isinstance(self.env.resource_mgr.nodes,
+                                              dict) and 'cpu' in self.env.resource_mgr.nodes:
+                                    cpu_list = self.env.resource_mgr.nodes.get('cpu', [])
+                                    mem_list = self.env.resource_mgr.nodes.get('memory', [])
+                                    cpu = cpu_list[high_action] if high_action < len(cpu_list) else 'N/A'
+                                    mem = mem_list[high_action] if high_action < len(mem_list) else 'N/A'
+                                else:
+                                    node_info = self.env.resource_mgr.nodes.get(high_action, {})
+                                    cpu = node_info.get('cpu', 'N/A')
+                                    mem = node_info.get('mem', 'N/A')
+
+                                logger.warning(f"   节点{high_action}资源: CPU={cpu}, Mem={mem}")
+                                logger.warning(
+                                    f"   节点{high_action}是DC节点: {high_action in getattr(self.env, 'dc_nodes', [])}")
+
+                                # 强制中断
+                                if consecutive_same_high_action >= 5:
+                                    logger.error(f"   ❌ 连续{consecutive_same_high_action}次，强制终止episode")
+                                    break
+                        else:
+                            consecutive_same_high_action = 0
+
+                        last_high_action = high_action
+
+                        # 检测错误
+                        if isinstance(info, dict) and 'error' in info:
+                            high_error_count += 1
+                            logger.error(f"\n⚠️ [Episode {episode}, Step {step_count}] 高层错误!")
+                            logger.error(f"   错误信息: {info['error']}")
+                            logger.error(f"   累计错误次数: {high_error_count}")
+
+                        # 检测低层超时
+                        if isinstance(info, dict) and info.get('low_timeout'):
+                            low_timeout_count += 1
+                            logger.warning(f"\n⚠️ [Episode {episode}, Step {step_count}] 低层超时!")
+                            logger.warning(f"   当前位置: 节点{self.env.current_node_location}")
+                            target = getattr(self.env, 'current_deployment_target',
+                                             getattr(self.env, 'current_target_node', 'N/A'))
+                            logger.warning(f"   目标节点: {target}")
+                            logger.warning(f"   累计超时次数: {low_timeout_count}")
+
+                        # 🔥🔥🔥 诊断代码块2 结束 🔥🔥🔥
+
+                        episode_reward += reward
+                        # done 已经从 tuple 中提取
+
+                    else:
+                        # 兼容字典格式（如果 Coordinator 返回字典）
+                        high_action = result.get('high_action')
+
+                        # 循环检测（字典格式）
+                        if high_action == last_high_action:
+                            consecutive_same_high_action += 1
+                            if consecutive_same_high_action >= 3:
+                                logger.warning(f"\n⚠️ [Episode {episode}, Step {step_count}] 循环警告!")
+                                logger.warning(f"   连续{consecutive_same_high_action}次选择节点{high_action}")
+
+                                if consecutive_same_high_action >= 5:
+                                    logger.error(f"   ❌ 强制终止")
+                                    break
+                        else:
+                            consecutive_same_high_action = 0
+
+                        last_high_action = high_action
+
+                        # 检测错误
+                        if 'error' in result:
+                            high_error_count += 1
+                            logger.error(f"\n⚠️ 高层错误: {result['error']}")
+
+                        # 检测低层超时
+                        if result.get('low_timeout'):
+                            low_timeout_count += 1
+                            logger.warning(f"\n⚠️ 低层超时! 累计{low_timeout_count}次")
+
+                        episode_reward += result.get('reward', 0)
+                        done = result.get('done', False)
+
+                # ============================================================
+                # 如果没有 Coordinator，手动执行高层+低层
+                # ============================================================
                 else:
-                    total_failed += 1
+                    # 高层决策
+                    high_state = self.env.get_high_level_state_graph()
+                    high_mask = self.env.get_high_level_action_mask()
 
-                # 3. 计算累计指标
-                cum_acc = total_success / total_episodes if total_episodes > 0 else 0.0
-                cum_blk = total_failed / total_episodes if total_episodes > 0 else 0.0
+                    # Agent 选择动作
+                    with torch.no_grad():
+                        high_action = self.agent.select_action(high_state, high_mask, explore=True)
 
-                # 4. 记录到 Stats (用于绘图)
-                self.stats["rewards"].append(ep_reward)
-                self.stats["acceptance_rates"].append(1.0 if is_success else 0.0)
-                self.stats["blocking_rates"].append(0.0 if is_success else 1.0)
-                self.stats["resource_levels"].append(curr_res_level)
+                    # 🔥🔥🔥 诊断代码块3：手动模式循环检测 🔥🔥🔥
+                    if high_action == last_high_action:
+                        consecutive_same_high_action += 1
+                        if consecutive_same_high_action >= 3:
+                            logger.warning(f"\n⚠️ [Episode {episode}, Step {step_count}] 循环警告!")
+                            logger.warning(f"   连续{consecutive_same_high_action}次选择节点{high_action}")
 
-                # 🔥 [新增] 记录 Loss
-                avg_loss = ep_info.get('avg_loss', 0.0)
-                avg_high_loss = ep_info.get('avg_high_loss', 0.0)
-                avg_low_loss = ep_info.get('avg_low_loss', 0.0)
+                            if consecutive_same_high_action >= 5:
+                                logger.error(f"   ❌ 强制终止")
+                                break
+                    else:
+                        consecutive_same_high_action = 0
 
-                self.stats["losses"].append(avg_loss)
-                self.stats["high_losses"].append(avg_high_loss)
-                self.stats["low_losses"].append(avg_low_loss)
+                    last_high_action = high_action
+                    # 🔥🔥🔥
 
-                # 🔥 新增：时间槽统计
-                if self.use_timeslot:
-                    self.stats["time_slots_covered"].append(ep_info.get('time_slots_covered', 0))
-                    self.stats["decision_steps"].append(ep_info.get('decision_steps', 0))
-                    self.stats["requests_per_episode"].append(ep_info.get('requests_processed', 1))
+                    # 执行高层动作
+                    _, high_reward, high_done, high_trunc, high_info = self.env.step_high_level(high_action)
 
-                # 5. TensorBoard (记录累计值更平滑)
-                self.writer.add_scalar("Train/Reward", ep_reward, ep)
-                self.writer.add_scalar("Train/CumulativeAcc", cum_acc, ep)
-                self.writer.add_scalar("Train/CumulativeBlk", cum_blk, ep)
-                self.writer.add_scalar("Train/Resource", curr_res_level, ep)
-                self.writer.add_scalar("Train/Loss", avg_loss, ep)
-                self.writer.add_scalar("Train/HighLoss", avg_high_loss, ep)
-                self.writer.add_scalar("Train/LowLoss", avg_low_loss, ep)
+                    # 🔥 错误检测
+                    if 'error' in high_info:
+                        high_error_count += 1
+                        logger.error(f"\n⚠️ 高层错误: {high_info['error']}")
 
-                # 🔥 新增：时间槽指标
-                if self.use_timeslot:
-                    self.writer.add_scalar("Train/TimeSlotsCovered", ep_info.get('time_slots_covered', 0), ep)
-                    self.writer.add_scalar("Train/DecisionSteps", ep_info.get('decision_steps', 0), ep)
-                    self.writer.add_scalar("Train/CurrentTimeSlot", ep_info.get('current_time_slot', 0), ep)
+                    episode_reward += high_reward
 
-                if hasattr(self.agent, 'epsilon_low'):
-                    self.writer.add_scalar("Train/Epsilon", self.agent.epsilon_low, ep)
+                    # 如果没结束，执行低层
+                    if not high_done and not high_trunc:
+                        low_done = False
+                        low_step = 0
+                        max_low_steps = 50
 
-                # 6. 更新进度条 (显示全局累计值)
-                expert_usage_pct = ep_info.get('expert_usage', 0) * 100
+                        while not low_done and low_step < max_low_steps:
+                            low_state = self.env.get_state()
+                            low_mask = self.env.get_low_level_action_mask()
 
-                # 🔥 构建进度条显示
-                postfix = {
-                    "Rw": f"{ep_reward:.0f}",
-                    "Exp": f"{expert_usage_pct:.0f}%",
-                    "Acc": f"{cum_acc:.1%}",
-                    "Blk": f"{cum_blk:.1%}",
-                    "Res": f"{curr_res_level:.0f}%",
-                    "Loss": f"{avg_loss:.4f}",
-                    "HiLoss": f"{avg_high_loss:.4f}",
-                    "LoLoss": f"{avg_low_loss:.4f}"
-                }
+                            with torch.no_grad():
+                                low_action = self.agent.select_action(low_state, low_mask, explore=True)
 
-                # 🔥 如果启用时间槽，添加时间槽信息
-                if self.use_timeslot:
-                    postfix["TS"] = ep_info.get('current_time_slot', 0)
-                    postfix["DS"] = ep_info.get('decision_steps', 0)
+                            _, low_reward, low_done, low_trunc, low_info = self.env.step_low_level(low_action)
 
-                pbar.set_postfix(postfix)
+                            episode_reward += low_reward
+                            low_step += 1
 
-                # 7. 显示训练状态摘要
-                if (ep + 1) % 50 == 0:
-                    logger.info(f"\n📊 Episode {ep + 1} 训练状态:")
-                    logger.info(f"   累计更新次数: {self.total_updates}")
-                    logger.info(f"   经验缓冲区: High={len(self.agent.high_memory)}, Low={len(self.agent.low_memory)}")
-                    logger.info(f"   Loss: High={avg_high_loss:.6f}, Low={avg_low_loss:.6f}")
+                            # 🔥 超时检测
+                            if low_info.get('timeout'):
+                                low_timeout_count += 1
+                                logger.warning(f"\n⚠️ 低层超时! 累计{low_timeout_count}次")
+                                break
 
-                # 保存模型
-                if (ep + 1) % self.save_freq == 0:
-                    self.agent.save(str(self.output_dir / f"rl_model_ep{ep + 1}.pth"))
+                            if low_trunc:
+                                break
 
-                    # 🔥 打印时间槽统计
-                    if self.use_timeslot and self.log_timeslot_info:
-                        self._print_timeslot_stats(ep + 1)
+                        if low_step >= max_low_steps:
+                            logger.warning(f"⚠️ 低层达到最大步数{max_low_steps}")
 
-            except Exception as e:
-                # 🛡️ 崩溃防御：捕获所有异常，不中断训练
-                logger.error(f"❌ Episode {ep} CRASHED: {e}")
-                import traceback
-                traceback.print_exc()
-                # 发生异常算作失败
-                total_episodes += 1
-                total_failed += 1
-                continue
+                    done = high_done
 
-        # 训练结束保存
-        self.agent.save(str(self.output_dir / "rl_model_final.pth"))
-        logger.info(f"✅ Training Complete. Final Acc: {total_success / total_episodes:.2%}")
-        logger.info(f"📊 最终统计: 总更新次数={self.total_updates}, 平均Loss={np.mean(self.stats['losses']):.6f}")
+                # ============================================================
+                # 通用：步数保护
+                # ============================================================
+                step_count += 1
 
-        # 🔥 打印最终时间槽统计
-        if self.use_timeslot:
-            self._print_final_timeslot_stats()
+                # 🔥🔥🔥 诊断代码块4：步数保护 🔥🔥🔥
+                if step_count > 200:
+                    logger.error(f"\n❌ [Episode {episode}] 步数超限({step_count})，强制终止")
+                    logger.error(f"   当前阶段: {getattr(self.env, 'current_phase', 'unknown')}")
+                    logger.error(f"   VNF进度: {self.env._get_total_vnf_progress()}")
+                    logger.error(f"   低层超时次数: {low_timeout_count}")
+                    logger.error(f"   高层错误次数: {high_error_count}")
+                    break
+                # 🔥🔥🔥
 
+            # ====================================================================
+            # Episode 结束统计
+            # ====================================================================
+            logger.info(f"\nEpisode {episode}: Reward={episode_reward:.2f}, Steps={step_count}, "
+                        f"低层超时={low_timeout_count}次, 高层错误={high_error_count}次")
+
+            # 🔥 每10个episode详细输出
+            if episode % 10 == 0:
+                if self.env.current_request:
+                    vnf_list = self.env.current_request.get('vnf', [])
+                    logger.info(f"   VNF进度: {self.env._get_total_vnf_progress()}/{len(vnf_list)}")
+                    connected = len(self.env.current_tree.get('connected_dests', set()))
+                    dests = len(self.env.current_request.get('dest', []))
+                    logger.info(f"   已连接目的地: {connected}/{dests}")
+
+            # ====================================================================
+            # 定期保存模型 (每100个episode)
+            # ====================================================================
+            if episode > 0 and episode % 100 == 0:
+                save_path = os.path.join(self.output_dir, f"checkpoint_ep{episode}.pth")
+                try:
+                    torch.save({
+                        'episode': episode,
+                        'agent_state': self.agent.state_dict() if hasattr(self.agent, 'state_dict') else None,
+                        'config': self.cfg
+                    }, save_path)
+                    logger.info(f"💾 保存检查点: {save_path}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 保存失败: {e}")
+
+        # ====================================================================
+        # 训练结束，保存最终模型
+        # ====================================================================
+        final_path = os.path.join(self.output_dir, "phase3_final.pth")
+        try:
+            torch.save({
+                'agent_state': self.agent.state_dict() if hasattr(self.agent, 'state_dict') else None,
+                'config': self.config
+            }, final_path)
+            logger.info(f"✅ 训练完成，最终模型: {final_path}")
+        except Exception as e:
+            logger.error(f"❌ 最终模型保存失败: {e}")
     def _run_episode(self, episode_idx: int):
         """
         🔥 [V32.0 HRL Coordinator 集成版]
@@ -817,7 +917,6 @@ class Phase3RLTrainer:
         all_dests = self.env.current_request.get('dest', [])
         connected = self.env.current_tree.get('connected_dests', set())
         return [d for d in all_dests if d not in connected]
-
     def _get_expert_action(self, state):
         """获取专家动作"""
         if not hasattr(self, 'agent') or not hasattr(self.agent, 'expert'):
@@ -826,52 +925,4 @@ class Phase3RLTrainer:
                 # 这里需要 expert 逻辑，暂时随机兜底
                 pass
         return random.randint(0, getattr(self.env, 'n', 28) - 1)
-
-    def _print_timeslot_stats(self, episode):
-        """
-        🔥 新增：打印时间槽统计信息
-        """
-        logger.info(f"\n{'=' * 60}")
-        logger.info(f"⏰ 时间槽统计 @ Episode {episode}")
-        logger.info(f"{'=' * 60}")
-
-        if self.timeslot_stats['total_decision_steps'] > 0:
-            avg_steps = (self.timeslot_stats['total_decision_steps'] /
-                         max(1, len(self.stats['decision_steps'])))
-            logger.info(f"平均决策步数: {avg_steps:.1f}")
-
-        if len(self.stats['time_slots_covered']) > 0:
-            avg_slots = np.mean(self.stats['time_slots_covered'][-100:])
-            logger.info(f"平均时间槽跨度: {avg_slots:.1f}")
-
-        if len(self.timeslot_stats['timeslot_jumps']) > 0:
-            logger.info(f"时间槽跳转次数: {len(self.timeslot_stats['timeslot_jumps'])}")
-
-        logger.info(f"{'=' * 60}\n")
-
-    def _print_final_timeslot_stats(self):
-        """
-        🔥 新增：打印最终时间槽统计
-        """
-        logger.info(f"\n{'=' * 60}")
-        logger.info(f"🎉 最终时间槽统计")
-        logger.info(f"{'=' * 60}")
-
-        total_episodes = len(self.stats['decision_steps'])
-
-        if total_episodes > 0:
-            avg_decision_steps = np.mean(self.stats['decision_steps'])
-            avg_time_slots = np.mean(self.stats['time_slots_covered'])
-
-            logger.info(f"总Episodes: {total_episodes}")
-            logger.info(f"平均决策步数: {avg_decision_steps:.1f}")
-            logger.info(f"平均时间槽跨度: {avg_time_slots:.1f}")
-            logger.info(f"总时间槽跳转: {len(self.timeslot_stats['timeslot_jumps'])}")
-
-            if self.timeslot_stats['total_decision_steps'] > 0:
-                efficiency = (self.timeslot_stats['total_time_slots'] /
-                              self.timeslot_stats['total_decision_steps'])
-                logger.info(f"时间槽效率: {efficiency:.2f} (时间槽/决策步)")
-
-        logger.info(f"{'=' * 60}\n")
 

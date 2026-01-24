@@ -300,9 +300,9 @@ class HRLAgent:
                     # Agent模式：使用High-Level策略
                     self.current_subgoal = self._select_subgoal(state, unconnected_dests)
                     info['source'] = 'agent_high'
-
+                    logger.warning(f"🔍 [Agent] _select_subgoal返回: {self.current_subgoal}")
+                    logger.warning(f"🔍 [Agent] unconnected_dests传入: {unconnected_dests}")
                 # 生成goal embedding
-                self._generate_goal_embedding(state)
 
                 self.subgoal_steps = 0
                 info['high_level_decision'] = True
@@ -346,10 +346,19 @@ class HRLAgent:
             self.steps_done += 1
 
             # High action（目标在unconnected中的索引）
-            high_action = 0
             if unconnected_dests and self.current_subgoal is not None:
                 if self.current_subgoal in unconnected_dests:
                     high_action = unconnected_dests.index(self.current_subgoal)
+                else:
+                    high_action = 0
+            else:
+                # 🔥 VNF部署阶段：high_action就是目标节点ID
+                high_action = self.current_subgoal if self.current_subgoal is not None else 0
+            logger.warning(f"🔍 [Agent] 计算high_action:")
+            logger.warning(f"   - current_subgoal: {self.current_subgoal}")
+            logger.warning(f"   - unconnected_dests: {unconnected_dests}")
+            logger.warning(f"   - high_action: {high_action}")
+            logger.warning(f"   - info['subgoal']: {info.get('subgoal')}")
 
             return high_action, low_action, info
 
@@ -418,15 +427,41 @@ class HRLAgent:
                 epsilon=self.epsilon_high
             )
 
-        # 保存goal embedding
-        self.current_goal_emb = goal_emb
-
         # 映射回实际节点
         goal_idx = goal_idx.item()
         if goal_idx < len(unconnected_dests):
             subgoal = unconnected_dests[goal_idx]
         else:
             subgoal = unconnected_dests[0]
+
+        # 🔥🔥🔥 关键修复：使用节点特征而不是策略输出的embedding
+        if hasattr(state, 'x') and state.x is not None and subgoal < state.x.size(0):
+            # 使用目标节点的GNN特征作为goal embedding
+            node_feat = state.x[subgoal]  # [feat_dim]
+
+            # 调整维度到goal_dim
+            if node_feat.size(0) > self.goal_dim:
+                # 截断
+                node_feat = node_feat[:self.goal_dim]
+            elif node_feat.size(0) < self.goal_dim:
+                # 填充
+                padding = torch.zeros(self.goal_dim - node_feat.size(0), device=self.device)
+                node_feat = torch.cat([node_feat, padding])
+
+            self.current_goal_emb = node_feat.unsqueeze(0)  # [1, goal_dim]
+
+            logger.warning(f"🔥 [使用节点特征] 节点{subgoal}的特征作为goal_emb")
+            logger.warning(f"   - 节点特征前5维: {state.x[subgoal, :5].cpu().numpy()}")
+        else:
+            # 兜底：使用策略输出
+            self.current_goal_emb = goal_emb
+            logger.warning(f"⚠️ [使用策略输出] goal_emb (可能不匹配预训练)")
+
+        # 🔍 调试
+        logger.warning(f"🔍 [_select_subgoal] 最终goal_emb:")
+        logger.warning(f"   - shape: {self.current_goal_emb.shape}")
+        logger.warning(f"   - 前5维: {self.current_goal_emb[0, :5].cpu().numpy()}")
+        logger.warning(f"   - 目标节点: {subgoal}")
 
         return subgoal
 
@@ -439,7 +474,9 @@ class HRLAgent:
                 _, goal_emb, _ = self.high_policy(graph_emb, return_subgoal=True)
 
             self.current_goal_emb = goal_emb
-
+            logger.warning(f"🔍 [_generate_goal_embedding] 设置goal_emb:")
+            logger.warning(f"   - shape: {goal_emb.shape}")
+            logger.warning(f"   - 前5维: {goal_emb[0, :5].cpu().numpy()}")
         except Exception as e:
             logger.error(f"[Goal Embedding] Error: {e}")
             self.current_goal_emb = torch.zeros(1, self.goal_dim, device=self.device)
@@ -575,7 +612,9 @@ class HRLAgent:
             self.current_subgoal_emb = subgoal_emb  # tensor
             self.current_goal_emb = goal_emb
             self.subgoal_step_count = 0
-
+            logger.warning(f"🔍 [_generate_subgoal_embedding] 设置goal_emb:")
+            logger.warning(f"   - shape: {goal_emb.shape}")
+            logger.warning(f"   - 前5维: {goal_emb[0, :5].cpu().numpy()}")
         except Exception as e:
             logger.error(f"[Generate Subgoal] Error: {e}")
             # Fallback

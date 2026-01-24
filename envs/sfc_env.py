@@ -360,7 +360,6 @@ class SimpleDataLoader:
             self.events = []
 
         return len(self.requests) > 0
-
 class SFC_HIRL_Env(gym.Env):
     #基础初始化
     def __init__(self, config, use_gnn=True):
@@ -435,8 +434,12 @@ class SFC_HIRL_Env(gym.Env):
 
         # --- 资源管理器 ---
         capacities = self.config.get('capacities', {'cpu': 100.0, 'memory': 80.0, 'bandwidth': 100.0})
-        self.dc_nodes = self.config.get('topology', {}).get('dc_nodes', list(range(10)))
+        # 🔥 修复：读取原始配置并减 1 (适配 0-based 索引)
+        raw_dc_nodes = self.config.get('topology', {}).get('dc_nodes', list(range(10)))
+        self.dc_nodes = [x - 1 for x in raw_dc_nodes]
 
+        # 最好打印一下确认
+        print(f"✅ [Index Fix] DC Nodes converted: {self.dc_nodes}")
         self.resource_mgr = ResourceManager(self.topo, capacities, self.dc_nodes)
         self.topology_mgr = SimpleTopologyManager(self.topo)
 
@@ -1243,13 +1246,14 @@ class SFC_HIRL_Env(gym.Env):
             # 正常返回：等待低层执行
             # 这里我们返回低层的 Mask，或者保持高层 Mask 也可以，视你的 Agent 需求而定
             # 通常为了 HRL 连续性，这里返回高层 Mask 是安全的，或者返回 None 让协调器处理
-            return None, 0.0, False, False, {
+            return None, 0.0, False, True, {
                 'phase': 'vnf_deployment',
                 'target_node': deployment_node,
                 'vnf_idx': vnf_idx,
-                'action_mask': self.get_low_level_action_mask(),  # 传给低层用的 Mask
+                'action_mask': self.get_low_level_action_mask(),
                 'message': 'VNF部署目标已设定，等待低层执行'
             }
+
 
         # ============================================
         # 阶段2：目的地连接规划
@@ -1277,15 +1281,12 @@ class SFC_HIRL_Env(gym.Env):
             self.current_phase = 'destination_connection'
 
             # 正常返回
-            return None, 0.0, False, False, {
+            return None, 0.0, False, True, {
                 'phase': 'destination_connection',
                 'target_dest': target_dest,
                 'action_mask': self.get_low_level_action_mask(),
                 'message': '目的地连接目标已设定，等待低层执行'
             }
-
-    # 在 SFC_HIRL_Env 类中替换这两个方法
-
     def _is_valid_node(self, node):
         """
         验证节点是否有效且存在
@@ -1325,44 +1326,70 @@ class SFC_HIRL_Env(gym.Env):
                     return 0 <= node < nodes.shape[0]
 
         return True
-
     def get_high_level_action_mask(self):
         """
-        🔥 [V11.8 节点验证版] 高层动作掩码
+        🔥 [V11.9 强制DC约束版] 高层动作掩码
 
         修复要点:
-        1. 只允许通过 _is_valid_node 验证的节点
-        2. 优先使用 DC 节点
-        3. 添加紧急兜底机制
+        1. 返回 float32 类型（不是 bool）
+        2. 被屏蔽节点使用 -1e9（强制屏蔽）
+        3. 允许节点使用 1.0
+        4. 只允许DC节点
+        5. 添加紧急兜底机制
         """
-        mask = np.zeros(self.n, dtype=np.bool_)
+        # 🔥 改为 float32，并默认全部屏蔽
+        mask = np.full(self.n, -1e9, dtype=np.float32)
 
         # 异常保护
         if self.current_request is None:
-            mask[:] = 1
+            logger.warning("⚠️ current_request is None, 允许所有节点")
+            mask[:] = 1.0
             return mask
 
         # 1. 收集有效的部署节点
         valid_nodes = []
-        for node in range(self.n):
-            # 必须是 DC 节点 (VNF 部署要求)
-            if hasattr(self, 'dc_nodes') and node not in self.dc_nodes:
-                continue
 
-            # 必须通过有效性检查
-            if not self._is_valid_node(node):
-                continue
+        # 🔥 只遍历DC节点
+        if hasattr(self, 'dc_nodes') and self.dc_nodes:
+            for node in self.dc_nodes:
+                # 确保节点在范围内
+                if node < 0 or node >= self.n:
+                    continue
 
-            valid_nodes.append(node)
+                # 必须通过有效性检查
+                if not self._is_valid_node(node):
+                    continue
+
+                valid_nodes.append(node)
+        else:
+            logger.error("❌ 未找到 dc_nodes 属性！")
+            # 如果没有DC节点定义，允许所有通过验证的节点
+            for node in range(self.n):
+                if self._is_valid_node(node):
+                    valid_nodes.append(node)
 
         # 2. 生成掩码
         if len(valid_nodes) == 0:
-            # 🔥 紧急兜底: 如果没有有效的 DC 节点,允许所有节点
-            logger.warning(f"⚠️ 无有效DC节点,临时允许所有节点")
-            mask[:] = 1
+            # 🔥 紧急兜底: 如果没有有效的 DC 节点，允许所有DC节点（忽略验证）
+            logger.critical(f"⚠️ 无有效DC节点，紧急兜底：允许所有DC节点")
+            if hasattr(self, 'dc_nodes') and self.dc_nodes:
+                for dc in self.dc_nodes:
+                    if 0 <= dc < self.n:
+                        mask[dc] = 1.0
+            else:
+                # 最后兜底：允许所有节点
+                mask[:] = 1.0
         else:
+            # 🔥 设置有效节点为 1.0
             for node in valid_nodes:
-                mask[node] = 1
+                mask[node] = 1.0
+
+        # 3. 调试信息
+        allowed_nodes = [i for i in range(self.n) if mask[i] > 0]
+        if len(allowed_nodes) > 0:
+            logger.debug(f"🎯 [Mask] 允许的节点: {allowed_nodes} (共{len(allowed_nodes)}个)")
+        else:
+            logger.error(f"❌ [Mask] 所有节点被屏蔽！mask min={mask.min()}, max={mask.max()}")
 
         return mask
     def get_high_level_state_graph(self):
@@ -1394,78 +1421,19 @@ class SFC_HIRL_Env(gym.Env):
         connected = self.current_tree.get('connected_dests', set())
         nodes_on_tree = getattr(self, 'nodes_on_tree', set())
 
-        for node in range(n):
-            # 🔥 安全获取节点信息
-            node_info = self.resource_mgr.nodes.get(node, {})
-
-            # 如果节点不存在，使用默认值
-            if not node_info:
-                # 🔥 关键：如果resource_mgr还没初始化节点，手动初始化
+        for node in range(n):  # ✅ node是循环变量
+            # 🔥 修复：直接从pool获取资源
+            try:
+                cpu = self.resource_mgr.pool.get_available_cpu(node) / 100.0
+                mem = self.resource_mgr.pool.get_available_memory(node) / 100.0
+            except (AttributeError, IndexError):
+                # 如果pool不可用，使用默认值
                 if hasattr(self.resource_mgr, 'get_node_cpu'):
                     cpu = self.resource_mgr.get_node_cpu(node) / 100.0
                     mem = self.resource_mgr.get_node_mem(node) / 100.0
                 else:
-                    # 使用默认值
-                    cpu = 0.5  # 假设50%可用
+                    cpu = 0.5
                     mem = 0.5
-            else:
-                cpu = node_info.get('cpu', 50.0) / 100.0
-                mem = node_info.get('mem', 50.0) / 100.0
-
-            # 角色
-            is_source = 1.0 if node == source else 0.0
-            is_dest = 1.0 if node in dests else 0.0
-            is_connected = 1.0 if node in connected else 0.0
-
-            # VNF部署情况
-            num_vnf_deployed = sum(
-                1 for (n_id, vnf_idx), _ in placement.items()
-                if n_id == node
-            )
-            vnf_density = num_vnf_deployed / max(1, len(vnf_list))
-
-            # 是否在树上
-            is_on_tree = 1.0 if node in nodes_on_tree else 0.0
-
-            # 拓扑特征
-            try:
-                neighbors = self.resource_mgr.get_neighbors(node)
-                degree = len(neighbors) if neighbors else 0
-            except:
-                degree = 0
-            degree_norm = degree / max(1, n)
-
-            # 距离特征（安全版本）
-            try:
-                dist_to_source = self._get_hop_distance(node, source)
-                dist_norm = dist_to_source / max(1, n) if dist_to_source < 9999 else 1.0
-            except:
-                dist_norm = 0.5
-
-            # 到最近目的地的距离
-            if len(dests) > 0:
-                try:
-                    dist_to_nearest_dest = min(
-                        self._get_hop_distance(node, d) for d in dests
-                    )
-                    dist_dest_norm = dist_to_nearest_dest / max(1, n) if dist_to_nearest_dest < 9999 else 1.0
-                except:
-                    dist_dest_norm = 0.5
-            else:
-                dist_dest_norm = 0.0
-
-            x.append([
-                cpu,  # 0: CPU余量
-                mem,  # 1: 内存余量
-                is_source,  # 2: 是否源节点
-                is_dest,  # 3: 是否目的地
-                is_connected,  # 4: 是否已连接
-                vnf_density,  # 5: VNF部署密度
-                is_on_tree,  # 6: 是否在树上
-                degree_norm,  # 7: 度中心性
-                dist_norm,  # 8: 到源节点距离
-                dist_dest_norm  # 9: 到最近目的地距离
-            ])
 
         x = torch.tensor(x, dtype=torch.float32)
 
@@ -1582,15 +1550,30 @@ class SFC_HIRL_Env(gym.Env):
 #低层
     def step_low_level(self, action):
         """
-        ⚙️ [低层V32.0 时序同步版] 执行高层设定的目标
+        ⚙️ [低层V36.0 终极修复版]
+        集成：路径修正 + 资源验证 + 强引导 + 详细诊断
         """
-        # ----------------------
-        # 1. 基础校验与防护
-        # ----------------------
-        # 参数验证
+
+        # ==========================================
+        # [阶段0] 预处理：获取上下文信息
+        # ==========================================
+        phase = getattr(self, 'current_phase', 'unknown')
+        current_node = self.current_node_location
+
+        # 获取当前阶段目标
+        if phase == 'vnf_deployment':
+            target_goal = getattr(self, 'current_deployment_target', None)
+        elif phase == 'destination_connection':
+            target_goal = getattr(self, 'current_target_node', None)
+        else:
+            target_goal = None
+
+        # ==========================================
+        # [阶段1] 类型转换与基础验证
+        # ==========================================
         try:
-            target_node = int(action)
-            current_node = self.current_node_location
+            original_action = int(action)
+            target_node = original_action
         except (ValueError, TypeError):
             logger.error(f"❌ [低层] 无效的动作类型: {action}")
             return self.get_state(), -10.0, False, False, {
@@ -1598,23 +1581,84 @@ class SFC_HIRL_Env(gym.Env):
                 'message': f'动作类型无效: {type(action)}'
             }
 
-        # 获取动作掩码 (增加兜底逻辑)
+        # ==========================================
+        # [阶段2] 🎓 专家路径修正（三重检查）
+        # ==========================================
+        if target_goal is not None and current_node != target_goal:
+            neighbors = self.resource_mgr.get_neighbors(current_node)
+            needs_correction = False
+            correction_reason = ""
+
+            # 检查1：STAY但不在目标
+            if target_node == current_node:
+                needs_correction = True
+                correction_reason = "STAY但不在目标"
+
+            # 检查2：非邻居节点
+            elif target_node not in neighbors:
+                needs_correction = True
+                correction_reason = "非邻居节点"
+
+            # 执行修正
+            if needs_correction:
+                next_hop = self.get_next_hop_to_target(current_node, target_goal)
+
+                if next_hop is not None and next_hop != target_node:
+                    logger.warning(
+                        f"🎓 [路径修正] {current_node}→{target_goal}: "
+                        f"Agent选{target_node}({correction_reason})，改为{next_hop}"
+                    )
+                    target_node = next_hop
+                elif next_hop is None:
+                    logger.critical(f"❌ 目标{target_goal}从{current_node}完全不可达！")
+                    return self.get_state(), -50.0, False, True, {
+                        'unreachable_target': True,
+                        'target': target_goal,
+                        'current': current_node
+                    }
+
+        # ==========================================
+        # [阶段3] Mask验证与二次修正
+        # ==========================================
         try:
             mask = self.get_low_level_action_mask()
         except Exception as e:
-            logger.error(f"❌ [低层] 获取动作掩码失败: {e}")
-            mask = np.ones(self.n, dtype=np.int8)  # 兜底防止crash
+            logger.error(f"❌ [低层] 获取Mask失败: {e}")
+            mask = np.ones(self.n, dtype=np.float32)
 
-        # 动作合法性检查
-        if target_node >= len(mask) or mask[target_node] == 0:
-            logger.warning(f"❌ [低层] 非法动作: 目标节点{target_node}被掩码屏蔽")
-            return self.get_state(), -10.0, False, False, {
-                'invalid_action': True,
-                'current_node': current_node,
-                'target_node': target_node
-            }
+        # Mask检查
+        if target_node >= len(mask):
+            logger.error(f"❌ [低层] 动作越界: {target_node} >= {len(mask)}")
+            return self.get_state(), -10.0, False, False, {'out_of_bounds': True}
 
-        # 步数计数和熔断
+        if mask[target_node] <= 0:
+            logger.warning(
+                f"⚠️ [低层] 修正后动作{target_node}仍被屏蔽 "
+                f"(原:{original_action}, mask[{target_node}]={mask[target_node]:.3f})"
+            )
+
+            # 🔥 二次修正：强制使用Mask权重最高的动作
+            if target_goal is not None:
+                # 优先尝试最短路径
+                next_hop = self.get_next_hop_to_target(current_node, target_goal)
+                if next_hop is not None and next_hop < len(mask) and mask[next_hop] > 0:
+                    logger.error(f"🆘 二次修正：使用{next_hop}（最短路径）")
+                    target_node = next_hop
+                else:
+                    # 选择Mask权重最高的动作
+                    max_idx = int(np.argmax(mask))
+                    if mask[max_idx] > 0:
+                        logger.error(f"🆘 二次修正：使用{max_idx}（Mask最高权重）")
+                        target_node = max_idx
+                    else:
+                        logger.critical(f"❌ 无任何可行动作！返回高层")
+                        return self.get_state(), -50.0, False, True, {
+                            'no_valid_action': True
+                        }
+
+        # ==========================================
+        # [阶段4] 步数计数与超时保护
+        # ==========================================
         if not hasattr(self, '_step_count_this_branch'):
             self._step_count_this_branch = 0
         self._step_count_this_branch += 1
@@ -1623,21 +1667,38 @@ class SFC_HIRL_Env(gym.Env):
             logger.warning(f"❌ [低层超时] 步数超过50，强制终止")
             self.current_branch_id = None
             self._step_count_this_branch = 0
-            # 返回 truncated=True 强制交还控制权给高层
             return self.get_state(), -50.0, False, True, {
                 'timeout': True,
                 'message': '低层执行超时'
             }
 
-        phase = getattr(self, 'current_phase', 'unknown')
+        # ==========================================
+        # [阶段5] 详细诊断日志
+        # ==========================================
+        deployment_target = getattr(self, 'current_deployment_target', None)
+        vnf_idx = getattr(self, 'current_vnf_to_deploy', None)
 
-        # ============================================
-        # 阶段1：VNF部署执行
-        # ============================================
+        logger.warning(f"🔍 [低层执行] Step#{self._step_count_this_branch}")
+        logger.warning(f"   当前位置: {current_node}")
+        logger.warning(f"   原始动作: {original_action}")
+        logger.warning(f"   修正动作: {target_node}")
+        logger.warning(f"   是STAY: {target_node == current_node}")
+        logger.warning(f"   阶段: {phase}")
+        logger.warning(f"   部署目标: {deployment_target}")
+        logger.warning(f"   到达目标: {current_node == deployment_target}")
+        logger.warning(f"   VNF进度: {self._get_total_vnf_progress()}/{len(self.current_request.get('vnf', []))}")
+
+        if phase == 'vnf_deployment' and current_node == deployment_target and target_node == current_node:
+            logger.warning(f"   ⭐ 条件满足！准备尝试部署...")
+        elif phase == 'vnf_deployment':
+            logger.warning(
+                f"   ❌ 未满足部署条件: current={current_node}, target={target_node}, goal={deployment_target}"
+            )
+
+        # ==========================================
+        # [阶段6] VNF部署执行
+        # ==========================================
         if phase == 'vnf_deployment':
-            deployment_target = getattr(self, 'current_deployment_target', None)
-            vnf_idx = getattr(self, 'current_vnf_to_deploy', None)
-
             if deployment_target is None:
                 return self.get_state(), -5.0, False, True, {'error': 'no_deployment_target'}
 
@@ -1645,39 +1706,42 @@ class SFC_HIRL_Env(gym.Env):
             if current_node == deployment_target and target_node == current_node:
                 vnf_list = self.current_request.get('vnf', [])
 
-                # 尝试部署 (假设 _try_deploy 内部已经扣除了CPU/Mem资源)
+                # 🔥 部署前资源验证
+                logger.info(f"🔍 [部署验证] 准备在节点{current_node}部署VNF[{vnf_idx}]")
+
                 if self._try_deploy(current_node):
-                    # 🔥 [关键同步 1] 更新 placement 记录
+                    # 更新部署记录
                     if 'placement' not in self.current_tree:
                         self.current_tree['placement'] = {}
 
                     vnf_type = vnf_list[vnf_idx]
                     self.current_tree['placement'][(current_node, vnf_idx)] = vnf_type
 
-                    # 🔥 [关键同步 2] 更新树节点集合
+                    # 更新树节点集合
                     if not hasattr(self, 'nodes_on_tree'):
                         self.nodes_on_tree = set()
                     self.nodes_on_tree.add(current_node)
 
-                    logger.info(f"✅ [低层部署] 节点{current_node} VNF[{vnf_idx}]")
+                    logger.info(f"✅ [低层部署成功] 节点{current_node} VNF[{vnf_idx}]")
 
-                    # 清理状态，准备返回
+                    # 清理状态
                     self._step_count_this_branch = 0
                     delattr(self, 'current_deployment_target')
                     delattr(self, 'current_vnf_to_deploy')
 
-                    # truncated=True: 告诉协调器"我这波操作完了，请让高层看一眼新状态"
                     return self.get_state(), 50.0, False, True, {
                         'deploy_success': True,
                         'node': current_node,
                         'vnf_idx': vnf_idx
                     }
                 else:
-                    logger.warning(f"❌ [低层部署失败] 节点{current_node}资源不足")
-                    # 部署失败通常也意味着需要返回高层重新决策(或结束)
+                    logger.error(f"❌ [低层部署失败] 节点{current_node}资源不足或不是DC节点")
+                    # 🔥 部署失败返回高层，让高层选择新节点
+                    self._step_count_this_branch = 0
                     return self.get_state(), -20.0, False, True, {
                         'deploy_fail': True,
-                        'reason': 'resource_insufficient'
+                        'reason': 'resource_insufficient',
+                        'failed_node': current_node
                     }
 
             # --- 情况2：移动逻辑 ---
@@ -1685,11 +1749,13 @@ class SFC_HIRL_Env(gym.Env):
                 return self._handle_movement(current_node, target_node, deployment_target)
 
             else:
-                return self.get_state(), -3.0, False, False, {'unnecessary_move': True}
+                # 这种情况理论上不应该发生（已被修正）
+                logger.warning(f"⚠️ [低层] 异常状态: STAY但未触发部署逻辑")
+                return self.get_state(), -3.0, False, False, {'unexpected_stay': True}
 
-        # ============================================
-        # 阶段2：目的地连接执行
-        # ============================================
+        # ==========================================
+        # [阶段7] 目的地连接执行
+        # ==========================================
         elif phase == 'destination_connection':
             target_dest = getattr(self, 'current_target_node', None)
             if target_dest is None:
@@ -1697,16 +1763,14 @@ class SFC_HIRL_Env(gym.Env):
 
             # --- 情况1：已到达目的地，执行STAY连接 ---
             if current_node == target_dest and target_node == current_node:
-                # 建立路径 (假设内部扣除了带宽资源)
                 if self._build_path_to_destination(target_dest):
-                    # 连接目的地
                     if self._connect_destination(target_dest):
-                        # 🔥 [关键同步 3] 强制更新 connected_dests
+                        # 更新连接记录
                         if 'connected_dests' not in self.current_tree:
                             self.current_tree['connected_dests'] = set()
                         self.current_tree['connected_dests'].add(target_dest)
 
-                        logger.info(f"🎉 [低层连接] 目的地{target_dest}已连接")
+                        logger.info(f"🎉 [低层连接成功] 目的地{target_dest}")
                         self._step_count_this_branch = 0
 
                         # 检查是否全部完成
@@ -1714,11 +1778,9 @@ class SFC_HIRL_Env(gym.Env):
                         connected = self.current_tree.get('connected_dests', set())
 
                         if len(connected) >= len(dests):
-                            logger.info("🎊 [低层] 所有目的地连接完成，调用Finalize")
-                            # ⚠️ 注意：_finalize_request 必须返回 (s, r, term, trunc, info)
+                            logger.info("🎊 [低层] 所有目的地连接完成")
                             return self._finalize_request()
                         else:
-                            # 还有其他目的地，返回高层做下一个决策
                             delattr(self, 'current_target_node')
                             return self.get_state(), 100.0, False, True, {
                                 'connection_success': True,
@@ -1736,9 +1798,9 @@ class SFC_HIRL_Env(gym.Env):
             else:
                 return self.get_state(), -3.0, False, False, {'idle': True}
 
-        # ============================================
-        # 未知阶段
-        # ============================================
+        # ==========================================
+        # [阶段8] 未知阶段
+        # ==========================================
         else:
             return self.get_state(), -10.0, False, False, {'error': 'unknown_phase'}
     def _handle_movement(self, current, target, goal):
@@ -1837,63 +1899,124 @@ class SFC_HIRL_Env(gym.Env):
         return self.resource_mgr.has_link(from_node, to_node)
     def get_low_level_action_mask(self):
         """
-        🎭 [低层Mask V30.0] 根据阶段生成mask
+        🎭 [低层Mask V36.0] 基于最短路径的强引导
         """
-        mask = np.zeros(self.n, dtype=np.float32)
+        import networkx as nx
 
+        mask = np.zeros(self.n, dtype=np.float32)
         current = self.current_node_location
         phase = getattr(self, 'current_phase', 'unknown')
 
+        # 构建网络图
+        G = nx.Graph()
+        for u in range(self.n):
+            neighbors = self.resource_mgr.get_neighbors(u)
+            for v in neighbors:
+                if self.resource_mgr.has_link(u, v):
+                    G.add_edge(u, v)
+
         # ============================================
-        # 阶段1：VNF部署 - 引导到目标节点
+        # VNF部署阶段
         # ============================================
         if phase == 'vnf_deployment':
             target = getattr(self, 'current_deployment_target', None)
 
             if target is not None:
-                # 如果在目标节点，强烈建议STAY
-                if current == target:
-                    mask[current] = 10.0
+                # 检查目标可达性
+                try:
+                    path = nx.shortest_path(G, current, target)
+                    is_reachable = True
+                except nx.NetworkXNoPath:
+                    logger.error(f"❌ [Mask] 目标{target}从{current}不可达")
+                    is_reachable = False
 
-                    # 也允许移动（但权重低）
+                # 🔥 情况1：已在目标节点 - 强制STAY
+                if current == target:
+                    mask[current] = 100.0
+                    # 完全禁止移动
                     neighbors = self.resource_mgr.get_neighbors(current)
                     for nbr in neighbors:
-                        mask[nbr] = 0.1
+                        mask[nbr] = 0.0
+                    logger.debug(f"🎯 [Mask] 在目标{current}，强制STAY")
 
-                # 如果不在目标节点，允许移动
+                # 🔥 情况2：目标可达 - 沿最短路径强引导
+                elif is_reachable:
+                    next_hop = path[1] if len(path) > 1 else current
+                    neighbors = self.resource_mgr.get_neighbors(current)
+
+                    # 完全禁止STAY
+                    mask[current] = 0.0
+
+                    for nbr in neighbors:
+                        if nbr == next_hop:
+                            # 最短路径下一跳：超高权重
+                            mask[nbr] = 100.0
+                            logger.debug(f"🎯 [Mask] 最短路径: {current}→{nbr}→{target}")
+                        elif nbr == target:
+                            # 邻居就是目标：最高权重
+                            mask[nbr] = 100.0
+                            logger.debug(f"🎯 [Mask] 邻居{nbr}就是目标！")
+                        else:
+                            # 检查该邻居到目标的距离
+                            try:
+                                nbr_path = nx.shortest_path(G, nbr, target)
+                                nbr_dist = len(nbr_path) - 1
+                                curr_dist = len(path) - 1
+
+                                if nbr_dist < curr_dist:
+                                    mask[nbr] = 50.0  # 更近
+                                elif nbr_dist == curr_dist:
+                                    mask[nbr] = 20.0  # 同样近
+                                elif nbr_dist <= curr_dist + 2:
+                                    mask[nbr] = 5.0  # 稍远
+                                else:
+                                    mask[nbr] = 1.0  # 绕远路
+                            except nx.NetworkXNoPath:
+                                mask[nbr] = 0.1  # 死路
+
+                # 🔥 情况3：目标不可达 - 允许探索
                 else:
                     neighbors = self.resource_mgr.get_neighbors(current)
                     for nbr in neighbors:
                         mask[nbr] = 1.0
-
-                    # 轻微允许STAY（探索）
-                    mask[current] = 0.1
+                    mask[current] = 1.0  # 也允许STAY
 
         # ============================================
-        # 阶段2：目的地连接 - 引导到目的地
+        # 目的地连接阶段（逻辑相同）
         # ============================================
         elif phase == 'destination_connection':
             target = getattr(self, 'current_target_node', None)
 
             if target is not None:
-                # 如果在目的地，强烈建议STAY连接
+                try:
+                    path = nx.shortest_path(G, current, target)
+                    is_reachable = True
+                except nx.NetworkXNoPath:
+                    is_reachable = False
+
                 if current == target:
-                    mask[current] = 10.0
-
+                    mask[current] = 100.0
                     neighbors = self.resource_mgr.get_neighbors(current)
                     for nbr in neighbors:
-                        mask[nbr] = 0.1
+                        mask[nbr] = 0.0
 
-                # 如果不在目的地，允许移动
-                else:
+                elif is_reachable:
+                    next_hop = path[1] if len(path) > 1 else current
                     neighbors = self.resource_mgr.get_neighbors(current)
-                    for nbr in neighbors:
-                        mask[nbr] = 1.0
+                    mask[current] = 0.0
 
-                    mask[current] = 0.1
+                    for nbr in neighbors:
+                        if nbr == next_hop or nbr == target:
+                            mask[nbr] = 100.0
+                        else:
+                            try:
+                                nbr_path = nx.shortest_path(G, nbr, target)
+                                mask[nbr] = max(1.0, 100.0 / len(nbr_path))
+                            except nx.NetworkXNoPath:
+                                mask[nbr] = 0.1
 
         # ============================================
-        # 兜底
+        # 兜底逻辑
         # ============================================
         else:
             mask[current] = 1.0
@@ -1901,7 +2024,9 @@ class SFC_HIRL_Env(gym.Env):
             for nbr in neighbors:
                 mask[nbr] = 1.0
 
+        # 🔥 最终安全检查
         if np.sum(mask) == 0:
+            logger.critical(f"⚠️ [Mask] 所有动作被屏蔽，强制允许STAY")
             mask[current] = 1.0
 
         return mask
@@ -1930,10 +2055,11 @@ class SFC_HIRL_Env(gym.Env):
         # 2. 构造基础特征流
         base_features = []
         for node in range(self.n):
-            node_info = self.resource_mgr.nodes.get(node, {})
-            cpu_rem = node_info.get('cpu', 0.0)
-            mem_rem = node_info.get('mem', 0.0)
+            avail_cpu = self.resource_mgr.pool.get_available_cpu(node)
+            avail_mem = self.resource_mgr.pool.get_available_memory(node)
 
+            cpu_rem = avail_cpu
+            mem_rem = avail_mem
             # 🔥 [关键特征] 适配度 (Fit Factor)
             # 1.0 表示能放得下，-1.0 表示资源不足
             fit_factor = 1.0 if cpu_rem >= current_vnf_demand else -1.0
@@ -2201,31 +2327,83 @@ class SFC_HIRL_Env(gym.Env):
             return nx.shortest_path_length(self._nx_graph, u, v)
         except:
             return 50  # 出错兜底
+    def get_next_hop_to_target(self, current, target):
+        """
+        🧭 [V36.0] 智能获取下一跳节点
+        优先级：最短路径 > 启发式距离 > 随机邻居
+        """
+        import networkx as nx
+
+        # 情况1：已在目标
+        if current == target:
+            return current
+
+        # 情况2：构建网络图
+        G = nx.Graph()
+        for u in range(self.n):
+            neighbors = self.resource_mgr.get_neighbors(u)
+            for v in neighbors:
+                if self.resource_mgr.has_link(u, v):
+                    G.add_edge(u, v)
+
+        # 情况3：尝试最短路径
+        try:
+            path = nx.shortest_path(G, current, target)
+            if len(path) > 1:
+                next_hop = path[1]
+                logger.debug(f"🧭 [路径] 最短路径: {current}→{next_hop}→...→{target}")
+                return next_hop
+            else:
+                return current
+        except nx.NetworkXNoPath:
+            logger.warning(f"⚠️ [路径] 无路径: {current}→{target}")
+
+        # 情况4：启发式选择（距离目标最近的邻居）
+        neighbors = self.resource_mgr.get_neighbors(current)
+        if not neighbors:
+            logger.error(f"❌ [路径] 节点{current}无邻居！")
+            return current
+
+        best_neighbor = None
+        best_distance = float('inf')
+
+        for nbr in neighbors:
+            try:
+                nbr_path = nx.shortest_path(G, nbr, target)
+                dist = len(nbr_path) - 1
+            except nx.NetworkXNoPath:
+                dist = float('inf')
+
+            if dist < best_distance:
+                best_distance = dist
+                best_neighbor = nbr
+
+        if best_neighbor is not None and best_distance != float('inf'):
+            logger.debug(f"🧭 [路径] 启发式: {current}→{best_neighbor} (距{target}还有{best_distance}跳)")
+            return best_neighbor
+
+        # 情况5：无奈之选（返回第一个邻居）
+        logger.warning(f"⚠️ [路径] 目标{target}完全不可达，随机选择邻居{neighbors[0]}")
+        return neighbors[0]
 #资源检查 _check_node_resource _check_deployment_validity
 #_try_deploy  _manual_release_resources _archive_request _update_tree_state
-    def _check_node_resources(self, node_id: int) -> bool:
+    def _check_node_resources(self, node_id: int, vnf_idx: int = None) -> bool:
         """
-        🔥 [V3.5 修复版] 检查资源（含虚拟预扣）
-        解决“草图画得太满，落地时资源不足”的问题
+        🔥 [V3.7 修复变量名错误] 检查资源（含虚拟预扣）
+
+        Args:
+            node_id: 节点ID
+            vnf_idx: VNF索引（如果None，则自动推断）
         """
         try:
             if self.current_request is None:
                 return True
 
-            # 1. 获取当前要部署的 VNF 的资源需求
-            # ---------------------------------------------------
             vnf_list = self.current_request.get('vnf', [])
 
-            # 计算当前是第几个 VNF (根据 placement 的数量推断)
-            # 注意：这里假设是按顺序部署。如果是乱序，需要传参进来，但通常 Agent 是顺序的
-            deployed_count = 0
-            placement = self.current_tree.get('placement', {})
-            for k in placement.keys():
-                # 过滤掉非部署记录
-                if isinstance(k, tuple) and len(k) >= 2:
-                    deployed_count += 1
-
-            vnf_idx = deployed_count
+            # 使用传入的vnf_idx，或者使用环境的进度
+            if vnf_idx is None:
+                vnf_idx = self._get_total_vnf_progress()
 
             # 如果已经部署完了，就不需要检查了
             if vnf_idx >= len(vnf_list):
@@ -2237,109 +2415,117 @@ class SFC_HIRL_Env(gym.Env):
             mem_reqs = self.current_request.get('memory_origin', []) or \
                        self.current_request.get('mem_origin', [])
 
-            # 安全获取当前 VNF 的需求
             req_cpu = float(cpu_reqs[vnf_idx]) if vnf_idx < len(cpu_reqs) else 1.0
             req_mem = float(mem_reqs[vnf_idx]) if vnf_idx < len(mem_reqs) else 1.0
 
-            # 2. 🔥 [核心] 计算当前请求已在草图上预订的资源 (Virtual Reserved)
-            # ---------------------------------------------------
+            # 统计虚拟预订
             reserved_cpu = 0.0
             reserved_mem = 0.0
 
+            placement = self.current_tree.get('placement', {})
+            current_branch = getattr(self, 'current_branch_id', None)
+
             for key, info in placement.items():
-                # 只统计当前节点 (node_id) 的预订情况
-                p_node = info.get('node')
-                if p_node == node_id:
-                    reserved_cpu += info.get('cpu_used', 0.0)
-                    reserved_mem += info.get('mem_used', 0.0)
+                if len(key) >= 3:
+                    p_node = key[0]
+                    p_branch = key[2]
 
-            # 3. 获取物理剩余资源 (Physical Available)
-            # ---------------------------------------------------
-            avail_cpu = 0.0
-            avail_mem = 0.0
+                    if p_node == node_id and p_branch == current_branch:
+                        reserved_cpu += info.get('cpu_used', 0.0)
+                        reserved_mem += info.get('mem_used', 0.0)
 
-            # 适配 resource_mgr 的不同实现结构
-            nodes_data = self.resource_mgr.nodes
-            if isinstance(nodes_data, list):  # List[Dict]
-                node_info = nodes_data[node_id]
-                avail_cpu = node_info.get('cpu', 0.0)
-                avail_mem = node_info.get('memory', node_info.get('mem', 0.0))
-            elif isinstance(nodes_data, dict):  # SOA Dict
-                avail_cpu = nodes_data.get('cpu', [])[node_id]
-                avail_mem = nodes_data.get('memory', [])[node_id]
+            # 🔥 修复：使用正确的变量名 node_id
+            avail_cpu = self.resource_mgr.pool.get_available_cpu(node_id)
+            avail_mem = self.resource_mgr.pool.get_available_memory(node_id)
 
-            # 4. 最终判定：物理余额 - 虚拟预扣 >= 当前需求
-            # ---------------------------------------------------
-            # 加上 1.05 倍的安全因子，防止浮点数误差
+            # 详细日志
+            logger.warning(f"🔍 [资源检查] 节点{node_id}, VNF[{vnf_idx}]")
+            logger.warning(f"   物理资源: CPU={avail_cpu:.1f}, Mem={avail_mem:.1f}")
+            logger.warning(f"   虚拟预订: CPU={reserved_cpu:.1f}, Mem={reserved_mem:.1f}")
+            logger.warning(f"   可用资源: CPU={avail_cpu - reserved_cpu:.1f}, Mem={avail_mem - reserved_mem:.1f}")
+            logger.warning(f"   VNF需求: CPU={req_cpu:.1f}, Mem={req_mem:.1f}")
+
             cpu_ok = (avail_cpu - reserved_cpu) >= (req_cpu * 1.05)
             mem_ok = (avail_mem - reserved_mem) >= (req_mem * 1.05)
 
-            # 调试日志 (可选，排查问题时打开)
-            # if not cpu_ok:
-            #     print(f"🛑 [资源预警] 节点{node_id} 拒绝部署 VNF{vnf_idx}")
-            #     print(f"   物理余: {avail_cpu:.2f}, 草图占: {reserved_cpu:.2f}, 需: {req_cpu:.2f}")
+            logger.warning(f"   判断: {'✅可部署' if (cpu_ok and mem_ok) else '❌不足'}")
+
+            if not cpu_ok:
+                logger.warning(f"   ❌ CPU不足: {avail_cpu - reserved_cpu:.1f} < {req_cpu * 1.05:.1f}")
+            if not mem_ok:
+                logger.warning(f"   ❌ 内存不足: {avail_mem - reserved_mem:.1f} < {req_mem * 1.05:.1f}")
 
             return cpu_ok and mem_ok
 
         except Exception as e:
-            # print(f"⚠️ 资源检查报错: {e}")
+            logger.error(f"❌ [资源检查] 节点{node_id}检查失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     def _try_deploy(self, node):
         """
-        🔥 [V12.5 修复版] 强制使用带预扣的资源检查
-        彻底解决“假装有资源”导致的 Overbooking 问题
+        🔥 [V36.0 详细诊断版] 尝试部署VNF
         """
-        if self.current_request is None or self.current_branch_id is None:
+        if self.current_request is None:
+            logger.error("❌ [部署] 没有当前请求")
             return False
 
         vnf_list = self.current_request.get('vnf', [])
         if len(vnf_list) == 0:
-            return False
+            logger.info("✅ [部署] 没有VNF需要部署")
+            return True
 
-        # 1. 获取当前分支在该路径上的 VNF 连续部署进度
-        current_progress = self._get_path_vnf_progress(node)
-
-        # 2. 如果已经全部部署完成，则不再部署
+        # 获取当前VNF索引
+        current_progress = self._get_total_vnf_progress()
         if current_progress >= len(vnf_list):
-            return False
+            logger.info("✅ [部署] 所有VNF已部署完成")
+            return True
 
-        # 3. 确定当前需要部署的 VNF 类型
         next_vnf_idx = current_progress
         next_vnf_type = vnf_list[next_vnf_idx]
 
-        # 4. 获取资源需求
-        cpu_needs = self.current_request.get('cpu_origin', []) or self.current_request.get('vnf_cpu', [])
-        mem_needs = self.current_request.get('memory_origin', []) or self.current_request.get('mem_origin', [])
+        # 🔥 详细资源检查
+        logger.info(f"\n🔍 [部署检查] 节点{node}, VNF[{next_vnf_idx}]类型{next_vnf_type}")
 
-        # 安全获取需求值
-        c_req = float(cpu_needs[next_vnf_idx]) if next_vnf_idx < len(cpu_needs) else 1.0
-        m_req = float(mem_needs[next_vnf_idx]) if next_vnf_idx < len(mem_needs) else 1.0
+        # 获取资源需求
+        cpu_reqs = self.current_request.get('cpu_origin', []) or self.current_request.get('vnf_cpu', [])
+        mem_reqs = self.current_request.get('memory_origin', []) or self.current_request.get('vnf_mem', [])
 
-        # =================================================================
-        # 🔥🔥🔥 核心修改点：调用带“虚拟账本”的检查函数
-        # =================================================================
-        # 这一步会计算：物理剩余 - (当前请求已在草图中预订的资源) >= 新需求 ?
-        if not self._check_node_resources(node):
-            # 调试日志：如果被拒绝，说明算上预扣后资源不足
-            # print(f"🚫 [虚拟部署拒绝] 节点{node} 无法容纳 VNF{next_vnf_type} (预扣不足)")
+        required_cpu = cpu_reqs[next_vnf_idx] if next_vnf_idx < len(cpu_reqs) else 10.0
+        required_mem = mem_reqs[next_vnf_idx] if next_vnf_idx < len(mem_reqs) else 10.0
+
+        logger.info(f"   VNF需求: CPU={required_cpu}, Mem={required_mem}")
+
+        # 获取节点资源
+        # 🔥 修复：直接从pool获取可用资源
+        avail_cpu = self.resource_mgr.pool.get_available_cpu(node)
+        avail_mem = self.resource_mgr.pool.get_available_memory(node)
+
+        logger.info(f"   节点资源: CPU={avail_cpu}, Mem={avail_mem}")
+        logger.info(f"   资源足够: CPU={avail_cpu >= required_cpu}, Mem={avail_mem >= required_mem}")
+        # 🔥 资源检查
+        if avail_cpu < required_cpu or avail_mem < required_mem:
+            logger.error(f"❌ [部署失败] 节点{node}资源不足")
+            logger.error(f"   需要: CPU={required_cpu}, Mem={required_mem}")
+            logger.error(f"   可用: CPU={avail_cpu}, Mem={avail_mem}")
             return False
 
-        # 5. 执行虚拟部署记录 (Placement)
-        key = (node, next_vnf_type, self.current_branch_id)
+        # 🔥 DC节点检查
+        if hasattr(self, 'dc_nodes') and node not in self.dc_nodes:
+            logger.error(f"❌ [部署失败] 节点{node}不是DC节点")
+            logger.error(f"   DC节点列表: {self.dc_nodes}")
+            return False
 
-        if 'placement' not in self.current_tree:
-            self.current_tree['placement'] = {}
+        # 执行部署
+        logger.info(f"✅ [部署成功] 节点{node}部署VNF[{next_vnf_idx}]类型{next_vnf_type}")
 
-        self.current_tree['placement'][key] = {
-            'vnf_idx': next_vnf_idx,
-            'vnf_type': next_vnf_type,
-            'node': node,
-            'cpu_used': c_req,
-            'mem_used': m_req,
-            'branch_id': self.current_branch_id
-        }
+        # 扣除资源
+        if hasattr(self.resource_mgr, 'allocate_node_resource'):
+            success = self.resource_mgr.allocate_node_resource(node, next_vnf_type, required_cpu, required_mem)
+            if not success:
+                logger.error(f"❌ [部署失败] 资源分配失败")
+                return False
 
-        print(f"✅ [Virtual Deploy] 节点{node} 记录 VNF[{next_vnf_idx}]={next_vnf_type} (暂未扣费)")
         return True
     def _archive_request(self, success=False, already_rolled_back=False):
         """
@@ -4178,3 +4364,236 @@ class SFC_HIRL_Env(gym.Env):
 
         if len(placement) > 5:
             logger.info(f"  ... 还有 {len(placement) - 5} 个")
+
+    #诊断
+    def diagnose_high_level_decision(self):
+        """
+        🔍 [诊断工具] 分析高层为什么一直选择节点0
+        """
+        if not self.current_request:
+            return
+
+        print("\n" + "=" * 80)
+        print("🔍 高层决策诊断报告")
+        print("=" * 80)
+
+        vnf_idx = self._get_total_vnf_progress()
+        vnf_list = self.current_request.get('vnf', [])
+
+        print(f"\n📊 当前状态:")
+        print(f"  - 当前VNF索引: {vnf_idx}/{len(vnf_list)}")
+        print(f"  - 当前阶段: {getattr(self, 'current_phase', 'unknown')}")
+
+        # 分析每个节点的得分情况
+        print(f"\n🎯 节点分析:")
+        print(f"{'节点':<6} {'有效':<6} {'DC节点':<8} {'CPU余量':<10} {'内存余量':<10} {'Mask值':<8}")
+        print("-" * 60)
+
+        mask = self.get_high_level_action_mask()
+
+        for node in range(min(10, self.n)):  # 只显示前10个节点
+            is_valid = self._is_valid_node(node)
+            is_dc = node in getattr(self, 'dc_nodes', [])
+
+            if isinstance(self.resource_mgr.nodes, dict) and 'cpu' in self.resource_mgr.nodes:
+                # 列表字典结构 {'cpu': [...], 'memory': [...]}
+                cpu_list = self.resource_mgr.C
+                mem_list = self.resource_mgr.M
+
+                if node < len(cpu_list):
+                    cpu = cpu_list[node] / 100.0
+                    mem = mem_list[node] / 100.0 if node < len(mem_list) else 0.5
+                else:
+                    cpu = 0.5
+                    mem = 0.5
+            else:
+                # 节点字典结构 {0: {'cpu': xx, 'mem': xx}}
+                node_info = self.resource_mgr.nodes.get(node, {})
+                cpu = node_info.get('cpu', 50.0) / 100.0
+                mem = node_info.get('mem', 50.0) / 100.0
+
+            print(f"{node:<6} {'✅' if is_valid else '❌':<6} {'✅' if is_dc else '❌':<8} "
+                  f"{cpu:<10.2f} {mem:<10.2f} {mask[node]:<8}")
+
+        # 检查资源管理器状态
+        print(f"\n🗄️ 资源管理器状态:")
+        print(f"  - 类型: {type(self.resource_mgr)}")
+        print(f"  - 节点数据结构: {type(self.resource_mgr.nodes)}")
+
+        if isinstance(self.resource_mgr.nodes, dict):
+            print(f"  - 节点字典键: {list(self.resource_mgr.nodes.keys())[:5]}...")
+            if 'cpu' in self.resource_mgr.nodes:
+                print(f"  - ⚠️ 检测到字典结构为 {{'cpu': [...], 'memory': [...]}}")
+                print(f"  - CPU列表长度: {len(self.resource_mgr.nodes.get('cpu', []))}")
+
+        print("\n" + "=" * 80 + "\n")
+
+    def diagnose_low_level_execution(self):
+        """
+        🔍 [诊断工具] 分析低层为什么一直超时
+        """
+        print("\n" + "=" * 80)
+        print("⚙️ 低层执行诊断报告")
+        print("=" * 80)
+
+        print(f"\n📊 当前状态:")
+        print(f"  - 当前位置: 节点{self.current_node_location}")
+        print(f"  - 当前阶段: {getattr(self, 'current_phase', 'unknown')}")
+        print(f"  - 已执行步数: {getattr(self, '_step_count_this_branch', 0)}")
+
+        # VNF部署阶段诊断
+        if getattr(self, 'current_phase', '') == 'vnf_deployment':
+            target = getattr(self, 'current_deployment_target', None)
+            vnf_idx = getattr(self, 'current_vnf_to_deploy', None)
+
+            print(f"\n🎯 VNF部署目标:")
+            print(f"  - 目标节点: {target}")
+            print(f"  - VNF索引: {vnf_idx}")
+            print(f"  - 是否到达: {'✅' if self.current_node_location == target else '❌'}")
+
+            if target is not None:
+                # 检查目标节点资源
+                node_info = self.resource_mgr.nodes.get(target, {})
+                print(f"\n📦 目标节点{target}资源:")
+                print(f"  - CPU: {node_info.get('cpu', 'N/A')}")
+                print(f"  - 内存: {node_info.get('mem', 'N/A')}")
+
+                # 检查VNF需求
+                if self.current_request and vnf_idx is not None:
+                    vnf_cpu = self.current_request.get('vnf_cpu', [10.0])
+                    vnf_mem = self.current_request.get('vnf_mem', [10.0])
+
+                    if vnf_idx < len(vnf_cpu):
+                        print(f"\n📋 VNF[{vnf_idx}]需求:")
+                        print(f"  - CPU需求: {vnf_cpu[vnf_idx]}")
+                        print(f"  - 内存需求: {vnf_mem[vnf_idx]}")
+
+                        can_deploy = (node_info.get('cpu', 0) >= vnf_cpu[vnf_idx] and
+                                      node_info.get('mem', 0) >= vnf_mem[vnf_idx])
+                        print(f"  - 能否部署: {'✅' if can_deploy else '❌'}")
+
+        # 分析动作掩码
+        print(f"\n🎭 低层动作掩码分析:")
+        mask = self.get_low_level_action_mask()
+        available_actions = np.where(mask > 0)[0]
+
+        print(f"  - 可用动作数: {len(available_actions)}")
+        print(f"  - 可用动作: {available_actions[:10]}")  # 只显示前10个
+        print(f"  - 当前节点可用: {'✅' if mask[self.current_node_location] > 0 else '❌'}")
+        print(f"  - STAY动作权重: {mask[self.current_node_location]:.2f}")
+
+        # 检查邻居连通性
+        current = self.current_node_location
+        neighbors = self.resource_mgr.get_neighbors(current)
+        print(f"\n🔗 节点{current}连通性:")
+        print(f"  - 邻居数: {len(neighbors) if neighbors else 0}")
+        if neighbors:
+            print(f"  - 邻居节点: {neighbors[:10]}")
+
+        print("\n" + "=" * 80 + "\n")
+
+    def diagnose_resource_manager(self):
+        """
+        🔍 [诊断工具] 检查资源管理器的数据结构
+        """
+        print("\n" + "=" * 80)
+        print("🗄️ 资源管理器结构诊断")
+        print("=" * 80)
+
+        print(f"\n📊 基础信息:")
+        print(f"  - 类名: {type(self.resource_mgr).__name__}")
+        print(f"  - 节点总数: {self.n}")
+
+        # 检查nodes属性
+        print(f"\n🔍 nodes 属性分析:")
+        print(f"  - 类型: {type(self.resource_mgr.nodes)}")
+
+        if isinstance(self.resource_mgr.nodes, dict):
+            print(f"  - 字典键: {list(self.resource_mgr.nodes.keys())}")
+
+            # 如果是 {'cpu': [...], 'memory': [...]} 结构
+            if 'cpu' in self.resource_mgr.nodes:
+                print(f"\n  ⚠️ 检测到列表字典结构!")
+                cpu_list = self.resource_mgr.nodes.get('cpu', [])
+                mem_list = self.resource_mgr.nodes.get('mem', [])
+
+                print(f"  - CPU列表长度: {len(cpu_list)}")
+                print(f"  - 内存列表长度: {len(mem_list)}")
+                print(f"  - 前5个节点CPU: {cpu_list[:5]}")
+                print(f"  - 前5个节点内存: {mem_list[:5]}")
+
+            # 如果是 {0: {...}, 1: {...}} 结构
+            elif 0 in self.resource_mgr.nodes:
+                print(f"\n  ✅ 检测到节点字典结构")
+                print(f"  - 节点数量: {len(self.resource_mgr.nodes)}")
+
+                # 显示前5个节点
+                for i in range(min(5, len(self.resource_mgr.nodes))):
+                    node_info = self.resource_mgr.nodes.get(i, {})
+                    print(f"  - 节点{i}: {node_info}")
+
+        # 检查links属性
+        print(f"\n🔗 links 属性分析:")
+        print(f"  - 类型: {type(self.resource_mgr.links)}")
+
+        if isinstance(self.resource_mgr.links, dict):
+            print(f"  - 链路数量: {len(self.resource_mgr.links)}")
+
+            # 显示前5条链路
+            for i, (edge, info) in enumerate(list(self.resource_mgr.links.items())[:5]):
+                print(f"  - 链路{edge}: {info}")
+
+        # 测试关键方法
+        print(f"\n🧪 方法可用性测试:")
+        methods_to_test = [
+            'get_neighbors',
+            'has_link',
+            'get_node_cpu',
+            'get_node_mem',
+            'allocate_node_resource',
+            'allocate_link_resource'
+        ]
+
+        for method_name in methods_to_test:
+            has_method = hasattr(self.resource_mgr, method_name)
+            print(f"  - {method_name}: {'✅' if has_method else '❌'}")
+
+        print("\n" + "=" * 80 + "\n")
+
+    def diagnose_full_step(self, high_action, low_action=None):
+        """
+        🔍 [诊断工具] 追踪一次完整的step执行
+
+        使用方法:
+        在step之前调用: env.diagnose_full_step(high_action)
+        """
+        print("\n" + "🔥" * 40)
+        print("🔍 完整执行流程诊断")
+        print("🔥" * 40 + "\n")
+
+        # 1. 诊断高层决策
+        print("【第1步】高层决策诊断")
+        self.diagnose_high_level_decision()
+
+        # 2. 诊断资源管理器
+        print("【第2步】资源管理器诊断")
+        self.diagnose_resource_manager()
+
+        # 3. 执行高层动作并诊断
+        print("【第3步】执行高层动作")
+        print(f"  - 高层选择动作: {high_action}")
+
+        state, reward, done, trunc, info = self.step_high_level(high_action)
+
+        print(f"  - 高层返回:")
+        print(f"    * reward: {reward}")
+        print(f"    * done: {done}")
+        print(f"    * truncated: {trunc}")
+        print(f"    * info: {info}")
+
+        # 4. 如果进入低层，诊断低层
+        if not done and not trunc:
+            print("\n【第4步】低层执行诊断")
+            self.diagnose_low_level_execution()
+
+        print("\n" + "🔥" * 40 + "\n")
