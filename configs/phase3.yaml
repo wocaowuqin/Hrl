@@ -84,7 +84,7 @@ hrl:
 epsilon:
   # High-Level策略探索
   high:
-    initial: 0.9                  # 初始探索率30%
+    initial: 0.9                  # 初始探索率60%
     final: 0.05                   # 最终探索率5%
     decay_steps: 300000            # 50000步线性衰减
 
@@ -188,7 +188,7 @@ reward:
 # ============================================
 environment:
   num_nodes: 28                   # 节点数
-  nb_high_level_goals: 10         # High-Level目标数量
+  nb_high_level_goals: 28         # High-Level目标数量
   nb_low_level_actions: 28        # Low-Level动作数（等于节点数）
 
   # 🔥 新增：时间槽系统

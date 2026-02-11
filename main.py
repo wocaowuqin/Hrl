@@ -29,7 +29,7 @@ from core.hrl.agent import (
 
 from trainer.phase1_collector import Phase1ExpertCollector
 from trainer.phase2_il_trainer import Phase2ILTrainer
-from trainer.phase3_rl_trainer import Phase3RLTrainer  # 🔥 修改版
+from trainer.phase3_rl_trainer import Phase3RLTrainer
 
 # 配置全局日志格式
 logging.basicConfig(
@@ -444,80 +444,6 @@ def diagnose_goal_embedding(agent, env):
         return False
 
 
-def diagnose_mask_system(env, agent):
-    """
-    🔍 全面诊断 Mask 系统 (环境 + Agent)
-    """
-    import traceback  # 局部导入，防止报错
-    import numpy as np  # 确保numpy可用
-
-    print("\n" + "=" * 60)
-    print("🏥 [诊断开始] Mask 系统健康检查")
-    print("=" * 60)
-
-    try:
-        # 1. 静态检查
-        print("\n1️⃣ [静态检查] 环境属性:")
-        print(f"   👉 _n_actions: {getattr(env, '_n_actions', '❌ 缺失')}")
-        print(f"   👉 n (节点数): {getattr(env, 'n', '❌ 缺失')}")
-        print(f"   👉 get_action_mask: {'✅' if hasattr(env, 'get_action_mask') else '❌'}")
-        print(f"   👉 get_low_level_action_mask: {'✅' if hasattr(env, 'get_low_level_action_mask') else '❌'}")
-
-        # 2. 动态检查 Reset
-        print("\n2️⃣ [动态检查] Reset:")
-        obs, info = env.reset()
-        print(f"   ✅ Reset 成功 | Info keys: {list(info.keys())}")
-
-        mask = info.get('action_mask')
-        if mask is not None:
-            print(f"   ✅ Mask 获取成功 | Shape: {mask.shape} | Sum: {mask.sum()}")
-        else:
-            print("   ❌ 错误: info['action_mask'] 为 None")
-
-        # 3. 动态检查 Step
-        print("\n3️⃣ [动态检查] Step:")
-        try:
-            _, _, _, _, step_info = env.step(0)
-            step_mask = step_info.get('action_mask')
-            if step_mask is not None:
-                print(f"   ✅ Step Mask 获取成功 | Sum: {step_mask.sum()}")
-            else:
-                print("   ❌ 错误: step_info['action_mask'] 为 None")
-        except Exception as e:
-            print(f"   ❌ Step 崩溃: {e}")
-
-        # 4. Agent 兼容性
-        print("\n4️⃣ [兼容检查] Agent.select_action:")
-        try:
-            # 重新 Reset
-            obs, info = env.reset()
-            curr_mask = info.get('action_mask')
-            if curr_mask is None and hasattr(env, 'n'):
-                curr_mask = np.ones(env.n)  # 临时 Mask
-
-            # 获取 unconnected_dests，兼容不同属性名
-            unconnected = []
-            if hasattr(env, 'current_tree'):
-                unconnected = list(env.current_tree.get('connected_dests', []))
-
-            high, low, _ = agent.select_action(
-                state=obs,
-                action_mask=curr_mask,
-                unconnected_dests=unconnected,
-                blacklist_info={}
-            )
-            print(f"   ✅ Agent 调用成功: Low Action = {low}")
-        except Exception as e:
-            print(f"   ❌ Agent 崩溃: {e}")
-            traceback.print_exc()
-
-    except Exception as e:
-        print(f"❌ 诊断脚本自身出错: {e}")
-        traceback.print_exc()
-
-    print("=" * 60 + "\n")
-
-
 def diagnose_agent_timing_performance(env, agent):
     """
     🔍 深度诊断函数：检测 Agent 动作密度与物理时间的失配度
@@ -540,7 +466,9 @@ def diagnose_detailed_timing(env, agent):
     # 为节省空间省略，请保持原函数内容
 
 
+
 def main():
+    """🔥 V40.0 完整修复版本 - main函数"""
     parser = argparse.ArgumentParser(description="HRL-GNN SFC Orchestration Training Pipeline")
     parser.add_argument('--phase', type=str, required=True,
                         choices=['phase1', 'phase2', 'phase3'],
@@ -638,7 +566,6 @@ def main():
             print("=" * 40 + "\n")
         except Exception as e:
             print(f"⚠️ 资源打印失败: {e}")
-        # 🔥🔥🔥
     except Exception as e:
         logger.error(f"❌ 环境初始化崩溃: {e}")
         import traceback
@@ -728,7 +655,7 @@ def main():
             # 核心修复：传入全局 env
             trainer = Phase2ILTrainer(
                 agent=agent,
-                env=env,  # <--- 这里传入 env
+                env=env,
                 expert_data_path=data_path,
                 output_dir=output_dir,
                 config=phase2_config
@@ -763,7 +690,8 @@ def main():
             agent = create_goal_conditioned_agent(
                 config=config,
                 phase=3,
-                goal_strategy=args.goal_strategy
+                goal_strategy=args.goal_strategy,
+                env=env
             )
 
             logger.info("✅ Agent 初始化成功")
@@ -821,40 +749,7 @@ def main():
         else:
             logger.warning(f"⚠️ 未找到预训练模型: {pretrained_path}")
 
-        # 3. 诊断
-        diagnose_mask_system(env, agent)
-        if not diagnose_goal_embedding(agent, env):
-            return
 
-        # =========================================================
-        # 🔥 [关键修改] 在 main.py 中初始化 HRL Coordinator (移出 Env)
-        # =========================================================
-        coordinator = None
-        try:
-            logger.info("🔧 尝试初始化 HRL Coordinator...")
-            # 1. 尝试导入 (根据项目结构可能不同)
-            try:
-                from core.hrl.coordinator import HRL_Coordinator
-            except ImportError:
-                try:
-                    from envs.modules.hrl_coordinator import HRL_Coordinator
-                except ImportError:
-                    from envs.sfc_env import HRL_Coordinator
-
-            # 2. 准备 Agent 参数
-            # HRL Agent 通常封装了 high/low，如果没有显式分离，则复用 agent 实例
-            h_agent = getattr(agent, 'high_agent', agent)
-            l_agent = getattr(agent, 'low_agent', agent)
-
-            # 3. 实例化协调器
-            # 注意：env 已经在 main 中全局初始化了
-            coordinator = HRL_Coordinator(env, h_agent, l_agent, config)
-            logger.info("✅ HRL Coordinator 初始化成功 (Main Loop Ready)")
-
-        except ImportError:
-            logger.warning("⚠️ 未找到 HRL_Coordinator 类，跳过初始化")
-        except Exception as e:
-            logger.warning(f"⚠️ HRL Coordinator 初始化失败: {e}")
 
         # =========================================================
         # 🔥 初始化 HRL Coordinator
@@ -865,8 +760,8 @@ def main():
         try:
             coordinator = HRL_Coordinator(
                 env=env,
-                high_agent=agent,  # 高层策略
-                low_agent=agent,  # 低层策略 (同一个agent的不同方法)
+                high_agent=agent,
+                low_agent=agent,
                 config=config
             )
             logger.info("✅ HRL Coordinator 初始化成功")
@@ -877,29 +772,72 @@ def main():
             return
 
         # =========================================================
-        # 🔥 将 Coordinator 注入 Trainer
+        # 🔥🔥🔥 关键修复：加载Phase3训练数据
+        # =========================================================
+        logger.info("=" * 70)
+        logger.info("📥 加载Phase3训练数据")
+        logger.info("=" * 70)
+
+        data_file = 'data/input_dir/phase3_requests.pkl'
+        logger.info(f"📂 数据文件路径: {data_file}")
+        logger.info(f"📂 当前工作目录: {os.getcwd()}")
+        logger.info(f"🔍 文件是否存在: {os.path.exists(data_file)}")
+
+        if os.path.exists(data_file):
+            logger.info(f"✅ 文件存在，开始加载...")
+            try:
+                success = env.load_dataset(data_file)
+                if success:
+                    logger.info(f"✅ 数据加载成功")
+
+                    # 🔥 验证数据
+                    logger.info("🔍 验证数据加载...")
+                    test_state = env.reset()
+                    if env.current_request:
+                        vnf_list = env.current_request.get('vnf', [])
+                        logger.info(f"✅ 验证成功：请求存在，VNF数量={len(vnf_list)}")
+                    else:
+                        logger.warning("⚠️ 验证警告：reset后无请求")
+                else:
+                    logger.error(f"❌ load_dataset返回False")
+                    raise RuntimeError("数据加载失败")
+            except Exception as e:
+                logger.error(f"❌ 数据加载异常: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+        else:
+            logger.error(f"❌ 文件不存在: {data_file}")
+
+            # 列出可能的文件位置
+            logger.info("🔍 检查data/input_dir/目录内容...")
+            input_dir = 'data/input_dir'
+            if os.path.exists(input_dir):
+                files = [f for f in os.listdir(input_dir) if f.endswith('.pkl')]
+                logger.info(f"📂 找到的.pkl文件:")
+                for f in files:
+                    logger.info(f"   - {f}")
+            else:
+                logger.error(f"❌ 目录不存在: {input_dir}")
+
+            raise FileNotFoundError(f"数据文件不存在: {data_file}")
+
+        logger.info("=" * 70)
+
+        # =========================================================
+        # 🔥 创建 Trainer
         # =========================================================
         trainer = Phase3RLTrainer(
             env=env,
             agent=agent,
             output_dir=ckpt_dir,
             config=config,
-            coordinator=coordinator  # 🔥 传入 coordinator
+            coordinator=coordinator
         )
 
-        try:
-            trainer.run()
-            logger.info("✅ Phase 3 完成")
-        except Exception as e:
-            logger.error(f"❌ Phase 3 执行失败: {e}")
-            import traceback
-            traceback.print_exc()
-
-        # 注入 coordinator (如果 Trainer 支持)
-        if coordinator and hasattr(trainer, 'set_coordinator'):
-            logger.info("🔗 将 Coordinator 注入 Trainer")
-            trainer.set_coordinator(coordinator)
-
+        # =========================================================
+        # 🔥 开始训练
+        # =========================================================
         try:
             trainer.run()
             logger.info("✅ Phase 3 完成")
