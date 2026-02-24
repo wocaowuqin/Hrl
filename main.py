@@ -466,22 +466,21 @@ def diagnose_detailed_timing(env, agent):
     # 为节省空间省略，请保持原函数内容
 
 
-
 def main():
-    """🔥 V40.0 完整修复版本 - main函数"""
-    parser = argparse.ArgumentParser(description="HRL-GNN SFC Orchestration Training Pipeline")
-    parser.add_argument('--phase', type=str, required=True,
-                        choices=['phase1', 'phase2', 'phase3'],
-                        help='Training phase')
-    parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    """🔥 V40.0 完整修复版本 - main函数 (IDE直调版)"""
 
-    # 🔥 新增：Goal Strategy 参数
-    parser.add_argument('--goal_strategy', type=str, default='adaptive',
-                        choices=['relative', 'adaptive', 'hybrid'],
-                        help='Goal Embedding strategy (Phase 3 only)')
+    import argparse
 
-    args = parser.parse_args()
+    # =========================================================================
+    # 🔥 运行参数配置区：直接在这里修改你想运行的阶段和参数
+    # =========================================================================
+    args = argparse.Namespace(
+        phase='phase3',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
+        gpu=0,  # GPU ID, 设为 -1 则强制使用 CPU
+        seed=42,  # 随机种子
+        goal_strategy='adaptive'  # Phase 3 的目标策略: 'relative', 'adaptive', 'hybrid'
+    )
+    # =========================================================================
 
     # 1. 设置设备
     if torch.cuda.is_available() and args.gpu >= 0:
@@ -749,8 +748,6 @@ def main():
         else:
             logger.warning(f"⚠️ 未找到预训练模型: {pretrained_path}")
 
-
-
         # =========================================================
         # 🔥 初始化 HRL Coordinator
         # =========================================================
@@ -849,7 +846,6 @@ def main():
     logger.info("=" * 70)
     logger.info("🎉 程序执行完成")
     logger.info("=" * 70)
-
 
 if __name__ == "__main__":
     main()
