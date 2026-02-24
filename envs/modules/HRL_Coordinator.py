@@ -7,10 +7,11 @@ logger = logging.getLogger(__name__)
 
 class HRL_Coordinator:
     """
-    纯HRL协调器 - V52.0 (强制重采版)
+    纯HRL协调器 - V53.0 (移除暴力检测版)
     包含:
     1. 接收 HighLevel 的 Truncated 信号
-    2. 🔥 强制清空 Agent 的 Subgoal 缓存 (打破死循环的关键)
+    2. 强制清空 Agent 的 Subgoal 缓存
+    3. 🔥 [关键修复] 移除暴力目标检测，强制 Agent 执行停留动作
     """
 
     def __init__(self, env, high_agent, low_agent, config=None):
@@ -31,7 +32,7 @@ class HRL_Coordinator:
         self.current_episode = 0
         self.resources_released = False
 
-        logger.info("🚀 纯HRL协调器初始化完成（V52.0 强制重采版）")
+        logger.info("🚀 纯HRL协调器初始化完成（V53.0 移除暴力检测版）")
 
     def run_high_low_cycle(self, high_obs, training=True):
         """
@@ -46,11 +47,6 @@ class HRL_Coordinator:
         # ============================================================
         # 1. 获取 Mask
         high_mask = self.env.get_high_level_action_mask()
-
-        # 🕵️‍♂️ [Debug] 打印关键节点 Mask 状态
-        # debug_node = 7
-        # if len(high_mask) > debug_node:
-        #     logger.info(f"🎭 [Coordinator] Mask[{debug_node}] = {high_mask[debug_node]}")
 
         if sum(high_mask) == 0:
             logger.error("❌ 无可用高层动作 (Mask全0)")
@@ -160,6 +156,7 @@ class HRL_Coordinator:
             # ----------------------------------------------------
             # 终止条件检查
             # ----------------------------------------------------
+            # 必须由 info 中的明确信号触发终止
             if info.get('subgoal_done', False):
                 logger.info(f"✅ [Coordinator] 检测到 Subgoal 完成信号")
 
@@ -177,17 +174,26 @@ class HRL_Coordinator:
                 subgoal_achieved = True
                 break
 
-            # 暴力修正: 检查是否已物理连接
-            current_loc = self.env.current_node_location
-            if current_loc == target_node:
-                if hasattr(self.env, 'current_tree') and self.env.current_tree:
-                    connected_dests = self.env.current_tree.get('connected_dests', set())
-                    if target_node in connected_dests:
-                        logger.info(f"✅ [Coordinator] 暴力检测: 节点 {target_node} 已在连接树中")
-                        if hasattr(self.high_agent, 'current_subgoal'):
-                            self.high_agent.current_subgoal = None
-                        subgoal_achieved = True
-                        break
+            # 🛑 [V53.0 关键修复] 移除暴力检测！
+            # ----------------------------------------------------------------------------------
+            # 原有的逻辑会检测 "current_loc == target_node" 且 "target_node in connected_dests"。
+            # 这会导致 Agent 只要路过目标节点（尚未执行 STAY/CONNECT），就会被判定为完成，
+            # 从而跳过了 LowLevelController 中至关重要的 "连接建立" 和 "奖励获取" 步骤。
+            # 这正是导致 "树冗余高" 和 "反复徘徊" 的核心原因。
+            #
+            # 已注释掉以下代码块：
+            # ----------------------------------------------------------------------------------
+            # current_loc = self.env.current_node_location
+            # if current_loc == target_node:
+            #     if hasattr(self.env, 'current_tree') and self.env.current_tree:
+            #         connected_dests = self.env.current_tree.get('connected_dests', set())
+            #         if target_node in connected_dests:
+            #             logger.info(f"✅ [Coordinator] 暴力检测: 节点 {target_node} 已在连接树中")
+            #             if hasattr(self.high_agent, 'current_subgoal'):
+            #                 self.high_agent.current_subgoal = None
+            #             subgoal_achieved = True
+            #             break
+            # ----------------------------------------------------------------------------------
 
             if done:
                 episode_done = True

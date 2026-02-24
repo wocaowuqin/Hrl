@@ -229,8 +229,26 @@ class HRLAgent:
             blacklist_info: Optional[dict] = None
     ) -> Tuple[int, int, Dict]:
         """
-        🔥 [V40.20 最终修复版] Start-End 联合决策逻辑
+        🔥 [V55.6 强制起点版] 紧急修复 StartNode=None 问题
         """
+        # ================================================================
+        # 🚨 [DEBUG] 打印接收到的动作掩码（V55.3 增强调试）
+        # ================================================================
+        logger.error("=" * 60)
+        logger.error("🟡 [Agent Debug] select_action 收到掩码:")
+        if action_mask is not None:
+            logger.error(f"   形状: {action_mask.shape}, 类型: {type(action_mask)}")
+            valid_nodes = np.where(action_mask > 0)[0]
+            logger.error(f"   合法节点: {valid_nodes.tolist()}")
+            logger.error(f"   总数: {len(valid_nodes)}")
+            if len(action_mask) > 15:
+                logger.error(f"   mask[15] = {action_mask[15]}")
+            else:
+                logger.error(f"   mask 长度不足15: {len(action_mask)}")
+        else:
+            logger.error("   action_mask = None")
+        logger.error("=" * 60)
+
         # 初始化 info 字典
         info = {
             'high_level_decision': False,
@@ -248,23 +266,40 @@ class HRLAgent:
 
             if need_new_subgoal:
                 # === A. 选终点 (Goal Head) ===
-                # 注意：_select_subgoal 内部负责更新 self.current_subgoal
                 self.current_subgoal = self._select_subgoal(state, unconnected_dests, action_mask)
                 self.subgoal_steps = 0
 
-                # 更新 info
                 info['high_level_decision'] = True
                 info['subgoal'] = self.current_subgoal
                 info['source'] = 'agent_high'
 
                 logger.debug(f"🎯 [High] 新子目标: {self.current_subgoal}")
 
-                # === B. 🔥🔥🔥 选起点 (Start Head) 🔥🔥🔥 ===
-                # 关键修复：调用 _force_select_start_node 强制更新环境位置
-                start_node = self._force_select_start_node(state, self.current_subgoal)
-                info['start_node'] = start_node
+                # ========== 🔥 强制起点：从请求中获取 source 节点 ==========
+                # 临时紧急修复：直接使用源节点作为起点，确保环境位置正确更新
+                try:
+                    if self.env is not None and hasattr(self.env, 'current_request') and self.env.current_request:
+                        source_node = self.env.current_request.get('source', 0)
+                    else:
+                        source_node = 0
+                        logger.error("🟢 [强制起点] 无法获取环境请求，使用默认0")
 
-                # 日志确认代码已生效
+                    # 更新环境当前位置（非常重要！）
+                    if hasattr(self.env, 'current_node_location'):
+                        self.env.current_node_location = int(source_node)
+                        logger.error(f"🟢 [强制起点] 设置环境位置为源节点: {source_node}")
+                    else:
+                        logger.error("🟢 [强制起点] 环境没有 current_node_location 属性")
+
+                    start_node = int(source_node)
+                    logger.error(f"🟢 [强制起点] 最终起点: {start_node}")
+                except Exception as e:
+                    logger.error(f"🟢 [强制起点] 异常: {e}")
+                    start_node = 0
+                    if hasattr(self.env, 'current_node_location'):
+                        self.env.current_node_location = 0
+
+                info['start_node'] = start_node
                 logger.info(f"✅ [SelectAction] High-Level 完成: Start={start_node} -> Goal={self.current_subgoal}")
 
             # ============================================
@@ -275,9 +310,7 @@ class HRLAgent:
             # 更新计数器
             self.subgoal_steps += 1
             self.subgoal_step_count = self.subgoal_steps
-            # self.steps_done += 1 # 如果外部 Trainer 会增加 step，这里可以注释掉，避免重复计数
 
-            # 更新 info
             info['low_action'] = low_action
             if blacklist_info and low_action in blacklist_info.get('nodes', []):
                 info['blacklisted_action'] = True
@@ -291,8 +324,16 @@ class HRLAgent:
                 if self.current_subgoal in unconnected_dests:
                     high_action = unconnected_dests.index(self.current_subgoal)
             else:
-                # VNF 模式 (Phase 3 Placement): 直接返回节点 ID 或 DC ID
+                # VNF 模式 (Phase 3 Placement): 直接返回节点 ID
                 high_action = self.current_subgoal if self.current_subgoal is not None else 0
+
+            # ================================================================
+            # 🚨 [DEBUG] 最终动作确认
+            # ================================================================
+            logger.error("=" * 50)
+            logger.error(f"✅ [Agent Decision] HighAction={high_action}, LowAction={low_action}")
+            logger.error(f"   Subgoal={self.current_subgoal}, StartNode={info.get('start_node')}")
+            logger.error("=" * 50)
 
             return high_action, low_action, info
 
@@ -304,38 +345,73 @@ class HRLAgent:
             return 0, 0, info
 
     def _need_new_subgoal(self, state: Dict, unconnected_dests: Optional[list]) -> bool:
-        """判断是否需要新的subgoal"""
-        # 1. 没有subgoal
+        """
+        🔥 [V55.4 修复版] 判断是否需要新的子目标
+        新增：VNF阶段资源不足检测 + 详细调试日志
+        """
+        # ---------- 1. 无子目标 ----------
         if self.current_subgoal is None:
+            logger.debug("[NeedNew] 无子目标 → 需要")
             return True
 
-        # 2. 没有未连接节点
+        # ---------- 2. 无待连接目的地（仅对路由阶段有效）----------
         if not unconnected_dests or len(unconnected_dests) == 0:
+            logger.debug("[NeedNew] 无待连接目的地 → 不需要（已无任务）")
             return False
 
-        # 3. Subgoal已连接
+        # ---------- 3. 子目标已连接（路由阶段专用）----------
         if self.current_subgoal not in unconnected_dests:
+            logger.debug(f"[NeedNew] 子目标 {self.current_subgoal} 已连接 → 需要")
             return True
 
-        # 4. Subgoal超时
+        # ---------- 4. 子目标超时 ----------
         if self.subgoal_steps >= self.subgoal_horizon:
-            logger.debug(f"⚠️ Subgoal超时 (steps={self.subgoal_steps})")
+            logger.debug(f"[NeedNew] 子目标超时 (steps={self.subgoal_steps}) → 需要")
             return True
 
-        # 5. 已到达subgoal
+        # ---------- 5. 已到达子目标位置 ----------
         current_pos = state.get('current_position', -1)
         if current_pos == self.current_subgoal:
+            logger.debug(f"[NeedNew] 已到达子目标 {self.current_subgoal} → 需要")
             return True
 
+        # ============================================================
+        # 🔥🔥🔥 [新增] 6. VNF 部署阶段：检查当前子目标节点资源是否充足
+        # ============================================================
+        if self.env is not None and hasattr(self.env, 'current_phase'):
+            if self.env.current_phase == 'vnf_deployment':
+                try:
+                    vnf_list = self.env.current_request.get('vnf', [])
+                    vnf_idx = getattr(self.env, 'next_vnf_idx', 0)
+                    if vnf_idx < len(vnf_list):
+                        cpu_req = self.env.current_request.get('cpu_origin', [])[vnf_idx]
+                        mem_req = self.env.current_request.get('memory_origin', [])[vnf_idx]
+                        avail_cpu = self.env.resource_mgr.pool.get_available_cpu(self.current_subgoal)
+                        avail_mem = self.env.resource_mgr.pool.get_available_memory(self.current_subgoal)
+
+                        if avail_cpu < cpu_req or avail_mem < mem_req:
+                            logger.warning(
+                                f"[NeedNew] 🚨 子目标节点 {self.current_subgoal} 资源不足！\n"
+                                f"   需求: CPU={cpu_req}, MEM={mem_req}\n"
+                                f"   可用: CPU={avail_cpu:.1f}, MEM={avail_mem:.1f}\n"
+                                f"   → 强制触发新子目标"
+                            )
+                            return True
+                except Exception as e:
+                    logger.error(f"[NeedNew] 资源检查异常: {e}")
+
+        # ---------- 默认：不需要新子目标 ----------
+        logger.debug(f"[NeedNew] 保持当前子目标 {self.current_subgoal}")
         return False
 
     def _select_subgoal(self, state: Dict, unconnected_dests: list, action_mask: np.ndarray = None) -> int:
         """
-        🔥 [终极修复版]
-        1. 修正了 Index Aliasing 问题 (不再映射 unconnected_dests)
+        🔥 [终极修复版 + V55.3 强制验证]
+        1. 修正 Index Aliasing 问题
         2. 包含完整的 Brain Scan 和 Mask 诊断
+        3. 探索/贪婪阶段强制修正非法选择
         """
-        # Get graph embedding
+        # 获取图嵌入
         graph_emb = self._get_graph_embedding(state)
 
         # ============================================================
@@ -343,21 +419,16 @@ class HRLAgent:
         # ============================================================
         with torch.no_grad():
             q_values, goal_emb, _ = self.high_policy(graph_emb, return_subgoal=True)
-            # q_values shape: [1, n_nodes] usually
 
-        # =================================================================================
-        # 🕵️‍♂️🔥 [调试模块 A] Brain Scan (查看原始网络想法)
-        # =================================================================================
+        # ============================================================
+        # 🕵️‍♂️ [调试模块 A] Brain Scan
+        # ============================================================
         try:
             q_list = q_values.squeeze().cpu().numpy().tolist()
-            # 找到前3名
             top_indices = np.argsort(q_list)[-3:][::-1]
             top_scores = [q_list[i] for i in top_indices]
-
-            # 专门监控当前可能出问题的节点 (比如 7)
             monitor_nodes = [7]
             monitor_str = " | ".join([f"Node{n}={q_list[n]:.2f}" for n in monitor_nodes if n < len(q_list)])
-
             logger.warning(
                 f"\n🧠 [BRAIN] Raw Top3: {top_indices} (Scores: {[f'{s:.2f}' for s in top_scores]}) | {monitor_str}")
         except Exception as e:
@@ -372,83 +443,82 @@ class HRLAgent:
         if action_mask is not None:
             mask_tensor = torch.tensor(action_mask, device=self.device).float()
 
-            # 维度对齐检查
             if mask_tensor.shape[-1] != q_values.shape[-1]:
                 logger.error(f"❌ [MASK] 维度不匹配! Mask={mask_tensor.shape[-1]}, Q={q_values.shape[-1]}")
-                # 紧急回退：全1 mask，避免 crash，但会打印错误
                 mask_tensor = torch.ones_like(q_values)
 
-            # 确保 mask 形状正确
             if mask_tensor.dim() == 1:
                 mask_tensor = mask_tensor.unsqueeze(0)
 
-            # 🔥 核心 Mask 操作：将非法节点 Q 值设为负无穷
             huge_negative = torch.tensor(-1e9, device=self.device)
             masked_q_values = torch.where(mask_tensor > 0, q_values, huge_negative)
             effective_mask = mask_tensor
 
-            # 🕵️‍♂️ [调试模块 B] Mask 检查
             try:
                 invalid_indices = torch.where(mask_tensor.squeeze() == 0)[0].tolist()
                 logger.warning(f"🎭 [MASK] 被封杀节点数: {len(invalid_indices)}")
                 if 7 in invalid_indices:
-                    logger.warning(f"   ✅ Node 7 已被正确 Mask (Q应该变为 -1e9)")
+                    logger.warning(f"   ✅ Node 7 已被正确 Mask")
                 else:
                     logger.error(f"   ❌ 警告: Node 7 未被 Mask! 它仍然是可选的!")
             except:
                 pass
 
         # ============================================================
-        # 3. 动作选择 (Action Selection)
+        # 3. 动作选择 (Epsilon-Greedy)
         # ============================================================
         goal_idx = 0
 
-        # Epsilon-Greedy
         if random.random() < self.epsilon_high:
-            # 随机探索：只从 mask=1 的节点中选
+            # ---------- 探索 ----------
             valid_indices = torch.nonzero(effective_mask.squeeze() > 0).flatten()
             if len(valid_indices) > 0:
                 rand_pos = torch.randint(0, len(valid_indices), (1,)).item()
                 goal_idx = valid_indices[rand_pos].item()
+
+                # 🚨 [DEBUG] 探索合法性检查与强制修正
+                if action_mask is not None and action_mask[goal_idx] == 0:
+                    logger.critical(f"💥 [Agent Bug] 探索选中了被 Mask 封杀的节点 {goal_idx}！")
+                    goal_idx = valid_indices[0].item()
+                    logger.critical(f"   强制修正为: {goal_idx}")
+
                 logger.warning(f"🎲 [EXPLORE] 随机选中: {goal_idx}")
             else:
                 logger.error(f"💀 [FAIL] 无路可走(Mask全0)，强制返回 0")
                 goal_idx = 0
         else:
-            # 贪婪选择
+            # ---------- 贪婪 ----------
             goal_idx = masked_q_values.argmax(dim=1).item()
 
-            # --- 安全检查 (Sanity Check) ---
             if action_mask is not None and len(action_mask) > goal_idx:
                 if action_mask[goal_idx] == 0:
-                    logger.error(
-                        f"💀 [CRITICAL] 贪婪策略选中了被Mask的节点 {goal_idx}! MaskedQ={masked_q_values[0][goal_idx]}")
-
-                    # 🚑 紧急修复机制：如果网络选了死路，强制选第一个活路
+                    logger.critical(
+                        f"💀 [CRITICAL] 贪婪策略选中了被Mask的节点 {goal_idx}! "
+                        f"MaskedQ={masked_q_values[0][goal_idx].item():.2f}, "
+                        f"RawQ={q_values[0][goal_idx].item():.2f}"
+                    )
                     valid_indices = np.where(action_mask > 0)[0]
                     if len(valid_indices) > 0:
+                        old_idx = goal_idx
                         goal_idx = valid_indices[0]
-                        logger.warning(f"🔧 [FIX] 强制重定向到第一个合法节点: {goal_idx}")
+                        logger.critical(f"🔧 [FIX] 强制重定向: {old_idx} -> {goal_idx}")
 
         # ============================================================
-        # 4. 后处理 (❌ BUG 修复区)
+        # 4. 后处理 (直接使用物理索引)
         # ============================================================
-
-        # ❌ [已删除] 旧的错误逻辑 (Index Aliasing Source)
-        # if unconnected_dests is not None:
-        #     if goal_idx < len(unconnected_dests):
-        #         subgoal = unconnected_dests[goal_idx]  <-- 罪魁祸首
-
-        # ✅ [新逻辑] 直接使用物理索引
-        # 神经网络输出的就是全图的节点 ID，不需要映射！
         subgoal = int(goal_idx)
+
+        # 🚨 [DEBUG] 最终选择的掩码状态验证
+        if action_mask is not None and len(action_mask) > subgoal:
+            logger.error(f"   [验证] mask[{subgoal}] = {action_mask[subgoal]}")
+            if action_mask[subgoal] == 0:
+                logger.critical("🚨🚨🚨 严重错误：最终选择了一个被Mask封杀的节点！")
 
         logger.info(f"🎯 [DECISION] Final Subgoal: {subgoal} (RawIdx: {goal_idx})")
 
-        # Update Goal Embedding (用于传给 Low Level Policy)
+        # 更新 Goal Embedding
         if hasattr(state, 'x') and state.x is not None and subgoal < state.x.size(0):
             node_feat = state.x[subgoal]
-            # Padding check
             if node_feat.size(0) > self.goal_dim:
                 node_feat = node_feat[:self.goal_dim]
             elif node_feat.size(0) < self.goal_dim:
@@ -456,10 +526,10 @@ class HRLAgent:
                 node_feat = torch.cat([node_feat, padding])
             self.current_goal_emb = node_feat.unsqueeze(0)
         else:
-            # Fallback
             self.current_goal_emb = goal_emb
 
         return subgoal
+
     def _select_start_node(self, state: Dict, goal_idx: int, graph_emb: torch.Tensor) -> int:
         """
         🔥 [V41.3 修复版] 使用 Start Selector 选择起点节点 (支持 Tuple 解包)
@@ -528,27 +598,41 @@ class HRLAgent:
 
             # 兜底：返回默认起点
             return self._get_default_start_node(state)
-    def _get_default_start_node(self, state: Dict) -> int:
+
+    def _get_default_start_node(self, state) -> int:
         """
-        获取默认起点
-
-        Args:
-            state: 当前状态
-
-        Returns:
-            default_start: 默认起点索引
+        获取默认起点，保证返回整数节点ID
         """
-        # 优先级1: 从state中获取source
-        if hasattr(state, 'current_request') and state.current_request:
-            return state.current_request.get('source', 0)
+        # 优先级1：从 state 中获取 source
+        logger.error("🔵 [DefaultStart] 被调用！")
+        try:
+            if isinstance(state, tuple):
+                real_state = state[0]
+            else:
+                real_state = state
 
-        # 优先级2: 从环境获取
-        if hasattr(self, 'env') and hasattr(self.env, 'current_request'):
-            if self.env.current_request:
-                return self.env.current_request.get('source', 0)
+            if hasattr(real_state, 'current_request') and real_state.current_request:
+                source = real_state.current_request.get('source')
+                if source is not None:
+                    return int(source)
+        except:
+            pass
 
-        # 兜底：返回0
+        # 优先级2：从环境获取
+        try:
+            if hasattr(self, 'env') and self.env is not None:
+                if hasattr(self.env, 'current_request') and self.env.current_request:
+                    source = self.env.current_request.get('source')
+                    if source is not None:
+                        return int(source)
+        except:
+            pass
+
+        # 兜底：返回 0
+        logger.warning("[DefaultStart] 未找到源节点，返回 0")
         return 0
+
+
 
     def _build_tree_mask(self, state: Dict) -> torch.Tensor:
         """
@@ -1459,49 +1543,51 @@ class HRLAgent:
 
     def _force_select_start_node(self, state, subgoal):
         """
-        🔥 [V41.1 修复版] 强制使用高层策略选择起点 (支持 tuple 解包)
+        🔥 [V55.7 强制维度适配版] 确保无论 Encoder 是否存在，都能获得正确维度的节点嵌入
         """
         try:
-            # 🔥🔥🔥 核心修复：检测并解包 tuple state (obs, info)
+            # 1. 解包
             if isinstance(state, tuple):
-                # 通常格式为 (data, info)
                 real_state = state[0]
             else:
                 real_state = state
 
-            # 1. 获取节点嵌入（原始GNN输出）
-            if self.encoder is not None:
-                # 检查 real_state 是否有 x 属性
-                if hasattr(real_state, 'x') and real_state.x is not None:
-                    batch_vector = torch.zeros(real_state.x.size(0), dtype=torch.long, device=self.device)
-                    node_embeddings = self.encoder(real_state.x, real_state.edge_index, batch_vector)
-                else:
-                    # 如果没有 x 属性，可能是非 PyG 数据，记录警告并返回
-                    # logger.warning(f"State类型 {type(real_state)} 缺少x属性，无法使用Encoder")
-                    return self._get_default_start_node(real_state)
-            else:
-                # 备用模式：没有 Encoder，直接使用 state.x
-                if hasattr(real_state, 'x'):
-                    node_embeddings = real_state.x
-                else:
-                    return self._get_default_start_node(real_state)
+            # 2. 获取原始节点特征 [num_nodes, node_feat_dim]
+            if not hasattr(real_state, 'x') or real_state.x is None:
+                logger.error("[Start] state 缺少 x 属性")
+                return self._get_default_start_node(state)
 
-            # 2. 获取目标节点特征 (Target Embedding)
+            node_feat = real_state.x  # shape: [N, 17]
+
+            # ===== 关键修复：确保节点特征维度为 self.state_dim (128) =====
+            # 如果 encoder 存在，使用 encoder 投影；否则使用简单线性层投影
+            if self.encoder is not None:
+                batch = torch.zeros(node_feat.size(0), dtype=torch.long, device=self.device)
+                # encoder 期望输入 [N, 128]，但 node_feat 是 [N, 17]，我们需要一个适配器
+                # 方案：在 encoder 前加一个线性投影层（仅当输入维度不匹配时）
+                if not hasattr(self, 'state_proj'):
+                    self.state_proj = nn.Linear(node_feat.size(1), self.state_dim).to(self.device)
+                    logger.warning(f"🛠️ [Start] 创建临时投影层: {node_feat.size(1)} -> {self.state_dim}")
+                proj_feat = self.state_proj(node_feat)
+                node_embeddings = self.encoder(proj_feat, real_state.edge_index, batch)
+            else:
+                # 没有 encoder：使用一个简单的线性层直接投影到 self.state_dim
+                if not hasattr(self, 'state_proj'):
+                    self.state_proj = nn.Linear(node_feat.size(1), self.state_dim).to(self.device)
+                    logger.warning(f"🛠️ [Start] 创建临时投影层 (无Encoder): {node_feat.size(1)} -> {self.state_dim}")
+                node_embeddings = self.state_proj(node_feat)
+
+            # 3. 目标节点特征
             if isinstance(subgoal, int) and 0 <= subgoal < node_embeddings.size(0):
                 target_raw = node_embeddings[subgoal].unsqueeze(0)
             else:
-                # 目标节点无效，使用零向量
                 target_raw = torch.zeros(1, node_embeddings.size(1), device=self.device)
 
-            # 3. 获取目标的投影嵌入
-            # HighPolicy 内部会处理投影，这里传入原始特征即可
             target_emb = target_raw
 
-            # 4. 构建起点选择 mask
+            # 4. 构建起点掩码
             num_nodes = node_embeddings.size(0)
             start_mask = torch.ones(num_nodes, device=self.device)
-
-            # 基本规则：不能从目标节点本身出发
             if isinstance(subgoal, int) and 0 <= subgoal < num_nodes:
                 start_mask[subgoal] = 0
 
@@ -1514,27 +1600,28 @@ class HRLAgent:
                 sample=is_training
             )
 
-            # 6. 更新环境当前位置
+            # 6. 验证并更新环境位置
+            if not isinstance(start_node, (int, np.integer)) or start_node < 0 or start_node >= num_nodes:
+                logger.error(f"[Start] 无效起点 {start_node}，使用默认起点")
+                return self._get_default_start_node(state)
+
             if hasattr(self, 'env') and self.env is not None:
-                self.env.current_node_location = start_node
-                # 打印日志确认
+                self.env.current_node_location = int(start_node)
                 logger.info(f"🤖 [Start Head] 选中起点: {start_node} (目标: {subgoal})")
+            else:
+                logger.warning("[Start] 环境引用缺失，无法更新位置")
 
-            logger.info(f"🚀 [Start Selection] 激活！起点: {start_node} → 目标: {subgoal}")
-
-            return start_node
+            return int(start_node)
 
         except Exception as e:
-            # 只有在真正出错时才打印 Error
-            # logger.error(f"❌ 起点选择失败: {e}")
-            # import traceback
-            # traceback.print_exc()
-
-            # 兜底：返回默认起点
-            default_start = self._get_default_start_node(state)
+            logger.error(f"[Start] 异常: {e}")
+            import traceback
+            traceback.print_exc()
+            default = self._get_default_start_node(state)
+            logger.info(f"[Start] 异常回退，使用默认起点: {default}")
             if hasattr(self, 'env') and self.env is not None:
-                self.env.current_node_location = default_start
-            return default_start
+                self.env.current_node_location = default
+            return default
 # ============================================
 # 向后兼容：保留旧接口
 # ============================================
