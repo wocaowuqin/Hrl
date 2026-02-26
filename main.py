@@ -540,7 +540,9 @@ def diagnose_detailed_timing(env, agent):
     # 为节省空间省略，请保持原函数内容
 
 
+
 def main():
+    """🔥 V40.0 完整修复版本 - main函数"""
     parser = argparse.ArgumentParser(description="HRL-GNN SFC Orchestration Training Pipeline")
     parser.add_argument('--phase', type=str, required=True,
                         choices=['phase1', 'phase2', 'phase3'],
@@ -638,7 +640,6 @@ def main():
             print("=" * 40 + "\n")
         except Exception as e:
             print(f"⚠️ 资源打印失败: {e}")
-        # 🔥🔥🔥
     except Exception as e:
         logger.error(f"❌ 环境初始化崩溃: {e}")
         import traceback
@@ -728,7 +729,7 @@ def main():
             # 核心修复：传入全局 env
             trainer = Phase2ILTrainer(
                 agent=agent,
-                env=env,  # <--- 这里传入 env
+                env=env,
                 expert_data_path=data_path,
                 output_dir=output_dir,
                 config=phase2_config
@@ -827,36 +828,6 @@ def main():
             return
 
         # =========================================================
-        # 🔥 [关键修改] 在 main.py 中初始化 HRL Coordinator (移出 Env)
-        # =========================================================
-        coordinator = None
-        try:
-            logger.info("🔧 尝试初始化 HRL Coordinator...")
-            # 1. 尝试导入 (根据项目结构可能不同)
-            try:
-                from core.hrl.coordinator import HRL_Coordinator
-            except ImportError:
-                try:
-                    from envs.modules.hrl_coordinator import HRL_Coordinator
-                except ImportError:
-                    from envs.sfc_env import HRL_Coordinator
-
-            # 2. 准备 Agent 参数
-            # HRL Agent 通常封装了 high/low，如果没有显式分离，则复用 agent 实例
-            h_agent = getattr(agent, 'high_agent', agent)
-            l_agent = getattr(agent, 'low_agent', agent)
-
-            # 3. 实例化协调器
-            # 注意：env 已经在 main 中全局初始化了
-            coordinator = HRL_Coordinator(env, h_agent, l_agent, config)
-            logger.info("✅ HRL Coordinator 初始化成功 (Main Loop Ready)")
-
-        except ImportError:
-            logger.warning("⚠️ 未找到 HRL_Coordinator 类，跳过初始化")
-        except Exception as e:
-            logger.warning(f"⚠️ HRL Coordinator 初始化失败: {e}")
-
-        # =========================================================
         # 🔥 初始化 HRL Coordinator
         # =========================================================
         from envs.modules.HRL_Coordinator import HRL_Coordinator
@@ -865,8 +836,8 @@ def main():
         try:
             coordinator = HRL_Coordinator(
                 env=env,
-                high_agent=agent,  # 高层策略
-                low_agent=agent,  # 低层策略 (同一个agent的不同方法)
+                high_agent=agent,
+                low_agent=agent,
                 config=config
             )
             logger.info("✅ HRL Coordinator 初始化成功")
@@ -877,29 +848,72 @@ def main():
             return
 
         # =========================================================
-        # 🔥 将 Coordinator 注入 Trainer
+        # 🔥🔥🔥 关键修复：加载Phase3训练数据
+        # =========================================================
+        logger.info("=" * 70)
+        logger.info("📥 加载Phase3训练数据")
+        logger.info("=" * 70)
+
+        data_file = 'data/input_dir/phase3_requests.pkl'
+        logger.info(f"📂 数据文件路径: {data_file}")
+        logger.info(f"📂 当前工作目录: {os.getcwd()}")
+        logger.info(f"🔍 文件是否存在: {os.path.exists(data_file)}")
+
+        if os.path.exists(data_file):
+            logger.info(f"✅ 文件存在，开始加载...")
+            try:
+                success = env.load_dataset(data_file)
+                if success:
+                    logger.info(f"✅ 数据加载成功")
+
+                    # 🔥 验证数据
+                    logger.info("🔍 验证数据加载...")
+                    test_state = env.reset()
+                    if env.current_request:
+                        vnf_list = env.current_request.get('vnf', [])
+                        logger.info(f"✅ 验证成功：请求存在，VNF数量={len(vnf_list)}")
+                    else:
+                        logger.warning("⚠️ 验证警告：reset后无请求")
+                else:
+                    logger.error(f"❌ load_dataset返回False")
+                    raise RuntimeError("数据加载失败")
+            except Exception as e:
+                logger.error(f"❌ 数据加载异常: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+        else:
+            logger.error(f"❌ 文件不存在: {data_file}")
+
+            # 列出可能的文件位置
+            logger.info("🔍 检查data/input_dir/目录内容...")
+            input_dir = 'data/input_dir'
+            if os.path.exists(input_dir):
+                files = [f for f in os.listdir(input_dir) if f.endswith('.pkl')]
+                logger.info(f"📂 找到的.pkl文件:")
+                for f in files:
+                    logger.info(f"   - {f}")
+            else:
+                logger.error(f"❌ 目录不存在: {input_dir}")
+
+            raise FileNotFoundError(f"数据文件不存在: {data_file}")
+
+        logger.info("=" * 70)
+
+        # =========================================================
+        # 🔥 创建 Trainer
         # =========================================================
         trainer = Phase3RLTrainer(
             env=env,
             agent=agent,
             output_dir=ckpt_dir,
             config=config,
-            coordinator=coordinator  # 🔥 传入 coordinator
+            coordinator=coordinator
         )
 
-        try:
-            trainer.run()
-            logger.info("✅ Phase 3 完成")
-        except Exception as e:
-            logger.error(f"❌ Phase 3 执行失败: {e}")
-            import traceback
-            traceback.print_exc()
-
-        # 注入 coordinator (如果 Trainer 支持)
-        if coordinator and hasattr(trainer, 'set_coordinator'):
-            logger.info("🔗 将 Coordinator 注入 Trainer")
-            trainer.set_coordinator(coordinator)
-
+        # =========================================================
+        # 🔥 开始训练
+        # =========================================================
         try:
             trainer.run()
             logger.info("✅ Phase 3 完成")

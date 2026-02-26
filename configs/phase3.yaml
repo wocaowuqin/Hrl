@@ -84,7 +84,7 @@ hrl:
 epsilon:
   # High-Level策略探索
   high:
-    initial: 0.9                  # 初始探索率30%
+    initial: 0.9                  # 初始探索率60%
     final: 0.05                   # 最终探索率5%
     decay_steps: 300000            # 50000步线性衰减
 
