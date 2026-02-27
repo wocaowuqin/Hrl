@@ -8,21 +8,12 @@ project:
 
 # 2. 🔥 [关键] 路径配置 (已更新为您提供的绝对路径)
 path:
-  # [输入] 数据集位置 (存放 .mat 拓扑, phaseX_requests.pkl 等)
-  input_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/data/input_dir"
-
-  # [输出] 专家数据导出位置 (建议在 outputs 下建子文件夹，保持整洁)
-  expert_data_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/expert"
-
-  # [输出] 模型检查点 (checkpoints)
-  ckpt_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/checkpoints"
-
-  # [输出] 日志文件
-  log_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/logs"
-
-  # [输出] 失败案例可视化
-  failure_output_dir: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/failures"
-
+  # 程序会自动补全为: 项目根目录/data/input_dir
+  input_dir: "data/input_dir"
+  expert_data_dir: "outputs/expert"
+  ckpt_dir: "outputs/checkpoints"
+  log_dir: "outputs/logs"
+  failure_output_dir: "outputs/failures"
 # 3. 拓扑配置
 topology:
   # 设为 null，由 main.py 自动从 input_dir 加载 .mat 文件
@@ -65,4 +56,4 @@ training:
 logging:
   level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: "E:/pycharmworkspace/SFC-master/HRL-GNN for Multicast-aware SFC Orchestration/outputs/training.log"
+  file: "outputs/training.log"

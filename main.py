@@ -29,7 +29,7 @@ from core.hrl.agent import (
 
 from trainer.phase1_collector import Phase1ExpertCollector
 from trainer.phase2_il_trainer import Phase2ILTrainer
-from trainer.phase3_rl_trainer import Phase3RLTrainer  # 🔥 修改版
+from trainer.phase3_rl_trainer import Phase3RLTrainer
 
 # 配置全局日志格式
 logging.basicConfig(
@@ -444,80 +444,6 @@ def diagnose_goal_embedding(agent, env):
         return False
 
 
-def diagnose_mask_system(env, agent):
-    """
-    🔍 全面诊断 Mask 系统 (环境 + Agent)
-    """
-    import traceback  # 局部导入，防止报错
-    import numpy as np  # 确保numpy可用
-
-    print("\n" + "=" * 60)
-    print("🏥 [诊断开始] Mask 系统健康检查")
-    print("=" * 60)
-
-    try:
-        # 1. 静态检查
-        print("\n1️⃣ [静态检查] 环境属性:")
-        print(f"   👉 _n_actions: {getattr(env, '_n_actions', '❌ 缺失')}")
-        print(f"   👉 n (节点数): {getattr(env, 'n', '❌ 缺失')}")
-        print(f"   👉 get_action_mask: {'✅' if hasattr(env, 'get_action_mask') else '❌'}")
-        print(f"   👉 get_low_level_action_mask: {'✅' if hasattr(env, 'get_low_level_action_mask') else '❌'}")
-
-        # 2. 动态检查 Reset
-        print("\n2️⃣ [动态检查] Reset:")
-        obs, info = env.reset()
-        print(f"   ✅ Reset 成功 | Info keys: {list(info.keys())}")
-
-        mask = info.get('action_mask')
-        if mask is not None:
-            print(f"   ✅ Mask 获取成功 | Shape: {mask.shape} | Sum: {mask.sum()}")
-        else:
-            print("   ❌ 错误: info['action_mask'] 为 None")
-
-        # 3. 动态检查 Step
-        print("\n3️⃣ [动态检查] Step:")
-        try:
-            _, _, _, _, step_info = env.step(0)
-            step_mask = step_info.get('action_mask')
-            if step_mask is not None:
-                print(f"   ✅ Step Mask 获取成功 | Sum: {step_mask.sum()}")
-            else:
-                print("   ❌ 错误: step_info['action_mask'] 为 None")
-        except Exception as e:
-            print(f"   ❌ Step 崩溃: {e}")
-
-        # 4. Agent 兼容性
-        print("\n4️⃣ [兼容检查] Agent.select_action:")
-        try:
-            # 重新 Reset
-            obs, info = env.reset()
-            curr_mask = info.get('action_mask')
-            if curr_mask is None and hasattr(env, 'n'):
-                curr_mask = np.ones(env.n)  # 临时 Mask
-
-            # 获取 unconnected_dests，兼容不同属性名
-            unconnected = []
-            if hasattr(env, 'current_tree'):
-                unconnected = list(env.current_tree.get('connected_dests', []))
-
-            high, low, _ = agent.select_action(
-                state=obs,
-                action_mask=curr_mask,
-                unconnected_dests=unconnected,
-                blacklist_info={}
-            )
-            print(f"   ✅ Agent 调用成功: Low Action = {low}")
-        except Exception as e:
-            print(f"   ❌ Agent 崩溃: {e}")
-            traceback.print_exc()
-
-    except Exception as e:
-        print(f"❌ 诊断脚本自身出错: {e}")
-        traceback.print_exc()
-
-    print("=" * 60 + "\n")
-
-
 def diagnose_agent_timing_performance(env, agent):
     """
     🔍 深度诊断函数：检测 Agent 动作密度与物理时间的失配度
@@ -540,22 +466,21 @@ def diagnose_detailed_timing(env, agent):
     # 为节省空间省略，请保持原函数内容
 
 
-
 def main():
-    """🔥 V40.0 完整修复版本 - main函数"""
-    parser = argparse.ArgumentParser(description="HRL-GNN SFC Orchestration Training Pipeline")
-    parser.add_argument('--phase', type=str, required=True,
-                        choices=['phase1', 'phase2', 'phase3'],
-                        help='Training phase')
-    parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    """🔥 V40.0 完整修复版本 - main函数 (IDE直调版)"""
 
-    # 🔥 新增：Goal Strategy 参数
-    parser.add_argument('--goal_strategy', type=str, default='adaptive',
-                        choices=['relative', 'adaptive', 'hybrid'],
-                        help='Goal Embedding strategy (Phase 3 only)')
+    import argparse
 
-    args = parser.parse_args()
+    # =========================================================================
+    # 🔥 运行参数配置区：直接在这里修改你想运行的阶段和参数
+    # =========================================================================
+    args = argparse.Namespace(
+        phase='phase3',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
+        gpu=0,  # GPU ID, 设为 -1 则强制使用 CPU
+        seed=42,  # 随机种子
+        goal_strategy='adaptive'  # Phase 3 的目标策略: 'relative', 'adaptive', 'hybrid'
+    )
+    # =========================================================================
 
     # 1. 设置设备
     if torch.cuda.is_available() and args.gpu >= 0:
@@ -764,7 +689,8 @@ def main():
             agent = create_goal_conditioned_agent(
                 config=config,
                 phase=3,
-                goal_strategy=args.goal_strategy
+                goal_strategy=args.goal_strategy,
+                env=env
             )
 
             logger.info("✅ Agent 初始化成功")
@@ -821,11 +747,6 @@ def main():
                 logger.error(f"❌ 模型加载错误: {e}")
         else:
             logger.warning(f"⚠️ 未找到预训练模型: {pretrained_path}")
-
-        # 3. 诊断
-        diagnose_mask_system(env, agent)
-        if not diagnose_goal_embedding(agent, env):
-            return
 
         # =========================================================
         # 🔥 初始化 HRL Coordinator
@@ -925,7 +846,6 @@ def main():
     logger.info("=" * 70)
     logger.info("🎉 程序执行完成")
     logger.info("=" * 70)
-
 
 if __name__ == "__main__":
     main()

@@ -1,472 +1,385 @@
 import numpy as np
-import torch
-from collections import defaultdict
 import logging
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 
 class HRL_Coordinator:
     """
-    HRL协调器 - V40.0 完整诊断版本
-
-    关键修复：
-    1. 在step_high_level前调用set_high_level_goal
-    2. 正确处理Episode完成标志
-    3. 添加详细的诊断日志
+    纯HRL协调器 - V53.0 (移除暴力检测版)
+    包含:
+    1. 接收 HighLevel 的 Truncated 信号
+    2. 强制清空 Agent 的 Subgoal 缓存
+    3. 🔥 [关键修复] 移除暴力目标检测，强制 Agent 执行停留动作
     """
 
     def __init__(self, env, high_agent, low_agent, config=None):
-        """初始化协调器"""
         self.env = env
         self.high_agent = high_agent
         self.low_agent = low_agent
-
-        # 配置
         self.config = config or {}
-        self.max_low_steps = config.get('max_low_steps', 100)
-        self.max_high_steps = config.get('max_high_steps', 100)
 
-        # 高层动作维度
-        self.high_action_dim = config.get('high_action_dim', None)
-        if self.high_action_dim is None and hasattr(high_agent, 'action_dim'):
-            self.high_action_dim = high_agent.action_dim
-
-        # 统计
-        self.stats = {
-            'total_high_steps': 0,
-            'total_low_steps': 0,
-            'subgoals_completed': 0,
-            'subgoals_timeout': 0,
-            'subgoals_failed': 0,
-            'high_transitions_stored': 0,
-            'low_transitions_stored': 0
-        }
-
-        logger.info("✅ HRL协调器初始化完成（V40.0诊断版）")
-        logger.info(f"   max_low_steps={self.max_low_steps}")
-
-    def reset(self):
-        """重置协调器状态"""
-        logger.debug("🔄 [Coordinator] 重置")
-
-    def run_full_episode(self, max_steps=1000):
-        """
-        执行完整Episode - V40.1 修复版
-
-        修复：
-        1. 进度统计直接读取 env.next_vnf_idx，解决显示为0的问题
-        2. 增加请求检查和空值保护
-        """
-        logger.info("🎬 [Episode] 开始")
-
-        # ========================================
-        # 1. 重置环境
-        # ========================================
-        self.env.reset()
-
-        # ========================================
-        # 🔥 2. 诊断：检查请求信息
-        # ========================================
-        if self.env.current_request:
-            vnf_list = self.env.current_request.get('vnf', [])
-            dests = self.env.current_request.get('dest', [])
-            source = self.env.current_request.get('source', 0)
-            total_vnf = len(vnf_list)
-            total_dest = len(dests)
-
-            logger.info(f"📋 [Episode] 请求信息:")
-            logger.info(f"   源节点: {source}")
-            logger.info(f"   VNF链: {vnf_list} (共{total_vnf}个)")
-            logger.info(f"   目的地: {dests} (共{total_dest}个)")
+        # 仅保留引用，不主动管理释放
+        if hasattr(env, 'resource_mgr'):
+            self.resource_mgr = env.resource_mgr
+            logger.info("🔗 HRL 已连接 AllResourceManager（仅引用）")
         else:
-            logger.error("❌ [Episode] 无请求数据！")
-            return 0.0, {
-                'success': False,
-                'error': 'no_request',
-                'steps': 0
-            }
+            self.resource_mgr = None
 
-        obs = self.env.get_state()
+        self.max_low_steps = self.config.get('max_low_steps', 50)
+        self.stats = defaultdict(int)
+        self.current_episode = 0
+        self.resources_released = False
 
-        total_reward = 0.0
-        episode_steps = 0
-        episode_done = False
+        logger.info("🚀 纯HRL协调器初始化完成（V53.0 移除暴力检测版）")
 
-        # ========================================
-        # 3. Episode主循环
-        # ========================================
-        while not episode_done and episode_steps < max_steps:
-            step_reward, episode_done, step_info = self.run_high_low_cycle(obs)
-
-            total_reward += step_reward
-            episode_steps += 1
-
-            # ========================================
-            # 🔥 诊断：定期打印进度 (修复版)
-            # ========================================
-            if episode_steps % 10 == 0 or episode_done:
-                # 🟢 [修复] 直接读取环境指针（绝对真理）
-                if hasattr(self.env, 'next_vnf_idx'):
-                    current_vnf_count = self.env.next_vnf_idx
-                else:
-                    current_vnf_count = self.env._get_total_vnf_progress()
-
-                # 钳位防止越界显示 (例如 4/3)
-                current_vnf_count = min(current_vnf_count, total_vnf)
-
-                # 获取目的地连接数（优先使用保存的最终统计）
-                current_dest_count = step_info.get('final_dest_count',
-                                                   len(self.env.current_tree.get('connected_dests', set())))
-
-                logger.info(f"📊 [Episode进度] 步数={episode_steps}")
-                logger.info(f"   VNF进度: {current_vnf_count}/{total_vnf}")
-                logger.info(f"   目的地进度: {current_dest_count}/{total_dest}")
-                logger.info(f"   累计奖励: {total_reward:.2f}")
-
-            # ========================================
-            # 4. 结束检查与结算日志
-            # ========================================
-            if episode_done:
-                # 再次获取最终状态确保日志准确
-                if hasattr(self.env, 'next_vnf_idx'):
-                    final_vnf = min(self.env.next_vnf_idx, total_vnf)
-                else:
-                    final_vnf = self.env._get_total_vnf_progress()
-
-                final_dest = len(self.env.current_tree.get('connected_dests', set()))
-
-                logger.info("=" * 70)
-                logger.info(f"✅ [Episode] 完成！")
-                logger.info(f"   总步数: {episode_steps}")
-                logger.info(f"   总奖励: {total_reward:.2f}")
-                logger.info(f"   VNF完成: {final_vnf}/{total_vnf}")
-                logger.info(f"   目的地完成: {final_dest}/{total_dest}")
-                logger.info("=" * 70)
-                break
-
-            obs = self.env.get_state()
-
-            # 超时处理
-            if episode_steps >= max_steps:
-                logger.warning("=" * 70)
-                logger.warning(f"⏰ [Episode] 超时！")
-                logger.warning(f"   达到最大步数: {max_steps}")
-
-                # 获取当前进度用于日志
-                curr_vnf = self.env.next_vnf_idx if hasattr(self.env, 'next_vnf_idx') else 0
-                curr_dest = len(self.env.current_tree.get('connected_dests', set()))
-
-                logger.warning(f"   VNF进度: {min(curr_vnf, total_vnf)}/{total_vnf}")
-                logger.warning(f"   目的地进度: {curr_dest}/{total_dest}")
-                logger.warning("=" * 70)
-                break
-
-        # ========================================
-        # 5. 返回结果
-        # ========================================
-        return total_reward, {
-            'steps': episode_steps,
-            'reward': total_reward,
-            'success': episode_done,
-            'timeout': episode_steps >= max_steps and not episode_done,
-            'high_steps': self.stats['total_high_steps'],
-            'low_steps': self.stats['total_low_steps'],
-            'subgoals_completed': self.stats['subgoals_completed'],
-            'subgoals_timeout': self.stats['subgoals_timeout'],
-            'high_transitions': self.stats['high_transitions_stored'],
-            'low_transitions': self.stats['low_transitions_stored']
-        }
-
-    def run_high_low_cycle(self, high_obs):
+    def run_high_low_cycle(self, high_obs, training=True):
         """
-        执行一个 High → Low 循环 (V40.1 修复版)
-
-        修复：
-        1. 确保返回给外部统计的是环境真实奖励 (low_total_reward)
-        2. 仅将塑形奖励 (high_reward) 存入 Replay Buffer
+        🔥 [V52.0] 核心逻辑：Truncated -> Wipe Agent Memory -> Re-sample
         """
+        # 重置释放标志
+        if hasattr(self, 'resources_released'):
+            self.resources_released = False
 
-        # ========================================
-        # Phase 1: 高层决策
-        # ========================================
-        high_state = high_obs
-        high_mask = self._get_high_mask()
+        # ============================================================
+        # Phase 1: High-Level 决策
+        # ============================================================
+        # 1. 获取 Mask
+        high_mask = self.env.get_high_level_action_mask()
 
-        _, high_action, high_info = self.high_agent.select_action(
-            high_obs,
-            action_mask=high_mask
+        if sum(high_mask) == 0:
+            logger.error("❌ 无可用高层动作 (Mask全0)")
+            return 0.0, True, {'error': 'no_high_actions'}
+
+        # 2. Agent 选择动作
+        high_action_idx, high_action_remapped, agent_info = self.high_agent.select_action(
+            high_obs, action_mask=high_mask
         )
 
-        logger.info(f"🎯 [High] 选择动作: {high_action}")
-        self.stats['total_high_steps'] += 1
+        # ------------------------------------------------------------
+        # 目标解析
+        # ------------------------------------------------------------
+        target_node = None
+        if agent_info and 'subgoal' in agent_info and agent_info['subgoal'] is not None:
+            target_node = agent_info['subgoal']
+        else:
+            valid_indices = np.where(high_mask > 0)[0]
+            if high_action_idx < len(valid_indices):
+                target_node = int(valid_indices[high_action_idx])
+            else:
+                target_node = high_action_idx
 
-        # ========================================
-        # Phase 2: 设置高层目标
-        # ========================================
-        target_node_id = self._map_high_action_to_node(high_action)
+        # 同步起点
+        start_node = agent_info.get('start_node')
+        if start_node is None:
+            start_node = self.env.current_node_location
 
-        # 1. 设置目标变量
-        self.env.set_high_level_goal(high_action, target_node_id)
+        logger.info(f"🎯 [Coordinator] 意图同步: Start={start_node} -> Goal={target_node} (RawIdx={high_action_idx})")
 
-        # 2. 执行高层 Step (主要用于瞬移/状态切换)
-        _, _, _, truncated, env_info = self.env.step_high_level(high_action)
+        self.env.current_node_location = int(start_node)
+        self.env.set_high_level_goal(high_action_idx, target_node, start_node)
 
-        if not truncated:
-            logger.error("❌ [High] 环境未进入低层模式 (truncated!=True)")
-            return 0.0, False, {'error': 'high_action_failed'}
+        # ------------------------------------------------------------
+        # High-Level Step (执行决策)
+        # ------------------------------------------------------------
+        _, _, done, truncated, high_info = self.env.step_high_level(high_action_idx)
 
-        logger.info(f"✅ [High] 子目标已设置")
+        # 🔥 [关键逻辑] 处理 High Level 的立即终止信号
+        if done:
+            logger.info("🎉 High-Level 判定 Episode 结束")
+            return 0.0, True, {'episode_done': True}
 
-        # ========================================
-        # Phase 3: 低层循环执行
-        # ========================================
+        if truncated:
+            logger.warning(f"🔄 [Coordinator] High-Level 返回 Truncated (目标 {target_node} 无效/已完成)")
+            logger.warning("   -> 触发强制重采机制 (Force Re-sample)")
+
+            # 🔥🔥🔥 [核心修复] 强制清空 Agent 的缓存 🔥🔥🔥
+            # 这行代码逼迫 Agent 必须在下一轮重新评估 Mask，而不是使用旧的 current_subgoal
+
+            # 1. 清空当前目标缓存
+            if hasattr(self.high_agent, 'current_subgoal'):
+                logger.info(f"   🧹 清空 Agent 缓存: current_subgoal ({self.high_agent.current_subgoal}) -> None")
+                self.high_agent.current_subgoal = None
+
+            # 2. 重置步数计数器 (使其超过 horizon，触发 update)
+            if hasattr(self.high_agent, 'subgoal_steps'):
+                horizon = getattr(self.high_agent, 'subgoal_horizon', 10)
+                self.high_agent.subgoal_steps = horizon + 1
+                logger.info(f"   🧹 重置 Agent 计时: subgoal_steps -> {self.high_agent.subgoal_steps}")
+
+            # 3. 针对不同 Agent 实现的兼容性清空
+            if hasattr(self.high_agent, 'subgoal_step_count'):
+                self.high_agent.subgoal_step_count = 999
+
+            # 直接返回，不执行下面的 Low Level Loop
+            # Coordinator 的 run_episode 会继续循环，重新调用 run_high_low_cycle
+            return 0.0, False, {'subgoal_truncated': True}
+
+        # ============================================================
+        # Phase 2: Low-Level 执行 (只有在非 Truncated 时才执行)
+        # ============================================================
+        low_state = self.env.get_state()
         low_step = 0
         low_total_reward = 0.0
-        subgoal_done = False
         episode_done = False
+        info = {}
+        low_level_stalled = False
+        subgoal_achieved = False
 
-        # 初始低层状态
-        # (此时已经是瞬移后的状态了)
-        low_state = self.env.get_state()
+        logger.info(f"🚀 [Low Exec] 开始执行 Subgoal: {target_node} (MaxSteps={self.max_low_steps})")
 
-        while low_step < self.max_low_steps and not subgoal_done and not episode_done:
-            # 执行一步低层动作
-            # 注意：这里直接调用 select_action 和 env.step，避免重复 get_state
+        while low_step < self.max_low_steps and not episode_done:
             low_mask = self.env.get_low_level_action_mask()
 
+            if sum(low_mask) == 0:
+                logger.warning(f"⚠️ [Low] 无路可走 (Mask=0) at Node {self.env.current_node_location}")
+                low_level_stalled = True
+                break
+
             _, low_action, _ = self.low_agent.select_action(
-                low_state,
-                action_mask=low_mask
+                low_state, action_mask=low_mask
             )
 
-            next_low_state, low_reward, done, truncated, info = self.env.step_low_level(low_action)
-            info['low_action'] = low_action
+            next_state, reward, done, truncated_low, info = self.env.step_low_level(low_action)
 
-            # 累加统计
-            low_total_reward += low_reward
-            low_step += 1
-            self.stats['total_low_steps'] += 1
-
-            # 存储低层 Transition
-            if low_action is not None:
+            if training:
                 self._store_transition(
-                    self.low_agent,
-                    low_state,
-                    low_action,
-                    low_reward,
-                    next_low_state,
-                    done or truncated
+                    self.low_agent, low_state, low_action,
+                    reward, next_state, done
                 )
-                self.stats['low_transitions_stored'] += 1
 
-            # 更新状态指针
-            low_state = next_low_state
+            low_total_reward += reward
+            low_state = next_state
+            low_step += 1
 
-            # 检查子目标状态 (truncated=True 表示子目标完成或超时，但在 Env 内部区分了 timeout)
-            # 注意：Env 的 step_low_level 只有在成功时返回 truncated=True (子目标结束)
-            # 或者超时时返回 truncated=True
+            # ----------------------------------------------------
+            # 终止条件检查
+            # ----------------------------------------------------
+            # 必须由 info 中的明确信号触发终止
+            if info.get('subgoal_done', False):
+                logger.info(f"✅ [Coordinator] 检测到 Subgoal 完成信号")
 
-            # 检查是否因为部署成功/连接成功而结束
-            if truncated:
-                # 检查是否是超时导致的 truncated
-                if info.get('timeout'):
-                    subgoal_done = True
-                    # 超时逻辑在循环外统一处理
-                else:
-                    subgoal_done = True
-                    logger.info(f"✅ [Low] 子目标完成 ({low_step}步)")
-                    self.stats['subgoals_completed'] += 1
+                # 即使完成了，也建议清空 Agent 缓存，防止下一轮还想回来
+                if hasattr(self.high_agent, 'current_subgoal'):
+                    self.high_agent.current_subgoal = None
 
-            # 检查全剧终
+                subgoal_achieved = True
+                break
+
+            if info.get('goal_reached', False) or info.get('current_goal_satisfied', False):
+                logger.info(f"✅ [Coordinator] 检测到 Goal Reached 信号")
+                if hasattr(self.high_agent, 'current_subgoal'):
+                    self.high_agent.current_subgoal = None
+                subgoal_achieved = True
+                break
+
+            # 🛑 [V53.0 关键修复] 移除暴力检测！
+            # ----------------------------------------------------------------------------------
+            # 原有的逻辑会检测 "current_loc == target_node" 且 "target_node in connected_dests"。
+            # 这会导致 Agent 只要路过目标节点（尚未执行 STAY/CONNECT），就会被判定为完成，
+            # 从而跳过了 LowLevelController 中至关重要的 "连接建立" 和 "奖励获取" 步骤。
+            # 这正是导致 "树冗余高" 和 "反复徘徊" 的核心原因。
+            #
+            # 已注释掉以下代码块：
+            # ----------------------------------------------------------------------------------
+            # current_loc = self.env.current_node_location
+            # if current_loc == target_node:
+            #     if hasattr(self.env, 'current_tree') and self.env.current_tree:
+            #         connected_dests = self.env.current_tree.get('connected_dests', set())
+            #         if target_node in connected_dests:
+            #             logger.info(f"✅ [Coordinator] 暴力检测: 节点 {target_node} 已在连接树中")
+            #             if hasattr(self.high_agent, 'current_subgoal'):
+            #                 self.high_agent.current_subgoal = None
+            #             subgoal_achieved = True
+            #             break
+            # ----------------------------------------------------------------------------------
+
             if done:
                 episode_done = True
-                logger.info(f"🎉 [Low] Episode完成！")
+            if truncated_low:
+                break
 
-                # 🔥 V40.3修复：在返回前保存最终统计（避免被清空）
-                info['final_dest_count'] = len(self.env.current_tree.get('connected_dests', set()))
-                info['final_vnf_count'] = self.env._get_total_vnf_progress()
-                logger.info(f"📊 [最终统计] VNF={info['final_vnf_count']}, 目的地={info['final_dest_count']}")
+        # ============================================================
+        # Phase 3: 奖励结算
+        # ============================================================
+        high_done = episode_done
+        high_reward = self._compute_reward_from_env_info(info)
 
-                # Episode 结束：计算高层奖励并存储
-                high_next_state = next_low_state  # 此时是终止状态
-                high_reward = self._compute_high_reward(low_total_reward, low_step, True)
+        if low_step == 0 or low_level_stalled:
+            logger.error(f"⛔ [Stall] 僵死检测触发")
+            high_reward = -15.0
+            info['stalled'] = True
 
-                self._store_transition(
-                    self.high_agent,
-                    high_state,
-                    high_action,
-                    high_reward,
-                    high_next_state,
-                    True  # done
-                )
-                self.stats['high_transitions_stored'] += 1
+        # 全局完成检测
+        if not high_done and self.env.current_request:
+            if hasattr(self.env, 'high_level_controller') and hasattr(self.env.high_level_controller,
+                                                                      '_is_all_tasks_completed'):
+                try:
+                    completed, status = self.env.high_level_controller._is_all_tasks_completed()
+                    if completed:
+                        logger.info(f"✅ [High Check] 全局任务完成: {status}")
+                        high_done = True
+                        high_reward = 30.0
+                        episode_done = True
+                except:
+                    pass
 
-                # 🔥 返回环境真实奖励（使用info）
-                return low_total_reward, True, info
+        if training:
+            high_next_state = None if high_done else self.env.get_state()
+            self._store_transition(
+                self.high_agent, high_obs, high_action_idx,
+                high_reward, high_next_state, high_done
+            )
 
-        # ========================================
-        # Phase 4: 子目标结束 (但 Episode 未结束)
-        # ========================================
+        self._update_stats(high_done, info)
 
-        # 检查是否是超时失败
-        subgoal_failed = False
-        if low_step >= self.max_low_steps and not subgoal_done:
-            logger.warning(f"⏰ [Low] 超时 ({self.max_low_steps}步)")
-            subgoal_done = True
-            subgoal_failed = True
-            self.stats['subgoals_timeout'] += 1
-            self.stats['subgoals_failed'] += 1
-
-        # 计算高层奖励 (用于训练 High Agent)
-        success = subgoal_done and not subgoal_failed
-        high_reward = self._compute_high_reward(low_total_reward, low_step, success)
-
-        # 获取高层的新状态 (即低层结束时的状态)
-        high_next_state = low_state
-
-        # 存储 Transition (用 high_reward)
-        self._store_transition(
-            self.high_agent,
-            high_state,
-            high_action,
-            high_reward,
-            high_next_state,
-            False  # not done
-        )
-        self.stats['high_transitions_stored'] += 1
-
-        # 🔥 关键修复：返回给外部统计的是环境真实奖励 (low_total_reward)
-        return low_total_reward, False, {
-            'high_action': high_action,
-            'subgoal_steps': low_step,
-            'subgoal_done': subgoal_done,
-            'subgoal_failed': subgoal_failed,
-            'low_reward': low_total_reward
+        return low_total_reward, high_done, {
+            'high_action': high_action_idx,
+            'target_node': target_node,
+            'low_steps': low_step,
+            'high_reward': high_reward,
+            'info': info
         }
 
-    def _map_high_action_to_node(self, high_action):
-        """
-        🔥 [V40.1 修复版] 映射高层动作到目标节点
+    # ... (run_episode, _fallback_success_check, _compute_reward_from_env_info, _store_transition, _update_stats, _reset_episode_stats, get_stats 保持不变) ...
+    def run_episode(self, training=True, max_steps=100):
+        self.current_episode += 1
+        self.resources_released = False
 
-        修正：直接使用 high_action 作为节点ID (不再取模)，
-        前提是 High Agent 的动作空间就是全网节点 (0 ~ N-1)。
-        """
-        # 1. 安全检查
-        if not hasattr(self.env, 'current_request') or self.env.current_request is None:
-            logger.warning("⚠️ [Coordinator] 无当前请求，使用默认节点0")
-            return 0
+        logger.info(f"\n{'=' * 50}")
+        logger.info(f"📚 Episode {self.current_episode}")
+        logger.info(f"{'=' * 50}")
 
-        target_node_id = int(high_action)
-        vnf_list = self.env.current_request.get('vnf', [])
+        high_obs = self.env.reset()
+        episode_done = False
+        total_reward = 0.0
+        total_steps = 0
 
-        # 2. 判断当前阶段
-        # 注意：这里依赖 env.next_vnf_idx 是准确的
-        if self.env.next_vnf_idx < len(vnf_list):
-            # ========================================
-            # 阶段1：VNF部署 - 目标应该是 DC 节点
-            # ========================================
-            valid_dc = [n for n in getattr(self.env, 'dc_nodes', [])
-                        if self.env._is_valid_node(n)]
+        while not episode_done and total_steps < max_steps:
+            cycle_reward, done, info = self.run_high_low_cycle(
+                high_obs, training=training
+            )
 
-            # 校验：Agent 选的节点是否在 DC 列表中
-            if target_node_id not in valid_dc:
-                # 这是一个非法动作（Agent 选了非 DC 节点）
-                # 如果使用了 Action Mask，这种情况理论上不应发生
-                logger.warning(f"⚠️ [Coordinator] 高层动作 {target_node_id} 不是有效DC节点 {valid_dc}")
+            total_reward += cycle_reward
+            total_steps += 1
+            episode_done = done
 
-                # 兜底策略：如果真的选错了，可以强制修正（可选）
-                # target_node_id = valid_dc[0]
+            if not episode_done:
+                high_obs = self.env.get_state()
 
-            logger.debug(f"🎯 [Coordinator] VNF部署: Action {high_action} -> Node {target_node_id}")
+        vnf_success = False
+        dest_success = False
+        episode_success = False
+        completion_status = "未知"
 
+        try:
+            if hasattr(self.env, 'current_request') and self.env.current_request:
+                vnf_list = self.env.current_request.get('vnf', [])
+                dest_list = self.env.current_request.get('dest', [])
+
+                if hasattr(self.env, 'high_level_controller') and \
+                        hasattr(self.env.high_level_controller, '_is_all_tasks_completed'):
+                    try:
+                        completed, status = self.env.high_level_controller._is_all_tasks_completed()
+                        episode_success = completed
+                        completion_status = status
+                    except Exception as e:
+                        episode_success = self._fallback_success_check()
+                        completion_status = "回退检测"
+                else:
+                    episode_success = self._fallback_success_check()
+                    completion_status = "回退检测"
+
+                if hasattr(self.env, 'next_vnf_idx'):
+                    vnf_progress = self.env.next_vnf_idx
+                    vnf_success = vnf_progress >= len(vnf_list)
+
+                if hasattr(self.env, 'current_tree') and self.env.current_tree:
+                    connected_dests = self.env.current_tree.get('connected_dests', set())
+                    dest_success = len(connected_dests) >= len(dest_list)
+
+        except Exception as e:
+            logger.error(f"❌ 结果判定异常: {e}")
+            episode_success = False
+
+        if episode_success:
+            logger.info(f"✅ [Episode Success] {completion_status}")
+            self.resources_released = True
         else:
-            # ========================================
-            # 阶段2：目的地连接 - 目标应该是剩余目的地
-            # ========================================
-            dests = self.env.current_request.get('dest', [])
-            connected = self.env.current_tree.get('connected_dests', set())
-            remaining = list(set(dests) - connected)
+            logger.info(f"❌ [Episode Fail] {completion_status}")
 
-            # 校验：Agent 选的节点是否是剩余目的地
-            if target_node_id not in remaining:
-                logger.warning(f"⚠️ [Coordinator] 高层动作 {target_node_id} 不是有效剩余目的地 {remaining}")
-                # 兜底策略（可选）
-                # if remaining: target_node_id = remaining[0]
+        logger.info(f"📊 Summary: Steps={total_steps} | TotalReward={total_reward:.2f}")
 
-            logger.debug(f"🎯 [Coordinator] 目的连接: Action {high_action} -> Node {target_node_id}")
+        self._reset_episode_stats()
 
-        return target_node_id
+        return total_reward, {
+            'steps': total_steps,
+            'success': episode_success,
+            'reward': total_reward,
+            'subgoals_ok': self.stats.get('subgoals_ok', 0),
+            'subgoals_fail': self.stats.get('subgoals_fail', 0),
+            'vnf_success': vnf_success,
+            'dest_success': dest_success,
+            'completion_status': completion_status
+        }
 
-    def _execute_low_level_step(self):
-        """执行一步低层动作"""
-        low_obs = self.env.get_state()
-        low_mask = self.env.get_low_level_action_mask()
+    def _fallback_success_check(self):
+        if not hasattr(self.env, 'current_request') or not self.env.current_request:
+            return True
+        try:
+            vnf_list = self.env.current_request.get('vnf', [])
+            dest_list = self.env.current_request.get('dest', [])
 
-        # 🔥 Phase3适配：低层也不需要unconnected_dests
-        _, low_action, _ = self.low_agent.select_action(
-            low_obs,
-            action_mask=low_mask
-        )
+            if hasattr(self.env, 'next_vnf_idx'):
+                vnf_success = self.env.next_vnf_idx >= len(vnf_list)
+            elif hasattr(self.env, 'resource_mgr') and hasattr(self.env.resource_mgr, 'next_vnf_idx'):
+                vnf_success = self.env.resource_mgr.next_vnf_idx >= len(vnf_list)
+            else:
+                vnf_success = False
 
-        next_obs, reward, done, truncated, info = self.env.step_low_level(low_action)
-        info['low_action'] = low_action
+            if hasattr(self.env, 'current_tree') and self.env.current_tree:
+                connected_dests = self.env.current_tree.get('connected_dests', set())
+                dest_success = len(connected_dests) >= len(dest_list)
+            else:
+                dest_success = False
 
-        return next_obs, reward, done, truncated, info
+            return vnf_success and dest_success
+        except:
+            return False
+
+    def _compute_reward_from_env_info(self, info):
+        if not info: return 0.0
+        if info.get('vnf_deployed', False):
+            return 20.0
+        elif info.get('dest_connected', False):
+            return 10.0
+        elif info.get('deploy_fail', False):
+            return -10.0
+        elif info.get('timeout', False):
+            return -5.0
+        return 0.0
 
     def _store_transition(self, agent, state, action, reward, next_state, done):
-        """存储transition"""
         if hasattr(agent, 'store_transition'):
             agent.store_transition(state, action, reward, next_state, done)
-        elif hasattr(agent, 'remember'):
-            agent.remember(state, action, reward, next_state, done)
+        elif hasattr(agent, 'memory') and hasattr(agent.memory, 'store'):
+            agent.memory.store(state, action, reward, next_state, done)
         elif hasattr(agent, 'store'):
             agent.store(state, action, reward, next_state, done)
 
-    def _get_high_mask(self):
-        """获取高层动作掩码"""
-        if hasattr(self.env, 'get_high_level_action_mask'):
-            return self.env.get_high_level_action_mask()
-        else:
-            if self.high_action_dim is not None:
-                n_actions = self.high_action_dim
-            elif hasattr(self.env, 'n'):
-                n_actions = self.env.n
-            else:
-                n_actions = 28
-            return np.ones(n_actions, dtype=np.float32)
+    def _update_stats(self, high_done, info):
+        if info:
+            if info.get('vnf_deployed', False) or info.get('dest_connected', False):
+                self.stats['subgoals_ok'] += 1
+            elif info.get('deploy_fail', False) or info.get('timeout', False):
+                self.stats['subgoals_fail'] += 1
+        if high_done:
+            self.stats['episodes_completed'] += 1
 
-    def _compute_high_reward(self, low_reward, steps, success):
-        """计算高层奖励"""
-        if success:
-            high_reward = 10.0 + low_reward
-        else:
-            high_reward = -5.0 - (steps * 0.1)
-        return high_reward
+    def _reset_episode_stats(self):
+        self.stats['subgoals_ok'] = 0
+        self.stats['subgoals_fail'] = 0
 
     def get_stats(self):
-        """获取统计信息"""
-        return self.stats.copy()
-
-    def print_stats(self):
-        """打印统计"""
-        logger.info("=" * 60)
-        logger.info("📊 HRL协调器统计")
-        logger.info("=" * 60)
-        logger.info(f"高层总步数: {self.stats['total_high_steps']}")
-        logger.info(f"低层总步数: {self.stats['total_low_steps']}")
-        logger.info(f"子目标完成: {self.stats['subgoals_completed']}")
-        logger.info(f"子目标超时: {self.stats['subgoals_timeout']}")
-        logger.info(f"高层transitions: {self.stats['high_transitions_stored']}")
-        logger.info(f"低层transitions: {self.stats['low_transitions_stored']}")
-
-        if self.stats['total_high_steps'] > 0:
-            avg_low_per_high = self.stats['total_low_steps'] / self.stats['total_high_steps']
-            logger.info(f"平均低层步数/高层: {avg_low_per_high:.2f}")
-
-        total_subgoals = self.stats['subgoals_completed'] + self.stats['subgoals_failed']
-        if total_subgoals > 0:
-            success_rate = self.stats['subgoals_completed'] / total_subgoals
-            logger.info(f"子目标成功率: {success_rate:.2%}")
-
-        logger.info("=" * 60)
+        return dict(self.stats)

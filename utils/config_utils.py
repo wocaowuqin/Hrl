@@ -75,50 +75,40 @@ def deep_update(base_dict: Dict, update_dict: Dict) -> Dict:
 
 
 def _resolve_path_variables(config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    解析配置中的路径变量（如 ${project.base_dir}）
-
-    Args:
-        config: 配置字典
-
-    Returns:
-        解析后的配置字典
-    """
+    project_root = get_project_root()  # 获取项目根目录
 
     def resolve_value(value, context):
-        """递归解析单个值"""
         if isinstance(value, str):
-            # 查找 ${var.key} 格式的变量
+            # --- 步骤 1: 处理已有的 ${var} 变量替换 (保持原逻辑) ---
             pattern = r'\$\{([^}]+)\}'
             matches = re.findall(pattern, value)
-
             for match in matches:
                 keys = match.split('.')
                 resolved = context
-
                 try:
                     for key in keys:
                         resolved = resolved[key]
-
-                    # 替换变量
                     value = value.replace(f'${{{match}}}', str(resolved))
                 except (KeyError, TypeError):
-                    # 变量不存在，保持原样
                     logger.warning(f"⚠️  无法解析变量: ${{{match}}}")
+
+            # --- 步骤 2: ⚡ 新增逻辑：自适应路径补全 ---
+            # 如果字符串包含斜杠且不是绝对路径，也不是变量占位符
+            if ('/' in value or '\\' in value) and not os.path.isabs(value):
+                if not value.startswith('$'):
+                    # 自动转换为当前系统的绝对路径
+                    return os.path.abspath(os.path.join(project_root, value))
 
             return value
 
         elif isinstance(value, dict):
             return {k: resolve_value(v, context) for k, v in value.items()}
-
         elif isinstance(value, list):
             return [resolve_value(item, context) for item in value]
-
         else:
             return value
 
     return resolve_value(config, config)
-
 
 def _post_process_config(config: Dict[str, Any], phase: str) -> Dict[str, Any]:
     """

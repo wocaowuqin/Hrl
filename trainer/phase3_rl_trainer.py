@@ -82,7 +82,7 @@ class Phase3RLTrainer:
 
         for episode in pbar:
             # 执行 Episode
-            total_reward, info = self.coordinator.run_full_episode(
+            total_reward, info = self.coordinator.run_episode(
                 max_steps=self.max_steps_per_episode
             )
 
