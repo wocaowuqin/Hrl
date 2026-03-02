@@ -99,6 +99,8 @@ class HighLevelPolicy(nn.Module):
 
         return q_values, subgoal_emb, None
 
+    # 修改2: core/hrl/high_policy.py
+    # 彻底修复掩码一维化导致的张量越界和索引失效问题
     def select_goal(self, state_emb, valid_goals_mask, epsilon=0.1):
         """Epsilon-Greedy Goal Selection"""
         import numpy as np
