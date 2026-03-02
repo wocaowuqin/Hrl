@@ -17,7 +17,7 @@ NODE_TRAFFIC_LIST = [2, 5, 6, 10, 15, 16, 21, 24]
 TIME_INTERVAL = 5.0  # 时间间隔 5秒
 
 # 🔥 【关键修改】提高到达率 + 增大时间槽
-LAMBDA_PER_INTERVAL = 5.0  # 每间隔56个请求
+LAMBDA_PER_INTERVAL = 15
 
 LAMBDA_RATE = LAMBDA_PER_INTERVAL / TIME_INTERVAL
 
@@ -237,7 +237,7 @@ if __name__ == '__main__':
     phase3_reqs, phase3_by_slot = generate_all_requests(
         num_intervals=400,
         lamda=LAMBDA_RATE,
-        seed=123,
+        seed=125,
         phase_name="Phase 3 (Evaluation)"
     )
 

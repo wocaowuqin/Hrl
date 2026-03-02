@@ -24,7 +24,7 @@ from envs.modules.MABPruner import MABPruningHelper
 from envs.modules.tools import SFCToolkit
 from envs.modules.low_level_controller import LowLevelController
 from envs.modules.high_level_controller import HighLevelController
-
+from envs.modules.TimeSlotManager import TimeSlotManager
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -222,7 +222,7 @@ class SFC_HIRL_Env(gym.Env):
 
         # 4.1 步数控制
         # 从配置读取最大低层步数 (默认 50)
-        self.max_subgoal_steps = config.get('max_low_steps', 50)
+        self.max_subgoal_steps = config.get('max_low_steps', 25)
         self.subgoal_step_count = 0  # 统一的低层步数计数器 (替代 _low_step_count)
 
         # 4.2 目标控制
@@ -279,6 +279,10 @@ class SFC_HIRL_Env(gym.Env):
         #工具箱初始化
         self.tools = SFCToolkit(self)
         logger.info("✅ 工具箱 已初始化")
+
+        # TimeSlotManager 初始化（接管时钟推进和请求获取）
+        self.time_slot_mgr = TimeSlotManager(self, self.config)
+        logger.info("✅ TimeSlotManager 已初始化")
         self.low_level_controller = LowLevelController(self)
         logger.info("✅ LowLevelController 已初始化")
         self.high_level_controller = HighLevelController(self)
@@ -308,6 +312,8 @@ class SFC_HIRL_Env(gym.Env):
         # 最好打印一下确认
         print(f"✅ [Index Fix] DC Nodes converted: {self.dc_nodes}")
         self.resource_mgr = ResourceManager(self.topo, capacities, self.dc_nodes)
+        self.resource_mgr.env = self          # [P1] online_mode 判断依赖
+        self.request_manager = self.resource_mgr.request_manager  # [P1] lifecycle 入口
         self.topology_mgr = SimpleTopologyManager(self.topo)
 
         logger.info(f"✅ 环境参数: n={self.n}, L={self.L}, K_vnf={self.K_vnf}")
@@ -668,6 +674,14 @@ class SFC_HIRL_Env(gym.Env):
             self.current_slot_index = 0
             self.slot_queue = []
             self.simulation_done = False
+
+        # [P4] 同步到 TimeSlotManager（必须在数据加载后）
+        if hasattr(self, 'time_slot_mgr') and self.time_slot_mgr is not None:
+            self.time_slot_mgr.load(requests)
+
+        # 同步到 TimeSlotManager
+        if hasattr(self, 'time_slot_mgr') and self.time_slot_mgr is not None:
+            self.time_slot_mgr.load(requests)
     # 环境智能体交互 reset step step_low_level step_high_level get_state
     def reset(self, seed=None, options=None):
         """
@@ -730,6 +744,9 @@ class SFC_HIRL_Env(gym.Env):
         # 8. 资源管理器重置
         # ========================================
         if hasattr(self, 'resource_mgr') and self.resource_mgr:
+            # reset() 内部会自动判断 online_mode：
+            #   online → episode_reset (保留lifecycle)
+            #   offline/hard → 完整重置
             self.resource_mgr.reset()
 
         # ========================================
@@ -751,7 +768,7 @@ class SFC_HIRL_Env(gym.Env):
 
         # 10. 获取下一个请求
         if self.online_mode:
-            req_raw = self.tools.get_next_request_online()
+            req_raw = self.time_slot_mgr.get_next_request()
         else:
             req_raw, _ = self.reset_request()
 
@@ -821,15 +838,42 @@ class SFC_HIRL_Env(gym.Env):
         if not hasattr(self, 'global_request_index'):
             self.global_request_index = 0
 
-        # 3. 检查是否越界
+        # 3. 检查是否越界，循环复用时叠加时间偏移保证时钟单调递增
         if self.global_request_index >= len(self.all_requests):
+            # 🔥 关键修复：数据集用完后，先强制释放所有活跃请求，再循环
+            #    否则：时钟倒回 → expire_time 永远大于 current_time → 永不释放 → 资源耗尽
+            if not hasattr(self, '_request_cycle_offset'):
+                self._request_cycle_offset = 0.0
+            # 计算本轮时间跨度：取数据集内最大过期时间，加 10% 余量确保全部自然过期
+            if self.all_requests:
+                cycle_end = max(
+                    float(r.get('arrival_time', 0.0)) + float(r.get('lifetime', 5.0))
+                    for r in self.all_requests
+                ) * 1.10
+            else:
+                cycle_end = 600.0
+            self._request_cycle_offset += cycle_end
+            logger.info(f"[ResetReq] 数据集循环，时间偏移累计 +{cycle_end:.1f}s → "
+                        f"总偏移={self._request_cycle_offset:.1f}s，触发全量过期检查")
+            # 用偏移后的时间触发一次全量过期检查，确保上一轮请求全部释放
+            if hasattr(self.resource_mgr, 'request_manager'):
+                self.resource_mgr.request_manager.check_and_release_expired(
+                    self._request_cycle_offset
+                )
             self.global_request_index = 0
 
-        # 4. 获取请求
-        req = self.all_requests[self.global_request_index]
+        # 4. 获取请求（shallow copy 防止污染原始数据集）
+        req = dict(self.all_requests[self.global_request_index])
 
         # 5. 🔥 时间切片处理与资源释放
-        # 获取新请求的到达时间和槽位
+        # 叠加循环偏移，使 arrival_time / expire_time 在全局时间轴上单调递增
+        offset = getattr(self, '_request_cycle_offset', 0.0)
+        if offset > 0:
+            raw_arrival  = float(req.get('arrival_time', 0.0))
+            raw_lifetime = float(req.get('lifetime', 5.0))
+            req['arrival_time'] = raw_arrival + offset
+            req['expire_time']  = raw_arrival + offset + raw_lifetime
+            # time_slot 不需要偏移（只用于槽切换检测，相对值即可）
         new_arrival_time = float(req.get('arrival_time', self.time_step))
         new_time_slot = req.get('time_slot', 0)
 
@@ -851,8 +895,8 @@ class SFC_HIRL_Env(gym.Env):
 
             # B. 触发资源回收管理器
             # 因为时间变了，去检查一下有没有在这段时间内过期的老请求
-            if hasattr(self, 'request_manager'):
-                self.resource_mgr.check_and_release_expired(self.time_step)
+            if hasattr(self.resource_mgr, 'request_manager'):
+                self.resource_mgr.request_manager.check_and_release_expired(self.time_step)
 
         else:
             # 同槽内也要更新时间
@@ -921,3 +965,16 @@ class SFC_HIRL_Env(gym.Env):
             import torch
             from torch_geometric.data import Data
             return Data(x=torch.zeros((self.n, 17)))
+
+
+    #资源探测
+    def get_resource_utilization(self):
+        """资源利用率 — 基于pool实际数据"""
+        try:
+            total_used = 0.0
+            for i in range(self.n):
+                avail = self.resource_mgr.pool.get_available_cpu(i)
+                total_used += (100.0 - avail)
+            return total_used / (self.n * 100.0)
+        except Exception:
+            return 0.0

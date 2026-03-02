@@ -18,6 +18,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torch
 from utils.visualizer import SFCVisualizer
+from trainer.training_analyzer import TrainingAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,9 @@ class Phase3RLTrainer:
         }
 
         logger.info("✅ Trainer初始化完成 (极简日志版)")
+
+        # 训练分析器
+        self.analyzer = TrainingAnalyzer(output_dir=str(self.output_dir))
 
     def run(self):
         """🚀 训练主循环"""
@@ -111,20 +115,44 @@ class Phase3RLTrainer:
             success_rate = success_count / (episode + 1)
             self.stats['success_rate'].append(success_rate)
 
-            # --- 进度条更新 ---
-            # 实时显示成功率和奖励
-            pbar.set_postfix({
-                'Success': f"{success_rate:.1%}",
-                'Reward': f"{total_reward:.1f}",
-                'ResUtil': f"{res_util:.2f}"
-            })
-
-            # --- 训练 Agent ---
-            if hasattr(self.agent, 'learn'):
+            # --- 训练 Agent（先更新权重和 epsilon，再记录快照）---
+            # update_policies() 是正确入口，包含 _update_epsilon() 调用
+            if hasattr(self.agent, 'update_policies'):
+                try:
+                    self.agent.update_policies()
+                except Exception as e:
+                    logger.debug(f"agent.update_policies() 异常: {e}")
+            elif hasattr(self.agent, 'learn'):
                 try:
                     self.agent.learn()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"agent.learn() 异常: {e}")
+            elif hasattr(self.agent, 'update'):
+                try:
+                    self.agent.update()
+                except Exception as e:
+                    logger.debug(f"agent.update() 异常: {e}")
+
+            # --- 分析器记录（learn 之后，epsilon 已更新）---
+            self.analyzer.record(
+                episode=episode,
+                info=info,
+                res_util=res_util,
+                env=self.env,
+                coordinator=self.coordinator,
+                agent=self.agent,
+            )
+
+            # --- 进度条更新 ---
+            eps_low = getattr(self.agent, 'epsilon_low', None)
+            postfix = {
+                'Success': f"{success_rate:.1%}",
+                'Reward': f"{total_reward:.1f}",
+                'ResUtil': f"{res_util:.2f}",
+            }
+            if eps_low is not None:
+                postfix['ε'] = f"{eps_low:.3f}"
+            pbar.set_postfix(postfix)
 
             # --- TensorBoard 记录 ---
             self.writer.add_scalar('Episode/Reward', total_reward, episode)
@@ -139,12 +167,19 @@ class Phase3RLTrainer:
                 recent_trees = [l for l in self.stats['tree_lengths'][-10:] if l > 0]
                 avg_tree_len = np.mean(recent_trees) if recent_trees else 0.0
 
-                # 写入日志文件，但不刷屏控制台（如果配置了FileHandler）
+                # 读取 epsilon（如果 agent 支持）
+                eps_high = getattr(self.agent, 'epsilon_high', None)
+                eps_low  = getattr(self.agent, 'epsilon_low',  None)
+                steps    = getattr(self.agent, 'steps_done',   None)
+                eps_str  = ""
+                if eps_high is not None:
+                    eps_str = f" | ε_h={eps_high:.3f} ε_l={eps_low:.3f} steps={steps}"
+
                 logger.info(
                     f"Ep {episode}: Rate={success_rate:.2%} | "
                     f"Rwd={total_reward:.1f} | "
                     f"Util={res_util:.2f} | "
-                    f"TreeLen={avg_tree_len:.1f}"
+                    f"TreeLen={avg_tree_len:.1f}{eps_str}"
                 )
 
             # --- 保存模型 ---
@@ -170,6 +205,9 @@ class Phase3RLTrainer:
         print(f"   🔋 平均资源利用率: {np.mean(self.stats['resource_utilization']):.2f}")
         print(f"   🌳 平均树长 (成功): {avg_tree_final:.2f}")
         print("=" * 40)
+
+        # 生成失败分析报告
+        self.analyzer.report()
 
     def _save_checkpoint(self, episode):
         """保存检查点"""

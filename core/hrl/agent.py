@@ -231,27 +231,8 @@ class HRLAgent:
             blacklist_info: Optional[dict] = None
     ) -> Tuple[int, int, Dict]:
         """
-        🔥 [V55.6 强制起点版] 紧急修复 StartNode=None 问题
+        [V55.6 强制起点版] 选择动作
         """
-        # ================================================================
-        # 🚨 [DEBUG] 打印接收到的动作掩码（V55.3 增强调试）
-        # ================================================================
-        logger.error("=" * 60)
-        logger.error("🟡 [Agent Debug] select_action 收到掩码:")
-        if action_mask is not None:
-            logger.error(f"   形状: {action_mask.shape}, 类型: {type(action_mask)}")
-            valid_nodes = np.where(action_mask > 0)[0]
-            logger.error(f"   合法节点: {valid_nodes.tolist()}")
-            logger.error(f"   总数: {len(valid_nodes)}")
-            if len(action_mask) > 15:
-                logger.error(f"   mask[15] = {action_mask[15]}")
-            else:
-                logger.error(f"   mask 长度不足15: {len(action_mask)}")
-        else:
-            logger.error("   action_mask = None")
-        logger.error("=" * 60)
-
-        # 初始化 info 字典
         info = {
             'high_level_decision': False,
             'subgoal': self.current_subgoal,
@@ -262,12 +243,11 @@ class HRLAgent:
 
         try:
             # ============================================
-            # 1. High-Level Decision (决定“去哪”和“从哪走”)
+            # 1. High-Level Decision
             # ============================================
             need_new_subgoal = self._need_new_subgoal(state, unconnected_dests)
 
             if need_new_subgoal:
-                # === A. 选终点 (Goal Head) ===
                 self.current_subgoal = self._select_subgoal(state, unconnected_dests, action_mask)
                 self.subgoal_steps = 0
 
@@ -275,41 +255,29 @@ class HRLAgent:
                 info['subgoal'] = self.current_subgoal
                 info['source'] = 'agent_high'
 
-                logger.debug(f"🎯 [High] 新子目标: {self.current_subgoal}")
-
-                # ========== 🔥 强制起点：从请求中获取 source 节点 ==========
-                # 临时紧急修复：直接使用源节点作为起点，确保环境位置正确更新
+                # 强制起点
                 try:
                     if self.env is not None and hasattr(self.env, 'current_request') and self.env.current_request:
                         source_node = self.env.current_request.get('source', 0)
                     else:
                         source_node = 0
-                        logger.error("🟢 [强制起点] 无法获取环境请求，使用默认0")
 
-                    # 更新环境当前位置（非常重要！）
                     if hasattr(self.env, 'current_node_location'):
                         self.env.current_node_location = int(source_node)
-                        logger.error(f"🟢 [强制起点] 设置环境位置为源节点: {source_node}")
-                    else:
-                        logger.error("🟢 [强制起点] 环境没有 current_node_location 属性")
 
                     start_node = int(source_node)
-                    logger.error(f"🟢 [强制起点] 最终起点: {start_node}")
-                except Exception as e:
-                    logger.error(f"🟢 [强制起点] 异常: {e}")
+                except Exception:
                     start_node = 0
                     if hasattr(self.env, 'current_node_location'):
                         self.env.current_node_location = 0
 
                 info['start_node'] = start_node
-                logger.info(f"✅ [SelectAction] High-Level 完成: Start={start_node} -> Goal={self.current_subgoal}")
 
             # ============================================
-            # 2. Low-Level Execution (决定“下一步怎么走”)
+            # 2. Low-Level Execution
             # ============================================
             low_action = self._select_low_action_with_blacklist(state, action_mask, blacklist_info)
 
-            # 更新计数器
             self.subgoal_steps += 1
             self.subgoal_step_count = self.subgoal_steps
 
@@ -318,32 +286,21 @@ class HRLAgent:
                 info['blacklisted_action'] = True
 
             # ============================================
-            # 3. 计算返回值 (High Action Index)
+            # 3. 计算返回值
             # ============================================
             high_action = 0
             if unconnected_dests is not None:
-                # 路由模式 (Phase 2/3 Routing): 返回 unconnected_dests 的索引
                 if self.current_subgoal in unconnected_dests:
                     high_action = unconnected_dests.index(self.current_subgoal)
             else:
-                # VNF 模式 (Phase 3 Placement): 直接返回节点 ID
                 high_action = self.current_subgoal if self.current_subgoal is not None else 0
-
-            # ================================================================
-            # 🚨 [DEBUG] 最终动作确认
-            # ================================================================
-            logger.error("=" * 50)
-            logger.error(f"✅ [Agent Decision] HighAction={high_action}, LowAction={low_action}")
-            logger.error(f"   Subgoal={self.current_subgoal}, StartNode={info.get('start_node')}")
-            logger.error("=" * 50)
 
             return high_action, low_action, info
 
         except Exception as e:
-            logger.error(f"❌ [Select Action] 发生未捕获异常: {e}")
+            logger.error(f"❌ [Select Action] 异常: {e}")
             import traceback
             traceback.print_exc()
-            # 发生严重错误时的兜底返回
             return 0, 0, info
 
     def _need_new_subgoal(self, state: Dict, unconnected_dests: Optional[list]) -> bool:
@@ -362,7 +319,7 @@ class HRLAgent:
             return False
 
         # ---------- 3. 子目标已连接（路由阶段专用）----------
-        if self.current_subgoal not in unconnected_dests:
+        if unconnected_dests is not None and self.current_subgoal not in unconnected_dests:
             logger.debug(f"[NeedNew] 子目标 {self.current_subgoal} 已连接 → 需要")
             return True
 
@@ -402,6 +359,15 @@ class HRLAgent:
                 except Exception as e:
                     logger.error(f"[NeedNew] 资源检查异常: {e}")
 
+        # ---------- 7. VNF阶段：检查当前 subgoal 是否仍是合法 DC 节点 ----------
+        # 防止上一 episode 残留的 subgoal（非DC节点）被沿用
+        if (self.env is not None and
+                getattr(self.env, 'current_phase', None) == 'vnf_deployment'):
+            dc_nodes = getattr(self.env, 'dc_nodes', [])
+            if self.current_subgoal not in dc_nodes:
+                logger.warning(f"[NeedNew] 子目标 {self.current_subgoal} 不是DC节点，强制重选")
+                return True
+
         # ---------- 默认：不需要新子目标 ----------
         logger.debug(f"[NeedNew] 保持当前子目标 {self.current_subgoal}")
         return False
@@ -431,8 +397,8 @@ class HRLAgent:
             top_scores = [q_list[i] for i in top_indices]
             monitor_nodes = [7]
             monitor_str = " | ".join([f"Node{n}={q_list[n]:.2f}" for n in monitor_nodes if n < len(q_list)])
-            logger.warning(
-                f"\n🧠 [BRAIN] Raw Top3: {top_indices} (Scores: {[f'{s:.2f}' for s in top_scores]}) | {monitor_str}")
+            # logger.warning(
+            #     f"\n🧠 [BRAIN] Raw Top3: {top_indices} (Scores: {[f'{s:.2f}' for s in top_scores]}) | {monitor_str}")
         except Exception as e:
             logger.warning(f"🧠 [BRAIN] Log Error: {e}")
 
@@ -455,16 +421,6 @@ class HRLAgent:
             huge_negative = torch.tensor(-1e9, device=self.device)
             masked_q_values = torch.where(mask_tensor > 0, q_values, huge_negative)
             effective_mask = mask_tensor
-
-            try:
-                invalid_indices = torch.where(mask_tensor.squeeze() == 0)[0].tolist()
-                logger.warning(f"🎭 [MASK] 被封杀节点数: {len(invalid_indices)}")
-                if 7 in invalid_indices:
-                    logger.warning(f"   ✅ Node 7 已被正确 Mask")
-                else:
-                    logger.error(f"   ❌ 警告: Node 7 未被 Mask! 它仍然是可选的!")
-            except:
-                pass
 
         # ============================================================
         # 3. 动作选择 (Epsilon-Greedy)
@@ -510,13 +466,13 @@ class HRLAgent:
         # ============================================================
         subgoal = int(goal_idx)
 
-        # 🚨 [DEBUG] 最终选择的掩码状态验证
-        if action_mask is not None and len(action_mask) > subgoal:
-            logger.error(f"   [验证] mask[{subgoal}] = {action_mask[subgoal]}")
-            if action_mask[subgoal] == 0:
-                logger.critical("🚨🚨🚨 严重错误：最终选择了一个被Mask封杀的节点！")
-
-        logger.info(f"🎯 [DECISION] Final Subgoal: {subgoal} (RawIdx: {goal_idx})")
+        # # 🚨 [DEBUG] 最终选择的掩码状态验证
+        # if action_mask is not None and len(action_mask) > subgoal:
+        #     logger.error(f"   [验证] mask[{subgoal}] = {action_mask[subgoal]}")
+        #     if action_mask[subgoal] == 0:
+        #         logger.critical("🚨🚨🚨 严重错误：最终选择了一个被Mask封杀的节点！")
+        #
+        # logger.info(f"🎯 [DECISION] Final Subgoal: {subgoal} (RawIdx: {goal_idx})")
 
         # 更新 Goal Embedding
         if hasattr(state, 'x') and state.x is not None and subgoal < state.x.size(0):
@@ -922,6 +878,7 @@ class HRLAgent:
             'done': done,
             'goal_emb': self.current_goal_emb
         })
+        self.steps_done += 1  # 驱动 ε 衰减
 
         # 缓冲区监控 (调试用)
         if len(self.low_memory) % 5000 == 0:
@@ -1632,7 +1589,7 @@ class GoalConditionedHRLAgent(HRLAgent):
     """向后兼容的GoalConditionedHRLAgent"""
 
     def __init__(self, config, phase=3, goal_strategy='adaptive', **kwargs):
-        logger.warning("⚠️ GoalConditionedHRLAgent已重构为HRLAgent，使用兼容模式")
+        logger.warning("GoalConditionedHRLAgent已重构为HRLAgent，使用兼容模式")
         super().__init__(config, phase=phase, goal_strategy=goal_strategy, **kwargs)
 
 

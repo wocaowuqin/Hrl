@@ -477,7 +477,7 @@ def main():
     args = argparse.Namespace(
         phase='phase3',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
         gpu=0,  # GPU ID, 设为 -1 则强制使用 CPU
-        seed=42,  # 随机种子
+        seed=100,  # 随机种子
         goal_strategy='adaptive'  # Phase 3 的目标策略: 'relative', 'adaptive', 'hybrid'
     )
     # =========================================================================
@@ -503,6 +503,23 @@ def main():
             setup_hrl_config(config)
             # 命令行参数覆盖
             config['hrl']['goal_strategy'] = args.goal_strategy
+
+            # ── RL 训练超参数（在 IL 预训练权重基础上微调）──────────
+            # 学习率要小：避免破坏 IL 预训练的好权重
+            # decay_steps 要大：让 epsilon 衰减慢一点，多探索
+            config['training'] = config.get('training', {})
+            config['training'].setdefault('lr_high',          1e-5)   # IL后微调用小lr
+            config['training'].setdefault('lr_low',           1e-5)   # 同上
+            config['training'].setdefault('batch_size',        64)    # 更稳定的梯度估计
+            config['training'].setdefault('gamma',            0.99)
+            config['training'].setdefault('target_update_freq', 500)  # 更频繁同步target网络
+            config['training'].setdefault('buffer_size',     100000)
+            config['training'].setdefault('epsilon', {
+                'initial':     0.20,   # 从0.2开始（IL已有好底子，不需要太多随机）
+                'final':       0.02,   # 衰减到0.02（几乎全利用）
+                'decay_steps': 150000, # 2000ep × 75步 = 15万步，整个训练期间线性衰减
+            })
+            logger.info("✅ RL 训练超参数已注入 (小学习率微调模式)")
 
         logger.info(f"✅ 配置加载成功")
     except Exception as e:
@@ -580,11 +597,34 @@ def main():
         logger.info("=" * 70)
 
         try:
-            # 直接使用上面初始化的全局 env
-            expert_solver = env.policy_helper.expert
+            # 直接实例化 MSFCE_Solver，不依赖 env.policy_helper
+            from core.expert.expert_msfce.core.solver import MSFCE_Solver
+            from core.expert.expert_msfce.utils.config import SolverConfig
+            from pathlib import Path
+
+            ckpt_dir  = get_config_path(config, 'ckpt_dir')
+            input_dir = config.get('path', config.get('paths', {})).get('input_dir', 'data/input_dir')
+            path_db   = Path(input_dir) / 'US_Backbone_path.mat'
+
+            topo_matrix = config['topology']['matrix']  # 真实拓扑（在上面已加载）
+            dc_nodes    = config.get('env', {}).get('dc_nodes', list(range(topo_matrix.shape[0])))
+            capacities  = {
+                'cpu':       config.get('env', {}).get('cap_cpu',       80.0),
+                'memory':    config.get('env', {}).get('cap_mem',       60.0),
+                'bandwidth': config.get('env', {}).get('link_capacity', 90.0),
+            }
+
+            expert_solver = MSFCE_Solver(
+                path_db_file=path_db,
+                topology_matrix=topo_matrix,
+                dc_nodes=dc_nodes,
+                capacities=capacities,
+                config=SolverConfig(),
+            )
             logger.info("✅ Expert Solver 已加载")
         except Exception as e:
             logger.error(f"❌ Expert Solver 获取失败: {e}")
+            import traceback; traceback.print_exc()
             return
 
         output_dir = get_config_path(config, 'expert_data_dir')
@@ -703,7 +743,10 @@ def main():
 
         # 2. 加载预训练模型 (智能适配版)
         ckpt_dir = get_config_path(config, 'ckpt_dir')
-        pretrained_path = os.path.join(ckpt_dir, "il_model_final.pth")
+        # 优先加载验证集最优模型（早停保存），回退到 final
+        pretrained_path = os.path.join(ckpt_dir, "il_model_best.pth")
+        if not os.path.exists(pretrained_path):
+            pretrained_path = os.path.join(ckpt_dir, "il_model_final.pth")
 
         if os.path.exists(pretrained_path):
             logger.info(f"📥 正在加载预训练模型: {pretrained_path}")
@@ -747,6 +790,19 @@ def main():
                 logger.error(f"❌ 模型加载错误: {e}")
         else:
             logger.warning(f"⚠️ 未找到预训练模型: {pretrained_path}")
+
+        # ── Phase3 开始前重置 optimizer lr（IL 训练后 lr 可能被 scheduler 降低）──
+        # 使用 config 里设置的小 lr（1e-5），确保 RL 微调阶段不破坏 IL 权重
+        rl_lr_high = config.get('training', {}).get('lr_high', 1e-5)
+        rl_lr_low  = config.get('training', {}).get('lr_low',  1e-5)
+        if hasattr(agent, 'optimizer_high'):
+            for pg in agent.optimizer_high.param_groups:
+                pg['lr'] = rl_lr_high
+            logger.info(f"🔧 重置 optimizer_high lr = {rl_lr_high}")
+        if hasattr(agent, 'optimizer_low'):
+            for pg in agent.optimizer_low.param_groups:
+                pg['lr'] = rl_lr_low
+            logger.info(f"🔧 重置 optimizer_low  lr = {rl_lr_low}")
 
         # =========================================================
         # 🔥 初始化 HRL Coordinator
