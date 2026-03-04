@@ -102,35 +102,50 @@ class HighLevelPolicy(nn.Module):
     # 修改2: core/hrl/high_policy.py
     # 彻底修复掩码一维化导致的张量越界和索引失效问题
     def select_goal(self, state_emb, valid_goals_mask, epsilon=0.1):
-        """Epsilon-Greedy Goal Selection"""
         import numpy as np
         with torch.no_grad():
             q_values, goal_emb, _ = self.forward(state_emb, return_subgoal=True)
 
+        # 将网络输出展平为 1D
+        q_values_flat = q_values.view(-1)
+
         if valid_goals_mask is not None:
             if isinstance(valid_goals_mask, np.ndarray):
                 valid_goals_mask = torch.FloatTensor(valid_goals_mask).to(q_values.device)
-            masked_q_values = q_values.clone()
-            masked_q_values[valid_goals_mask == 0] = -1e9
+
+            # 将掩码展平为 1D
+            mask_flat = valid_goals_mask.view(-1)
+
+            # 维度对齐保护
+            if mask_flat.size(0) != q_values_flat.size(0):
+                min_dim = min(mask_flat.size(0), q_values_flat.size(0))
+                temp_mask = torch.zeros_like(q_values_flat)
+                temp_mask[:min_dim] = mask_flat[:min_dim]
+                mask_flat = temp_mask
+
+            masked_q_values = q_values_flat.clone()
+            masked_q_values[mask_flat == 0] = -1e9
         else:
-            masked_q_values = q_values
+            masked_q_values = q_values_flat
+            mask_flat = torch.ones_like(q_values_flat)
 
         if np.random.rand() < epsilon:
-            if valid_goals_mask is not None:
-                valid_indices = torch.nonzero(valid_goals_mask[0] > 0, as_tuple=False).squeeze()
-                if valid_indices.numel() == 0:
-                    goal_idx = torch.tensor(0)
-                elif valid_indices.numel() == 1:
-                    goal_idx = valid_indices
-                else:
-                    goal_idx = valid_indices[torch.randint(len(valid_indices), (1,))]
+            # 修复点：直接对 1D 掩码进行条件判断
+            valid_indices = torch.nonzero(mask_flat > 0, as_tuple=False).squeeze(-1)
+            if valid_indices.numel() == 0:
+                goal_idx = torch.tensor(0)
+            elif valid_indices.numel() == 1:
+                goal_idx = valid_indices[0]
             else:
-                goal_idx = torch.randint(0, q_values.size(1), (1,))
+                rand_idx = torch.randint(0, len(valid_indices), (1,))
+                goal_idx = valid_indices[rand_idx].squeeze()
         else:
-            goal_idx = torch.argmax(masked_q_values[0])
+            goal_idx = torch.argmax(masked_q_values)
+
+        if goal_idx.dim() == 0:
+            goal_idx = goal_idx.unsqueeze(0)
 
         return goal_idx, goal_emb
-
     def select_start_node(self, node_embeddings, target_emb, tree_mask, sample=True):
         """
         🔥 [修复版] 选择起点 (支持采样和梯度流)

@@ -9,32 +9,65 @@ logger = logging.getLogger(__name__)
 
 class HighLevelController:
     """
-    🎮 高层交互控制器 - 收敛优化版
-    优化1: mask严格可行性（不全开兜底）
-    优化3: 高层步惩罚-0.1
-    优化5: Feature[9]置0减噪
+    🎮 高层交互控制器 - HQDQN 对齐优化版
     """
 
     def __init__(self, env):
         self.env = env
-        logger.info("✅ HighLevelController initialized (收敛优化版)")
+        logger.info("✅ HighLevelController initialized (HQDQN对齐版)")
         self._pending_dist_cache = {}
         self._last_dests_update = -1
 
     def set_high_level_goal(self, high_action_idx, target_node_id, start_node_id=None):
         self.env.last_high_action_idx = high_action_idx
+        target_node_id = int(target_node_id)  # 确保是int
+
+        # ============================================================
+        # 🔥 [防御] VNF阶段: target必须是DC节点；在此处做最后一道拦截
+        # ============================================================
+        if self.env.current_request:
+            vnf_list = self.env.current_request.get('vnf', [])
+            current_vnf_idx = getattr(self.env, 'next_vnf_idx', 0)
+            if current_vnf_idx < len(vnf_list):
+                dc_nodes = getattr(self.env, 'dc_nodes', set())
+                if dc_nodes and target_node_id not in dc_nodes:
+                    # 从mask中找第一个合法DC节点替换
+                    mask = self.get_high_level_action_mask()
+                    dc_fallback = next(
+                        (n for n in range(self.env.n) if mask[n] > 0 and n in dc_nodes),
+                        None
+                    )
+                    if dc_fallback is not None:
+                        logger.warning(
+                            f"🛡️ [High.set_goal] VNF阶段目标 {target_node_id} 非DC节点，"
+                            f"强制替换为 {dc_fallback}"
+                        )
+                        target_node_id = dc_fallback
+                    else:
+                        logger.error(f"❌ [High.set_goal] 无可用DC节点可替换目标 {target_node_id}")
+
         self.env.current_subgoal_node = target_node_id
         self.env.subgoal_step_count = 0
 
-        # [P1修复] 只记录起点，不强制瞬移
-        # 如果 start_node_id 与实际物理位置不符，以实际位置为准
         actual_location = self.env.current_node_location
         if start_node_id is not None:
-            if int(start_node_id) != actual_location:
-                logger.warning(f"⚠️ [High] Agent预测起点({start_node_id})≠实际位置({actual_location})，"
-                               f"以实际位置为准，不执行瞬移")
+            start_node_id = int(start_node_id)
+            if start_node_id != actual_location:
+                # ── [FIX SFC] dest阶段允许合法瞬移回 last_vnf ────────────────────────────────────
+                # 原来一律拒绝不一致的 start_node，导致 Coordinator 设置的 last_vnf 回位被忽略，
+                # 每个目的地从不同位置出发，SFC主干断裂，可视化里 VNF 节点缺失。
+                # 修复：若 start_node == chain_nodes[-1]，说明是 Coordinator 主动回位，执行合法瞬移。
+                _phase = getattr(self.env, 'current_phase', None)
+                _chain = getattr(self.env, 'chain_nodes', [])
+                if _phase == 'destination_connection' and _chain and start_node_id == _chain[-1]:
+                    self.env.current_node_location = start_node_id
+                    logger.debug(f"🔄 [High] dest阶段合法瞬移: {actual_location}→last_vnf={start_node_id}")
+                else:
+                    logger.warning(f"⚠️ [High] Agent预测起点({start_node_id})≠实际位置({actual_location})，"
+                                   f"以实际位置为准，不执行瞬移")
+                # ─────────────────────────────────────────────────────────────────
             else:
-                logger.info(f"📍 [High] Agent起点确认: {start_node_id}")
+                logger.debug(f"📍 [High] Agent起点确认: {start_node_id}")
 
         if self.env.current_request:
             vnf_list = self.env.current_request.get('vnf', [])
@@ -44,35 +77,41 @@ class HighLevelController:
                 self.env.current_phase = 'vnf_deployment'
                 self.env.current_deployment_target = target_node_id
                 self.env.current_target_node = None
-                #logger.info(f"🎯 [Env] VNF部署阶段: VNF[{self.env.next_vnf_idx}] → 节点{target_node_id}")
             else:
                 self.env.current_phase = 'destination_connection'
                 self.env.current_target_node = target_node_id
                 self.env.current_deployment_target = None
-                #logger.info(f"🎯 [Env] 目的地连接阶段: 目标节点{target_node_id}")
-        #else:
-            #logger.warning("⚠️ 设定目标时没有活跃请求")
 
         return self.get_high_level_state_graph()
 
-    # ==================================================================
-    # 🔥 优化1 + 优化3: step_high_level
-    # ==================================================================
     def step_high_level(self, action_idx):
-        """
-        🔥 [收敛优化版 + P1修复]
-        优化1: 开头检查mask全0 → Episode失败
-        优化3: 标准路径加 -0.5 步惩罚
-        P1修复: 使用 current_subgoal_node 而非 action_idx 作为目标节点
-        """
-        # 🔥🔥🔥 [优化1] 无可行动作 → 直接失败
+        # ================================================================
+        # 🔥 [FIX] mask计算前先同步phase状态，防止phase尚未切换就用旧mask判断
+        # ================================================================
+        if self.env.current_request:
+            vnf_list = self.env.current_request.get('vnf', [])
+            current_vnf_idx = getattr(self.env, 'next_vnf_idx', 0)
+            # 确保phase与vnf进度一致（防止低层完成VNF后phase未同步）
+            if current_vnf_idx >= len(vnf_list):
+                if getattr(self.env, 'current_phase', None) == 'vnf_deployment':
+                    self.env.current_phase = 'destination_connection'
+                    self.env.current_deployment_target = None
+                    logger.info(f"🔄 [High.step] 检测到VNF已全完成，phase强制切换→destination_connection")
+
         mask = self.get_high_level_action_mask()
         if np.sum(mask) == 0:
-            logger.warning("❌ [High] 无可行高层动作，Episode失败")
-            return None, -10.0, True, False, {'no_valid_action': True}
+            phase = getattr(self.env, 'current_phase', 'unknown')
+            vnf_idx = getattr(self.env, 'next_vnf_idx', -1)
+            pending = []
+            if self.env.current_request:
+                all_d = set(self.env.current_request.get('dest', []))
+                conn_d = self.env.current_tree.get('connected_dests', set()) if self.env.current_tree else set()
+                pending = list(all_d - conn_d)
+            logger.warning(
+                f"❌ [High] 无可行高层动作 | phase={phase} | vnf_idx={vnf_idx} | pending_dests={pending}"
+            )
+            return None, -10.0, True, False, {'no_valid_action': True, 'phase': phase}
 
-        # [P1修复] 使用 set_high_level_goal 中已正确解析的目标节点
-        # 原代码: target_node = int(action_idx)  ← action_idx可能是Agent输出索引，非真实节点ID
         target_node = getattr(self.env, 'current_subgoal_node', int(action_idx))
         target_node = int(target_node)
         self.current_high_action = target_node
@@ -94,7 +133,13 @@ class HighLevelController:
         if target_node in connected:
             if all_dests.issubset(connected):
                 logger.info("🎉 [High] 所有目的地已连接，Episode完美结束！")
-                return None, 20.0, True, False, {'all_done': True}
+                reward = 20.0
+                if hasattr(self.env, 'low_level_controller') and hasattr(self.env.low_level_controller,
+                                                                         '_calculate_tree_metrics'):
+                    metrics = self.env.low_level_controller._calculate_tree_metrics()
+                    reward += -2.0 * metrics.get('redundancy', 0.0)
+                    reward += -0.5 * metrics.get('tree_n_edges', 0.0)
+                return None, reward, True, False, {'all_done': True}
             else:
                 logger.warning(f"🔄 [High] 目标 {target_node} 已完成 -> Truncated")
                 return None, 5.0, False, True, {
@@ -102,10 +147,7 @@ class HighLevelController:
                     'warning': 'selected_completed_target'
                 }
 
-        self.env.current_goal_node = target_node
-
-        # 🔥🔥🔥 [优化3] 步惩罚，防止频繁换目标
-        step_penalty = -0.5
+        step_penalty = -0.1
 
         return None, step_penalty, False, False, {
             'target_node': target_node,
@@ -121,14 +163,7 @@ class HighLevelController:
         if not all_dests.issubset(connected): return False
         return True
 
-    # ==================================================================
-    # 🔥 优化1: get_high_level_action_mask (严格失败)
-    # ==================================================================
     def get_high_level_action_mask(self):
-        """
-        🔥 [收敛优化版] 严格可行性控制
-        优化1: 资源不足时返回全0，不再全开兜底
-        """
         n = self.env.n
         mask = np.zeros(n, dtype=np.float32)
 
@@ -147,15 +182,25 @@ class HighLevelController:
             req_cpu = float(cpu_list[current_vnf_idx]) if current_vnf_idx < len(cpu_list) else 10.0
             req_mem = float(mem_list[current_vnf_idx]) if current_vnf_idx < len(mem_list) else 10.0
 
+            # ── [FIX SFC] VNF部署节点排除：source / dest / 已部署节点
+            # VNF不能部署在source节点（会造成Source=VNF重叠）
+            # VNF不能部署在dest节点（会造成VNF=Dest重叠，SFC语义错误）
+            # VNF不能重复部署到同一节点
+            _source = self.env.current_request.get('source', -1) if self.env.current_request else -1
+            _dests = set(int(d) for d in self.env.current_request.get('dest', [])) if self.env.current_request else set()
+            _already = set(getattr(self.env, 'chain_nodes', []))
+
             if hasattr(self.env, 'dc_nodes'):
                 for node in self.env.dc_nodes:
                     if 0 <= node < n:
+                        if node == _source:       continue  # 不允许部署在source
+                        if node in _dests:        continue  # 不允许部署在dest
+                        if node in _already:      continue  # 不允许重复部署
                         avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
                         avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
                         if avail_cpu >= req_cpu and avail_mem >= req_mem:
                             mask[node] = 1.0
 
-            # 🔥🔥🔥 [优化1] 严格失败：不再全开兜底
             if np.sum(mask) == 0:
                 logger.warning("⚠️ [Mask] 所有DC节点资源不足，返回全0")
                 return np.zeros(n, dtype=np.float32)
@@ -175,29 +220,18 @@ class HighLevelController:
 
             true_pending = list(all_dests - connected_set)
             if not true_pending:
-                # [P0修复] 所有目的地已连接，不返回全0死锁
-                # 检查VNF是否也完成 → 如果是，开放 source 触发全局完成检测
-                vnf_done = current_vnf_idx >= len(vnf_list)
-                if vnf_done:
-                    logger.info("🎉 [Mask] 所有任务已完成，开放source节点触发Episode结束")
-                    source = self.env.current_request.get('source', 0)
-                    if source is not None and 0 <= int(source) < n:
-                        mask[int(source)] = 1.0
-                    if np.sum(mask) == 0:
-                        # source无效，开放任意已连接节点
-                        for d in connected_set:
-                            if 0 <= d < n:
-                                mask[d] = 1.0
-                                break
-                    return mask
-                else:
-                    # VNF 未完成但目的地全连接（异常状态）
-                    logger.warning("⚠️ [Mask] 目的地全连接但VNF未完成，返回全0")
-                    return np.zeros(n, dtype=np.float32)
+                return np.zeros(n, dtype=np.float32)
 
+            # 目的地阶段：纯拓扑连通性判断，带宽约束由低层执行时处理
+            llc = getattr(self.env, 'low_level_controller', None)
+            last_vnf = self.env.chain_nodes[-1] if getattr(self.env, 'chain_nodes', []) else None
             for node in true_pending:
                 if 0 <= node < n:
-                    mask[node] = 1.0
+                    if llc is not None and last_vnf is not None:
+                        if llc._get_hop_distance(last_vnf, node) < 9999:
+                            mask[node] = 1.0
+                    else:
+                        mask[node] = 1.0
 
             for done_node in connected_set:
                 if 0 <= done_node < n:
@@ -205,9 +239,6 @@ class HighLevelController:
 
         return mask
 
-    # ==================================================================
-    # 优化5: get_high_level_state_graph (Feature[9]置0)
-    # ==================================================================
     def get_high_level_state_graph(self):
         n = self.env.n
 
@@ -238,7 +269,6 @@ class HighLevelController:
                 req_cpu = float(cpu_list[next_vnf_idx])
                 req_mem = float(mem_list[next_vnf_idx]) if next_vnf_idx < len(mem_list) else 1.0
 
-        # VNF负载统计
         node_vnf_counts = [0] * n
         placement = self.env.current_tree.get('placement', {})
         for placement_key, info in placement.items():
@@ -258,9 +288,6 @@ class HighLevelController:
 
         dc_nodes = getattr(self.env, 'dc_nodes', set())
 
-        # =============================
-        # 构建节点特征 [N, 11]
-        # =============================
         x = []
         for node in range(n):
             try:
@@ -272,13 +299,9 @@ class HighLevelController:
                 norm_cpu, norm_mem = 0.5, 0.5
                 avail_cpu, avail_mem = 50.0, 50.0
 
-            # [0-1] 资源
             features = [norm_cpu, norm_mem]
-
-            # [2] 源节点
             features.append(1.0 if node == source else 0.0)
 
-            # [3] Pending Dest
             is_dest = node in dests
             is_connected = node in connected_dests
             if is_dest:
@@ -290,13 +313,9 @@ class HighLevelController:
                 is_pending = 0.0
             features.append(is_pending)
 
-            # [4] 已连接
             features.append(1.0 if is_connected else 0.0)
-
-            # [5] 在树上
             features.append(1.0 if node in nodes_on_tree else 0.0)
 
-            # [6] 资源匹配度
             if is_vnf_phase and req_cpu > 0:
                 cpu_match = min(avail_cpu / max(req_cpu, 0.1), 1.0)
                 mem_match = min(avail_mem / max(req_mem, 0.1), 1.0)
@@ -307,7 +326,6 @@ class HighLevelController:
                 match_score = 0.0
             features.append(match_score)
 
-            # [7] 度数
             try:
                 degree = len(self.env.resource_mgr.get_neighbors(node))
                 norm_degree = min(degree / 10.0, 1.0)
@@ -315,13 +333,9 @@ class HighLevelController:
                 norm_degree = 0.5
             features.append(norm_degree)
 
-            # [8] 历史负载
             features.append(min(node_vnf_counts[node] / 5.0, 1.0))
-
-            # 🔥🔥🔥 [优化5] Feature[9] 置0，减少噪声
             features.append(0.0)
 
-            # [10] 阶段指导（带负载惩罚）
             if is_vnf_phase:
                 if node in dc_nodes and avail_cpu >= req_cpu and avail_mem >= req_mem:
                     load_penalty = node_vnf_counts[node] * 0.3
@@ -371,18 +385,10 @@ class HighLevelController:
                     else:
                         phase_guide = -1.0
             features.append(phase_guide)
-
-            if is_dest:
-                status_str = "✅已完成" if is_connected else "❌未完成"
-                # logger.info(f"🧐 [Node {node}] {status_str} | "
-                #             f"Feat[3]:{features[3]:.1f} | "
-                #             f"Feat[10]:{features[10]:.1f} | "
-                #             f"CPU:{features[0]:.2f}")
             x.append(features)
 
         x_tensor = torch.tensor(x, dtype=torch.float32)
 
-        # 边特征
         edge_index_list = []
         edge_attr_list = []
 
@@ -434,7 +440,6 @@ class HighLevelController:
             edge_index = torch.zeros((2, 0), dtype=torch.long)
             edge_attr = torch.zeros((0, 2), dtype=torch.float32)
 
-        # 全局特征
         bw_req = req.get('bw_origin', 0.0)
         norm_bw_req = min(bw_req / 10.0, 1.0)
         vnf_progress = next_vnf_idx / max(1, len(vnf_list))
@@ -449,9 +454,6 @@ class HighLevelController:
 
         return Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, global_attr=global_attr)
 
-    # ==================================================================
-    # 辅助方法（不变）
-    # ==================================================================
     def _validate_start_node(self, start_node, target_node):
         if not self._is_valid_node(start_node):
             return False, f"无效节点ID: {start_node}"

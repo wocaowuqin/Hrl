@@ -447,6 +447,16 @@ class SFC_HIRL_Env(gym.Env):
         self.curr_ep_link_allocs = []
         self._current_req_record = {}
 
+        # ── [FIX SFC] 每个Episode必须重置chain_nodes，否则上一个episode的VNF记录污染下一个
+        # chain_nodes只在low_level_controller里追加，但reset()里从未清空，导致：
+        # 1. Ep2的chain_nodes包含Ep1的VNF节点
+        # 2. last_vnf指向错误节点，目的地分支从错误位置出发
+        # 3. SFC路径里VNF数量和位置都乱掉，可视化中VNF标注缺失或错位
+        self.chain_nodes = []
+        self.sfc_upstream_nodes = set()
+        self._need_reset_to_last_vnf = False
+        # ─────────────────────────────────────────────────────────────────────
+
         # HRL 分支管理状态
         self.branch_states = {}
         self.current_branch_id = None
@@ -765,6 +775,13 @@ class SFC_HIRL_Env(gym.Env):
         self.current_branch_id = None
         self.curr_ep_node_allocs = []
         self.curr_ep_link_allocs = []
+
+        # ── [FIX SFC] 每个Episode的reset()必须清空chain_nodes
+        # __init__里已有初始化，但只有reset()才在每个episode被调用
+        # 不清空会导致chain_nodes跨episode累积(Ep1:3个, Ep2:6个, Ep3:9个...)
+        self.chain_nodes = []
+        self.sfc_upstream_nodes = set()
+        self._need_reset_to_last_vnf = False
 
         # 10. 获取下一个请求
         if self.online_mode:

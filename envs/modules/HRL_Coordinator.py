@@ -6,132 +6,110 @@ logger = logging.getLogger(__name__)
 
 
 class HRL_Coordinator:
-    """
-    纯HRL协调器 - V53.0 (移除暴力检测版)
-    包含:
-    1. 接收 HighLevel 的 Truncated 信号
-    2. 强制清空 Agent 的 Subgoal 缓存
-    3. 🔥 [关键修复] 移除暴力目标检测，强制 Agent 执行停留动作
-    """
-
     def __init__(self, env, high_agent, low_agent, config=None):
         self.env = env
         self.high_agent = high_agent
         self.low_agent = low_agent
         self.config = config or {}
 
-        # 仅保留引用，不主动管理释放
         if hasattr(env, 'resource_mgr'):
             self.resource_mgr = env.resource_mgr
-            logger.info("🔗 HRL 已连接 AllResourceManager（仅引用）")
         else:
             self.resource_mgr = None
 
         self.max_low_steps = self.config.get('max_low_steps', 50)
-        # [关键修复] 同步 env.max_subgoal_steps，确保 Low-Level 超时阈值一致
-        # 默认50步（与max_low_steps一致），避免Low-Level内部过早超时
-        self.env.max_subgoal_steps = self.config.get('max_subgoal_steps', 50)
+        self.env.max_subgoal_steps = self.config.get('max_subgoal_steps', 40)
         self.stats = defaultdict(int)
         self.current_episode = 0
         self.resources_released = False
 
-        logger.info("🚀 纯HRL协调器初始化完成（V53.0 移除暴力检测版）")
+        self._permanent_unreachable = set()
 
     def run_high_low_cycle(self, high_obs, training=True):
-        """
-        🔥 [V52.0] 核心逻辑：Truncated -> Wipe Agent Memory -> Re-sample
-        """
-        # 重置释放标志
         if hasattr(self, 'resources_released'):
             self.resources_released = False
 
-        # ============================================================
-        # Phase 1: High-Level 决策
-        # ============================================================
-        # 1. 获取 Mask
         high_mask = self.env.get_high_level_action_mask()
 
-        # 过滤本 episode 已确认不可达/部署失败的节点
         if hasattr(self, '_unreachable_targets') and self._unreachable_targets:
             for idx in self._unreachable_targets:
                 if idx < len(high_mask):
                     high_mask[idx] = 0
-            logger.debug(f"[Coordinator] 过滤不可达节点: {self._unreachable_targets}")
+
+        if hasattr(self, '_permanent_unreachable') and self._permanent_unreachable:
+            for idx in self._permanent_unreachable:
+                if idx < len(high_mask):
+                    high_mask[idx] = 0
 
         if sum(high_mask) == 0:
-            logger.error("❌ 无可用高层动作 (Mask全0)")
             return 0.0, True, {'error': 'no_high_actions'}
 
-        # 2. Agent 选择动作
         high_action_idx, high_action_remapped, agent_info = self.high_agent.select_action(
             high_obs, action_mask=high_mask
         )
 
-        # ------------------------------------------------------------
-        # 目标解析
-        # ------------------------------------------------------------
         target_node = None
+        valid_indices = np.where(high_mask > 0)[0]
         if agent_info and 'subgoal' in agent_info and agent_info['subgoal'] is not None:
-            target_node = agent_info['subgoal']
-        else:
-            valid_indices = np.where(high_mask > 0)[0]
+            candidate = int(agent_info['subgoal'])
+            # 验证subgoal在当前mask仍然有效（资源可能已耗尽）
+            if candidate < len(high_mask) and high_mask[candidate] > 0:
+                target_node = candidate
+            elif len(valid_indices) > 0:
+                idx_pick = high_action_idx if high_action_idx < len(valid_indices) else 0
+                target_node = int(valid_indices[idx_pick])
+                logger.debug(f"[Coord] subgoal {candidate} 资源不足，重映射to {target_node}")
+        if target_node is None:
             if high_action_idx < len(valid_indices):
                 target_node = int(valid_indices[high_action_idx])
+            elif len(valid_indices) > 0:
+                target_node = int(valid_indices[0])
             else:
                 target_node = high_action_idx
 
-        # 同步起点
         start_node = agent_info.get('start_node')
         if start_node is None:
-            start_node = self.env.current_node_location
+            # ── [FIX SFC主干] 判断是否进入dest阶段，强制从last_vnf出发 ──────────
+            # 原逻辑依赖 current_phase=='destination_connection'，但phase切换发生在
+            # step_high_level()开头，而start_node在调用之前就确定了，导致：
+            # VNF全部部署完的第一个dest cycle，phase还是'vnf_deployment'，
+            # start_node走了else分支用current_node_location，dest从错误位置出发。
+            # 修复：改用 next_vnf_idx >= len(vnf_list) 直接判断VNF是否全部完成，
+            # 只要VNF完成且chain_nodes非空，就强制从last_vnf出发，
+            # 保证 Source→VNF1→VNF2→VNF3→Dest 的主干结构。
+            _chain = getattr(self.env, 'chain_nodes', [])
+            _vnf_list = []
+            if self.env.current_request:
+                _vnf_list = self.env.current_request.get('vnf', [])
+            _vnf_done = getattr(self.env, 'next_vnf_idx', 0) >= len(_vnf_list) if _vnf_list else False
+            if _vnf_done and len(_chain) > 0:
+                last_vnf = _chain[-1]
+                self.env.current_node_location = last_vnf
+                start_node = last_vnf
+                logger.debug(f"[Coord] VNF完成，dest阶段强制start_node=last_vnf={last_vnf}")
+            else:
+                start_node = self.env.current_node_location
+            # ──────────────────────────────────────────────────────────────────
 
-        logger.info(f"🎯 [Coordinator] 意图同步: ActualPos={self.env.current_node_location} | "
-                    f"AgentPredict={start_node} -> Goal={target_node} (RawIdx={high_action_idx})")
-
-        # [P1修复] 不在此处重置起点，由 set_high_level_goal 统一管理
-        # 原代码: self.env.current_node_location = int(start_node)
         self.env.set_high_level_goal(high_action_idx, target_node, start_node)
 
-        # ------------------------------------------------------------
-        # High-Level Step (执行决策)
-        # ------------------------------------------------------------
         _, _, done, truncated, high_info = self.env.step_high_level(high_action_idx)
 
-        # 🔥 [关键逻辑] 处理 High Level 的立即终止信号
         if done:
-            logger.info("🎉 High-Level 判定 Episode 结束")
             return 0.0, True, {'episode_done': True}
 
         if truncated:
-            logger.warning(f"🔄 [Coordinator] High-Level 返回 Truncated (目标 {target_node} 无效/已完成)")
-            logger.warning("   -> 触发强制重采机制 (Force Re-sample)")
-
-            # 🔥🔥🔥 [核心修复] 强制清空 Agent 的缓存 🔥🔥🔥
-            # 这行代码逼迫 Agent 必须在下一轮重新评估 Mask，而不是使用旧的 current_subgoal
-
-            # 1. 清空当前目标缓存
             if hasattr(self.high_agent, 'current_subgoal'):
-                logger.info(f"   🧹 清空 Agent 缓存: current_subgoal ({self.high_agent.current_subgoal}) -> None")
                 self.high_agent.current_subgoal = None
-
-            # 2. 重置步数计数器 (使其超过 horizon，触发 update)
             if hasattr(self.high_agent, 'subgoal_steps'):
                 horizon = getattr(self.high_agent, 'subgoal_horizon', 10)
                 self.high_agent.subgoal_steps = horizon + 1
-                logger.info(f"   🧹 重置 Agent 计时: subgoal_steps -> {self.high_agent.subgoal_steps}")
-
-            # 3. 针对不同 Agent 实现的兼容性清空
             if hasattr(self.high_agent, 'subgoal_step_count'):
                 self.high_agent.subgoal_step_count = 999
-
-            # 直接返回，不执行下面的 Low Level Loop
-            # Coordinator 的 run_episode 会继续循环，重新调用 run_high_low_cycle
+            if hasattr(self, '_unreachable_targets'):
+                self._unreachable_targets.clear()
             return 0.0, False, {'subgoal_truncated': True}
 
-        # ============================================================
-        # Phase 2: Low-Level 执行 (只有在非 Truncated 时才执行)
-        # ============================================================
-        # [修复A] 统一步数管理：每个 cycle 开始时重置步数，避免 Low-Level 内部超时残留
         self.env.subgoal_step_count = 0
         if hasattr(self.env, 'current_path_trace'):
             self.env.current_path_trace = []
@@ -143,36 +121,62 @@ class HRL_Coordinator:
         info = {}
         low_level_stalled = False
         subgoal_achieved = False
-        start_pos_before_low = self.env.current_node_location  # 记录起始位置，用于卡死检测
+        start_pos_before_low = self.env.current_node_location
 
-        logger.info(f"🚀 [Low Exec] 开始执行 Subgoal: {target_node} (MaxSteps={self.max_low_steps})")
-
-        # ==============================================================
-        # 🔥 优化：带宽感知最短路径引导
-        # 先用图算法算出 current_pos → target_node 的最优路径
-        # 然后沿路径逐步执行 step_low_level（保持所有奖励/带宽/信号逻辑）
-        # ==============================================================
         planned_path = None
         path_idx = 0
         blocked_edges = set()
         replan_count = 0
         no_progress_count = 0
-        if hasattr(self.env, 'low_level_controller') and \
+
+        if self.current_episode < 200:
+            use_path_guide = True
+        elif self.current_episode < 500:
+            use_path_guide = np.random.rand() < 0.2
+        else:
+            use_path_guide = False
+
+        if use_path_guide and hasattr(self.env, 'low_level_controller') and \
                 hasattr(self.env.low_level_controller, 'compute_bw_aware_path'):
             current_pos = self.env.current_node_location
-            planned_path = self.env.low_level_controller.compute_bw_aware_path(current_pos, target_node)
-            if planned_path and len(planned_path) > 1:
-                planned_path = planned_path[1:] + [target_node]
-                logger.info(f"🗺️ [PathGuide] 规划路径: {self.env.current_node_location} → "
-                            f"{' → '.join(str(n) for n in planned_path[:5])}{'...' if len(planned_path)>5 else ''} "
-                            f"(共{len(planned_path)}步)")
-            elif planned_path and len(planned_path) == 1:
-                planned_path = [target_node]
-                logger.info(f"🗺️ [PathGuide] 已在目标节点{target_node}，直接STAY")
+            _chain = getattr(self.env, 'chain_nodes', [])
+            _vnf_list = self.env.current_request.get('vnf', []) if self.env.current_request else []
+            _vnf_done = getattr(self.env, 'next_vnf_idx', 0) >= len(_vnf_list) if _vnf_list else False
+
+            # ── [FIX SFC路径约束] dest阶段强制路径经过全部VNF节点 ──────────────
+            # 原逻辑：直接计算 current_pos→dest_i 最短路，完全绕过VNF主干
+            # 修复：分段计算 current→VNF1→VNF2→VNF3→dest_i，拼接成完整路径
+            # 保证每条dest连接路径上必然经过全部VNF节点，满足SFC约束
+            if _vnf_done and len(_chain) >= 1:
+                waypoints = list(_chain) + [target_node]
+                full_path = []
+                seg_start = current_pos
+                path_ok = True
+                for wp in waypoints:
+                    if seg_start == wp:
+                        continue
+                    seg = self.env.low_level_controller.compute_bw_aware_path(seg_start, wp)
+                    if not seg:
+                        path_ok = False
+                        break
+                    full_path.extend(seg[1:] if len(seg) > 1 else [wp])
+                    seg_start = wp
+                if path_ok and full_path:
+                    planned_path = full_path
+                    logger.debug(f"[Coord] SFC路径 waypoints={waypoints} path={planned_path}")
+                else:
+                    planned_path = None
+                    self._unreachable_targets.add(target_node)
+            # ──────────────────────────────────────────────────────────────────
             else:
-                logger.warning(f"⚠️ [PathGuide] 无法规划路径到{target_node}，回退RL")
-                planned_path = None
-                self._unreachable_targets.add(target_node)
+                planned_path = self.env.low_level_controller.compute_bw_aware_path(current_pos, target_node)
+                if planned_path and len(planned_path) > 1:
+                    planned_path = planned_path[1:] + [target_node]
+                elif planned_path and len(planned_path) == 1:
+                    planned_path = [target_node]
+                else:
+                    planned_path = None
+                    self._unreachable_targets.add(target_node)
 
         while low_step < self.max_low_steps and not episode_done:
             if planned_path is not None and path_idx < len(planned_path):
@@ -181,7 +185,6 @@ class HRL_Coordinator:
             else:
                 low_mask = self.env.get_low_level_action_mask()
                 if sum(low_mask) == 0:
-                    logger.warning(f"⚠️ [Low] 无路可走 (Mask=0) at Node {self.env.current_node_location}")
                     low_level_stalled = True
                     break
                 _, low_action, _ = self.low_agent.select_action(
@@ -192,9 +195,9 @@ class HRL_Coordinator:
             next_state, reward, done, truncated_low, info = self.env.step_low_level(low_action)
             pos_after = self.env.current_node_location
 
-            # 无进展检测（位置没变且不是成功信号）
             is_success = info.get('dest_connected') or info.get('vnf_deployed') \
-                or info.get('all_vnf_deployed') or info.get('episode_complete')
+                         or info.get('all_vnf_deployed') or info.get('episode_complete')
+
             if pos_after == pos_before and not is_success:
                 no_progress_count += 1
                 failed_edge = info.get('edge')
@@ -203,7 +206,6 @@ class HRL_Coordinator:
             else:
                 no_progress_count = 0
 
-            # 路径受阻 → 排除失败边重规划（最多3次）
             if info.get('error') in ('no_bandwidth', 'resource_failure'):
                 if planned_path is not None:
                     replan_count += 1
@@ -217,27 +219,17 @@ class HRL_Coordinator:
                             if new_path and len(new_path) > 1:
                                 planned_path = new_path[1:] + [target_node]
                                 path_idx = 0
-                                logger.info(f"🔄 [PathGuide] 排除{len(blocked_edges)}条边，"
-                                            f"第{replan_count}次重规划: {len(planned_path)}步")
                             else:
-                                logger.warning(f"⚠️ [PathGuide] 排除边后无路径，回退RL")
                                 self._unreachable_targets.add(target_node)
                     else:
-                        logger.warning(f"⚠️ [PathGuide] 重规划{replan_count}次仍受阻，放弃路径引导")
                         planned_path = None
 
-            # 连续无进展 → 目标不可达，直接退出
             if no_progress_count >= 5:
-                logger.warning(f"⚠️ [Low] 连续{no_progress_count}步无进展 at {pos_after}，"
-                               f"目标{target_node}不可达，退出")
-
-                # 强制加入不可达列表并清空Agent缓存，防止高层死循环选中该节点
                 self._unreachable_targets.add(target_node)
                 if hasattr(self.high_agent, 'current_subgoal'):
                     self.high_agent.current_subgoal = None
                 if hasattr(self.high_agent, 'subgoal_steps'):
                     self.high_agent.subgoal_steps = getattr(self.high_agent, 'subgoal_horizon', 10) + 1
-
                 info['stuck'] = True
                 break
 
@@ -251,142 +243,110 @@ class HRL_Coordinator:
             low_state = next_state
             low_step += 1
 
-            # ----------------------------------------------------
-            # 终止条件检查
-            # ----------------------------------------------------
-            # 必须由 info 中的明确信号触发终止
             if info.get('subgoal_done', False):
-                logger.info(f"✅ [Coordinator] 检测到 Subgoal 完成信号")
-
-                # 即使完成了，也建议清空 Agent 缓存，防止下一轮还想回来
                 if hasattr(self.high_agent, 'current_subgoal'):
                     self.high_agent.current_subgoal = None
-
                 subgoal_achieved = True
                 break
 
             if info.get('goal_reached', False) or info.get('current_goal_satisfied', False):
-                logger.info(f"✅ [Coordinator] 检测到 Goal Reached 信号")
                 if hasattr(self.high_agent, 'current_subgoal'):
                     self.high_agent.current_subgoal = None
                 subgoal_achieved = True
                 break
 
-            # 🔥🔥🔥 [P0修复] 捕获 Low-Level 的阶段性成功信号
-            # dest_connected: 连接了一个（非最后）目的地
-            # vnf_deployed: 部署了一个（非最后）VNF
-            # all_vnf_deployed: 所有 VNF 部署完成
-            # episode_complete: 所有目的地已连接（Episode成功）
             if info.get('dest_connected', False) or info.get('vnf_deployed', False) \
                     or info.get('all_vnf_deployed', False):
-                # logger.info(f"✅ [Coordinator] 捕获阶段性成功信号: "
-                #             f"dest_connected={info.get('dest_connected', False)}, "
-                #             f"vnf_deployed={info.get('vnf_deployed', False)}, "
-                #             f"all_vnf={info.get('all_vnf_deployed', False)}")
                 if hasattr(self.high_agent, 'current_subgoal'):
                     self.high_agent.current_subgoal = None
                 subgoal_achieved = True
                 break
 
             if info.get('episode_complete', False) or info.get('all_destinations_connected', False):
-                logger.info(f"🎉 [Coordinator] 捕获 Episode 完成信号!")
                 if hasattr(self.high_agent, 'current_subgoal'):
                     self.high_agent.current_subgoal = None
                 subgoal_achieved = True
                 episode_done = True
                 break
 
-            # 🛑 [V53.0 关键修复] 移除暴力检测！
-            # ----------------------------------------------------------------------------------
-            # 原有的逻辑会检测 "current_loc == target_node" 且 "target_node in connected_dests"。
-            # 这会导致 Agent 只要路过目标节点（尚未执行 STAY/CONNECT），就会被判定为完成，
-            # 从而跳过了 LowLevelController 中至关重要的 "连接建立" 和 "奖励获取" 步骤。
-            # 这正是导致 "树冗余高" 和 "反复徘徊" 的核心原因。
-            #
-            # 已注释掉以下代码块：
-            # ----------------------------------------------------------------------------------
-            # current_loc = self.env.current_node_location
-            # if current_loc == target_node:
-            #     if hasattr(self.env, 'current_tree') and self.env.current_tree:
-            #         connected_dests = self.env.current_tree.get('connected_dests', set())
-            #         if target_node in connected_dests:
-            #             logger.info(f"✅ [Coordinator] 暴力检测: 节点 {target_node} 已在连接树中")
-            #             if hasattr(self.high_agent, 'current_subgoal'):
-            #                 self.high_agent.current_subgoal = None
-            #             subgoal_achieved = True
-            #             break
-            # ----------------------------------------------------------------------------------
-
             if done:
                 episode_done = True
             if truncated_low:
-                logger.info(f"📊 [Low] Cycle结束: 步数={low_step}, 退出原因=truncated, "
-                            f"info_keys={list(info.keys())}, pos={self.env.current_node_location}")
-                # 🔥 部署失败（非DC节点 / 资源不足）→ 标记为不可达，防止高层反复选它
                 if info.get('deploy_fail'):
-                    self._unreachable_targets.add(target_node)
-                    logger.warning(f"[Coordinator] 节点{target_node}部署失败，加入不可达列表")
+                    if not hasattr(self, '_permanent_unreachable'):
+                        self._permanent_unreachable = set()
+                    self._permanent_unreachable.add(target_node)
                 break
 
-        # ============================================================
-        # Phase 3: 奖励结算
-        # ============================================================
-        if low_step > 0 and not subgoal_achieved:
-            logger.info(f"📊 [Low] Cycle结束: 步数={low_step}, subgoal_achieved={subgoal_achieved}, "
-                        f"pos={self.env.current_node_location}")
-
-        # [关键修复] 卡死与超时检测：只要达到最大步数未完成，强制清空缓存并标记不可达
         actual_end_pos = self.env.current_node_location
         if low_step >= self.max_low_steps and not subgoal_achieved:
-            # 无论位置变没变，只要超时未完成，就强制清空HighAgent缓存
             if hasattr(self.high_agent, 'current_subgoal'):
                 self.high_agent.current_subgoal = None
             if hasattr(self.high_agent, 'subgoal_steps'):
                 self.high_agent.subgoal_steps = getattr(self.high_agent, 'subgoal_horizon', 10) + 1
 
-            # 核心：将超时无法到达的节点加入不可达列表，防止高层再次 Mask 选中
             self._unreachable_targets.add(target_node)
 
             if actual_end_pos == start_pos_before_low:
-                logger.error(f"⛔ [Stuck] Agent走了{low_step}步但位置未变 "
-                             f"(pos={actual_end_pos}, goal={target_node})，强制换目标")
                 info['stuck'] = True
-            else:
-                logger.warning(
-                    f"⏰ [Timeout] Agent耗尽步数未到达目标{target_node} (停在{actual_end_pos})，已标记不可达并换目标")
 
         high_done = episode_done
-        high_reward = self._compute_reward_from_env_info(info)
+
+        milestone_reward = self._compute_reward_from_env_info(info)
+        alpha = 0.05 if self.current_episode < 200 else 0.1
+        high_reward = milestone_reward + alpha * low_total_reward
+
+        if hasattr(self.env, 'low_level_controller') and \
+                hasattr(self.env.low_level_controller, '_calculate_tree_metrics'):
+
+            metrics = self.env.low_level_controller._calculate_tree_metrics()
+            current_redundancy = metrics.get('redundancy', 0.0)
+
+            if not hasattr(self, '_last_tree_redundancy'):
+                self._last_tree_redundancy = 0.0
+
+            delta_redundancy = current_redundancy - self._last_tree_redundancy
+            structure_penalty = -3.0 * delta_redundancy
+            high_reward += structure_penalty
+
+            self._last_tree_redundancy = current_redundancy
 
         if low_step == 0 or low_level_stalled or info.get('stuck', False):
-            logger.error(f"⛔ [Stall] 僵死检测触发 (stuck={info.get('stuck', False)})")
-            high_reward = -15.0
+            high_reward -= 15.0
             info['stalled'] = True
 
-        # 全局完成检测
         if not high_done and self.env.current_request:
             if hasattr(self.env, 'high_level_controller') and hasattr(self.env.high_level_controller,
                                                                       '_is_all_tasks_completed'):
                 try:
                     completed, status = self.env.high_level_controller._is_all_tasks_completed()
                     if completed:
-                        logger.info(f"✅ [High Check] 全局任务完成: {status}")
                         high_done = True
-                        high_reward = 30.0
+                        high_reward += 30.0
                         episode_done = True
                 except:
                     pass
 
         if training:
             high_next_state = None if high_done else self.env.get_state()
-            self._store_transition(
-                self.high_agent, high_obs, high_action_idx,
-                high_reward, high_next_state, high_done
-            )
+            # 直接调store_transition_high，避免通用路由误存到low_memory
+            if hasattr(self.high_agent, 'store_transition_high'):
+                self.high_agent.store_transition_high(
+                    high_obs, high_action_idx,
+                    high_reward, high_next_state, high_done
+                )
+            else:
+                self._store_transition(
+                    self.high_agent, high_obs, high_action_idx,
+                    high_reward, high_next_state, high_done
+                )
 
         self._update_stats(high_done, info)
 
-        return low_total_reward, high_done, {
+        if hasattr(self, '_unreachable_targets'):
+            self._unreachable_targets.clear()
+
+        return high_reward, high_done, {
             'high_action': high_action_idx,
             'target_node': target_node,
             'low_steps': low_step,
@@ -394,20 +354,23 @@ class HRL_Coordinator:
             'info': info
         }
 
-    # ... (run_episode, _fallback_success_check, _compute_reward_from_env_info, _store_transition, _update_stats, _reset_episode_stats, get_stats 保持不变) ...
     def run_episode(self, training=True, max_steps=100):
         self.current_episode += 1
         self.resources_released = False
 
-        logger.info(f"\n{'=' * 50}")
-        logger.info(f"📚 Episode {self.current_episode}")
-        logger.info(f"{'=' * 50}")
-
         high_obs = self.env.reset()
-        self._unreachable_targets = set()  # 每个 episode 清空
+
+        self._unreachable_targets = set()
+        self._permanent_unreachable = set()  # 每episode重置，不跨episode封禁节点
+        self._last_tree_redundancy = 0.0
+
         episode_done = False
         total_reward = 0.0
         total_steps = 0
+        no_progress_cycles = 0
+        last_connected_count = 0
+        last_vnf_count = 0
+        MAX_NO_PROGRESS = 5
 
         while not episode_done and total_steps < max_steps:
             cycle_reward, done, info = self.run_high_low_cycle(
@@ -417,6 +380,21 @@ class HRL_Coordinator:
             total_reward += cycle_reward
             total_steps += 1
             episode_done = done
+
+            cur_vnf = getattr(self.env, 'next_vnf_idx', 0)
+            cur_conn = len(self.env.current_tree.get('connected_dests', set())) if self.env.current_tree else 0
+            if cur_vnf > last_vnf_count or cur_conn > last_connected_count:
+                no_progress_cycles = 0
+                last_vnf_count = cur_vnf
+                last_connected_count = cur_conn
+            else:
+                no_progress_cycles += 1
+            if not episode_done and no_progress_cycles >= MAX_NO_PROGRESS:
+                logger.warning(f'[Coord] 连续{no_progress_cycles}个cycle无进展，终止(VNF={cur_vnf} Conn={cur_conn})')
+                total_reward -= 20.0
+                episode_done = True
+                info['fail'] = True
+                info['reason'] = 'no_progress'
 
             if not episode_done:
                 high_obs = self.env.get_state()
@@ -453,26 +431,42 @@ class HRL_Coordinator:
                     dest_success = len(connected_dests) >= len(dest_list)
 
         except Exception as e:
-            logger.error(f"❌ 结果判定异常: {e}")
             episode_success = False
 
         if episode_success:
-            logger.info(f"✅ [Episode Success] {completion_status}")
             self.resources_released = True
         else:
-            logger.info(f"❌ [Episode Fail] {completion_status}")
             try:
                 if (hasattr(self.env, 'resource_mgr') and
                         hasattr(self.env.resource_mgr, '_archive_request')):
                     self.env.resource_mgr._archive_request(
                         success=False, already_rolled_back=False)
-                    logger.debug("[Coordinator] 失败Episode资源已回滚")
             except Exception as e:
-                logger.error(f"[Coordinator] 资源回滚异常: {e}")
-
-        logger.info(f"📊 Summary: Steps={total_steps} | TotalReward={total_reward:.2f}")
+                pass
 
         self._reset_episode_stats()
+
+        # ── [VIS] 收集树快照供可视化使用 ──────────────────────────────────
+        tree_snapshot = None
+        try:
+            if hasattr(self.env, 'current_tree') and self.env.current_tree:
+                import copy
+                _t = self.env.current_tree
+                tree_snapshot = {
+                    'tree': dict(_t.get('tree', {})),
+                    'placement': copy.deepcopy(_t.get('placement', {})),
+                    'connected_dests': set(_t.get('connected_dests', set())),
+                }
+        except Exception:
+            pass
+        req_snapshot = None
+        try:
+            if hasattr(self.env, 'current_request') and self.env.current_request:
+                req_snapshot = dict(self.env.current_request)
+        except Exception:
+            pass
+        chain_snapshot = list(getattr(self.env, 'chain_nodes', []))
+        # ──────────────────────────────────────────────────────────────────
 
         return total_reward, {
             'steps': total_steps,
@@ -482,7 +476,10 @@ class HRL_Coordinator:
             'subgoals_fail': self.stats.get('subgoals_fail', 0),
             'vnf_success': vnf_success,
             'dest_success': dest_success,
-            'completion_status': completion_status
+            'completion_status': completion_status,
+            'tree_snapshot': tree_snapshot,
+            'req_snapshot': req_snapshot,
+            'chain_nodes': chain_snapshot,
         }
 
     def _fallback_success_check(self):
@@ -510,26 +507,17 @@ class HRL_Coordinator:
             return False
 
     def _compute_reward_from_env_info(self, info):
-        """
-        [P1修复] 完善奖励映射，确保所有里程碑事件都有对应奖励
-        """
         if not info: return 0.0
-        # Episode 完成（最高优先级）
         if info.get('episode_complete', False) or info.get('all_destinations_connected', False):
             return 30.0
-        # 所有 VNF 部署完成（里程碑）
         if info.get('all_vnf_deployed', False):
             return 25.0
-        # 单个 VNF 部署成功
         if info.get('vnf_deployed', False):
             return 20.0
-        # 单个目的地连接成功
         elif info.get('dest_connected', False):
             return 10.0
-        # 部署失败
         elif info.get('deploy_fail', False):
             return -10.0
-        # 超时
         elif info.get('timeout', False):
             return -5.0
         return 0.0
@@ -557,3 +545,127 @@ class HRL_Coordinator:
 
     def get_stats(self):
         return dict(self.stats)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎨  多播树可视化工具函数
+#     用法（训练结束后）：
+#       from core.hrl.HRL_Coordinator import visualize_multicast_trees
+#       visualize_multicast_trees(trees_data, save_path="multicast_trees_vis.png")
+#
+#     trees_data 格式（每个episode收集一条）：
+#       {
+#         'ep':      episode编号 (int),
+#         'success': 是否成功 (bool),
+#         'req':     req_snapshot (dict, from info['req_snapshot']),
+#         'tree':    tree_snapshot (dict, from info['tree_snapshot']),
+#         'chain':   chain_nodes (list, from info['chain_nodes']),
+#       }
+# ═══════════════════════════════════════════════════════════════════════════════
+def visualize_multicast_trees(trees_data, save_path="multicast_trees_vis.png",
+                               cols=5, rows=2, figsize=(22, 9)):
+    """
+    把 trees_data 列表里前 cols*rows 个episode的多播树画成网格图并保存。
+    每棵树中：绿色=源节点, 红色=目的地, 蓝色=VNF节点, 灰色=中间节点。
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import networkx as nx
+
+    n_show = min(len(trees_data), cols * rows)
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    axes = axes.flatten()
+
+    # 图例只画一次
+    legend_drawn = False
+
+    for idx in range(rows * cols):
+        ax = axes[idx]
+        if idx >= n_show:
+            ax.axis('off')
+            continue
+
+        data    = trees_data[idx]
+        req     = data.get('req') or {}
+        tree    = data.get('tree') or {}
+        ep      = data.get('ep', idx + 1)
+        success = data.get('success', False)
+        chain   = data.get('chain', [])
+
+        title_color = 'green' if success else 'red'
+        ax.set_title(f"Ep {ep} (" + ("Success" if success else "Fail") + ")",
+                     color=title_color, fontweight='bold', fontsize=9)
+
+        edges = list(tree.get('tree', {}).keys())
+        if not edges:
+            ax.text(0.5, 0.5, "No Tree", ha='center', va='center',
+                    color='gray', fontsize=10)
+            ax.axis('off')
+            continue
+
+        G = nx.Graph()
+        G.add_edges_from(edges)
+
+        source = req.get('source')
+        dests  = [int(d) for d in req.get('dest', [])]
+
+        # VNF节点：优先用 chain_nodes，fallback用 placement
+        if chain:
+            vnf_nodes = list(chain)
+        else:
+            vnf_nodes = []
+            placement = tree.get('placement', {})
+            for p_k, p_v in placement.items():
+                if isinstance(p_v, dict) and 'node' in p_v:
+                    vnf_nodes.append(p_v['node'])
+                elif isinstance(p_k, tuple) and len(p_k) > 0:
+                    vnf_nodes.append(p_k[0])
+
+        try:
+            pos = nx.spring_layout(G, seed=42)
+        except Exception:
+            pos = nx.random_layout(G)
+
+        all_nodes  = list(G.nodes())
+        gray_nodes = [n for n in all_nodes
+                      if n != source and n not in dests and n not in vnf_nodes]
+
+        # 画各类节点
+        if gray_nodes:
+            nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=gray_nodes,
+                                   node_color='#bdc3c7', node_size=260)
+        vnf_in_G = [v for v in vnf_nodes if v in G.nodes()]
+        if vnf_in_G:
+            nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=vnf_in_G,
+                                   node_color='#3498db', node_size=320,
+                                   edgecolors='#2980b9', linewidths=1.5)
+        dest_in_G = [d for d in dests if d in G.nodes()]
+        if dest_in_G:
+            nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=dest_in_G,
+                                   node_color='#e74c3c', node_size=340,
+                                   edgecolors='#c0392b', linewidths=1.5)
+        if source is not None and source in G.nodes():
+            nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=[source],
+                                   node_color='#2ecc71', node_size=380,
+                                   edgecolors='#27ae60', linewidths=2)
+
+        nx.draw_networkx_edges(G, pos, ax=ax, width=1.4,
+                               edge_color='#7f8c8d', alpha=0.8)
+        nx.draw_networkx_labels(G, pos, ax=ax, font_size=7, font_weight='bold')
+
+        if not legend_drawn:
+            ax.plot([], [], 'o', color='#2ecc71', label='Source', markersize=8)
+            ax.plot([], [], 'o', color='#e74c3c', label='Dest',   markersize=8)
+            ax.plot([], [], 'o', color='#3498db', label='VNF',    markersize=8)
+            ax.legend(loc='upper left', fontsize=7, markerscale=0.9,
+                      framealpha=0.8)
+            legend_drawn = True
+
+        ax.axis('off')
+
+    plt.suptitle("Multicast Trees Visualization", fontsize=13, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✅ 多播树可视化已保存: {save_path}")
+    return save_path

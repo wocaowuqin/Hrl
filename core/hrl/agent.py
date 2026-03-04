@@ -145,21 +145,21 @@ class HRLAgent:
         epsilon_cfg = training_cfg.get('epsilon', {})
 
         self.epsilon_high_start = float(epsilon_cfg.get('initial_high', epsilon_cfg.get('initial', 0.3)))
-        self.epsilon_high_end = float(epsilon_cfg.get('final_high', epsilon_cfg.get('final', 0.05)))
+        self.epsilon_high_end = float(epsilon_cfg.get('final_high', epsilon_cfg.get('final', 0.10)))
         self.epsilon_high = self.epsilon_high_start
 
         self.epsilon_low_start = float(epsilon_cfg.get('initial_low', epsilon_cfg.get('initial', 0.3)))
-        self.epsilon_low_end = float(epsilon_cfg.get('final_low', epsilon_cfg.get('final', 0.05)))
+        self.epsilon_low_end = float(epsilon_cfg.get('final_low', epsilon_cfg.get('final', 0.10)))
         self.epsilon_low = self.epsilon_low_start
 
-        self.epsilon_decay = float(epsilon_cfg.get('decay_steps', 50000))
+        self.epsilon_decay = float(epsilon_cfg.get('decay_steps', 200000))
 
         # ============================================
         # 经验回放
         # ============================================
         buffer_size = int(training_cfg.get('buffer_size', 50000))
 
-        self.high_memory = deque(maxlen=buffer_size // 10)
+        self.high_memory = deque(maxlen=buffer_size // 5)
         self.low_memory = deque(maxlen=buffer_size)
 
         # ============================================
@@ -255,22 +255,11 @@ class HRLAgent:
                 info['subgoal'] = self.current_subgoal
                 info['source'] = 'agent_high'
 
-                # 强制起点
+                # 只读取当前位置，不修改（位置由low_level_controller管理）
                 try:
-                    if self.env is not None and hasattr(self.env, 'current_request') and self.env.current_request:
-                        source_node = self.env.current_request.get('source', 0)
-                    else:
-                        source_node = 0
-
-                    if hasattr(self.env, 'current_node_location'):
-                        self.env.current_node_location = int(source_node)
-
-                    start_node = int(source_node)
+                    start_node = int(self.env.current_node_location) if hasattr(self.env, 'current_node_location') else 0
                 except Exception:
                     start_node = 0
-                    if hasattr(self.env, 'current_node_location'):
-                        self.env.current_node_location = 0
-
                 info['start_node'] = start_node
 
             # ============================================
@@ -835,10 +824,12 @@ class HRLAgent:
             elif goal < 0:
                 goal_idx = 0  # 默认值
 
+        # 高层reward缩放，防止Q值/Loss爆炸
+        scaled_reward = max(-10.0, min(15.0, reward * 0.1))
         self.high_memory.append({
             'state': state,
-            'goal': goal_idx,  # ✅ 存储修正后的索引
-            'reward': reward,
+            'goal': goal_idx,
+            'reward': scaled_reward,
             'next_state': next_state,
             'done': done
         })
@@ -881,8 +872,15 @@ class HRLAgent:
         self.steps_done += 1  # 驱动 ε 衰减
 
         # 缓冲区监控 (调试用)
-        if len(self.low_memory) % 5000 == 0:
-            logger.info(f"📊 Low Buffer Size: {len(self.low_memory)}")
+        # [FIX] 原 % 5000==0：buffer满后每步都打印，淹没有效日志。
+        # 改为：未满时每1万条打一次，满了只打一次。
+        _buf_len = len(self.low_memory)
+        _buf_max = self.low_memory.maxlen or 0
+        if _buf_len < _buf_max and _buf_len % 10000 == 0 and _buf_len > 0:
+            logger.info(f"📊 Low Buffer: {_buf_len}/{_buf_max}")
+        elif _buf_max > 0 and _buf_len >= _buf_max and not getattr(self, '_low_buf_full_logged', False):
+            logger.info(f"📊 Low Buffer已满: {_buf_len}/{_buf_max}")
+            self._low_buf_full_logged = True
 
     # ============================================
     # 向后兼容：保留旧接口
@@ -990,7 +988,7 @@ class HRLAgent:
                 target_q = rewards + (1 - dones) * self.gamma * next_q
 
                 # 🔥 限制目标Q值范围
-                target_q = torch.clamp(target_q, -10.0, 50.0)
+                target_q = torch.clamp(target_q, -15.0, 20.0)
 
             # 6. 计算 Loss & 更新
             # 🔥 使用Huber Loss提高稳定性

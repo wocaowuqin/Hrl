@@ -1,15 +1,13 @@
 """
 envs/modules/low_level_controller.py
 ====================================
-低层执行控制器 - 路径收敛优化版
+低层执行控制器 - 强制SFC状态机优化版
 ====================================
-优化清单:
-  [1] binary mask (去掉2.0)
-  [2] 距离引导 reward（核心）
-  [3] 步数递增惩罚
-  [4] 到达奖励与步数挂钩
-  [5] 防绕圈递增惩罚
-  [6] max_subgoal_steps 默认25
+架构级修复:
+  [1] 强制主干顺序: 记录 chain_nodes，锁定上游拓扑(排除误入节点)
+  [2] 尾端多播分叉: 强制所有 Destination 必须从 last_vnf 重新出发，切断串联
+  [3] 共享边复用: 多播复用边不扣带宽，且增加 tree_usage 记录引用次数
+  [4] 奖励重塑: +100(完成), -10(资源/无路), -5(过长/超时)
 """
 
 import numpy as np
@@ -23,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class LowLevelController:
-    """低层执行控制器 - 路径收敛优化版"""
+    """低层执行控制器 - 强制SFC状态机优化版"""
 
     def __init__(self, env):
         self.env = env
@@ -51,13 +49,12 @@ class LowLevelController:
         self._hop_dist_cache = None
         self._build_hop_distance_cache()
 
-        logger.info("✅ [LowLevelController] 初始化完成（路径收敛优化版）")
+        logger.info("✅ [LowLevelController] 初始化完成（强制SFC状态机优化版）")
 
     # ==================================================================
     # Hop Distance 缓存
     # ==================================================================
     def _build_hop_distance_cache(self):
-        """用networkx预计算全对最短路径，避免每步重复计算"""
         try:
             n = self.env.n
             G = nx.Graph()
@@ -72,7 +69,6 @@ class LowLevelController:
             self._hop_dist_cache = None
 
     def _get_hop_distance(self, u, v):
-        """获取两节点间最短跳数"""
         if u == v:
             return 0
         if self._hop_dist_cache is not None:
@@ -90,11 +86,6 @@ class LowLevelController:
             return 9999
 
     def compute_bw_aware_path(self, source, target, excluded_edges=None):
-        """
-        带宽感知最短路径：优先复用已建树边，其次选带宽充足的新边
-        excluded_edges: set of edge tuples to exclude (used after failed attempts)
-        返回: 路径节点列表 [source, ..., target] 或 None（不可达）
-        """
         if source == target:
             return [source]
 
@@ -105,46 +96,32 @@ class LowLevelController:
         if self.env.current_request:
             bw_req = self.env.current_request.get('bw_origin', 0.0)
 
-        # 获取已建树边集合
         tree_edges = set()
         if hasattr(self.env, 'current_tree') and self.env.current_tree:
             for edge_key in self.env.current_tree.get('tree', {}).keys():
                 tree_edges.add(edge_key)
 
-        # 构建带权图
         G = nx.Graph()
         for u in range(self.env.n):
             for v in self.env.resource_mgr.get_neighbors(u):
                 edge_key = tuple(sorted((u, v)))
-                # 排除已知失败边
                 if edge_key in excluded_edges:
                     continue
                 if edge_key in tree_edges:
-                    G.add_edge(u, v, weight=0.1)
+                    G.add_edge(u, v, weight=0.1) # 共享边代价极低，鼓励复用
                 else:
                     avail_bw = self.env.resource_mgr.pool.get_available_bandwidth(u, v)
-                    # 使用 1.01x 余量，防止浮点精度导致规划/执行不一致
                     if avail_bw >= bw_req * 1.01:
                         G.add_edge(u, v, weight=1.0)
 
-        # 🔥 修复: 先检查 source/target 是否在图里
-        #    当节点的所有邻边 BW 都耗尽时，该节点不会被加入 G
-        #    此时直接返回 None（BW 不足不可达），而不是抛出异常
-        if source not in G:
-            logger.debug(f"⚠️ [PathFind] source={source} 所有邻边BW不足，不可达")
-            return None
-        if target not in G:
-            logger.debug(f"⚠️ [PathFind] target={target} 所有邻边BW不足，不可达")
+        if source not in G or target not in G:
             return None
 
         try:
-            path = nx.shortest_path(G, source, target, weight='weight')
-            return path
+            return nx.shortest_path(G, source, target, weight='weight')
         except nx.NetworkXNoPath:
-            logger.debug(f"⚠️ [PathFind] 无可达路径: {source} → {target} (bw_req={bw_req})")
             return None
         except Exception as e:
-            logger.warning(f"⚠️ [PathFind] 路径计算异常: {e}")
             return None
 
     # ==================================================================
@@ -156,14 +133,36 @@ class LowLevelController:
 
         if not hasattr(self.env, 'subgoal_step_count'):
             self.env.subgoal_step_count = 0
+
+        # 全局失败计数：连续低层超时/无进展次数
+        if not hasattr(self.env, '_consecutive_timeout_count'):
+            self.env._consecutive_timeout_count = 0
+        if not hasattr(self.env, '_bw_fail_count'):
+            self.env._bw_fail_count = 0
+
+        # 🔥 约束2前置防线：仅在子目标刚切换（_need_reset_to_last_vnf标志）时执行一次回位
+        # ⚠️ 不再依赖 subgoal_step_count==0，避免Coordinator重置计数时反复触发瞬移
+        if self.env.current_phase == 'destination_connection' and \
+                getattr(self.env, '_need_reset_to_last_vnf', False):
+            if hasattr(self.env, 'chain_nodes') and len(self.env.chain_nodes) > 0:
+                last_vnf = self.env.chain_nodes[-1]
+                if self.env.current_node_location != last_vnf:
+                    # ── [FIX 树长] 重新启用瞬移回位 ───────────────────────────
+                    # 原来注释掉导致每个目的地各走独立路径，5dest×5跳≈28条边全图遍历。
+                    # 启用后每次从last_vnf出发，复用已有路径分叉，预期树长降至8~14。
+                    self.env.current_node_location = last_vnf
+                    logger.debug(f"🔄 [Low] 瞬移回位至last_vnf={last_vnf}")
+                    if hasattr(self.env, 'current_path_trace'):
+                        self.env.current_path_trace = []
+                    # ─────────────────────────────────────────────────────────
+            self.env._need_reset_to_last_vnf = False  # 消费flag，只执行一次
+
         self.env.subgoal_step_count += 1
 
         current_node = self.env.current_node_location
         target_action = int(action)
         is_stay = (target_action == current_node)
 
-        # [关键修复] 到达目标的STAY优先于超时检查
-        # 如果Agent已经在目标节点且执行STAY，即使超出步数也应该完成连接/部署
         at_target = False
         if is_stay:
             if self.env.current_phase == 'vnf_deployment':
@@ -172,12 +171,65 @@ class LowLevelController:
                 at_target = (current_node == getattr(self.env, 'current_target_node', None))
 
         if not at_target and self.env.subgoal_step_count > getattr(self.env, 'max_subgoal_steps', 25):
-            # 不在目标节点，真正超时
             self.env.subgoal_step_count = 0
-            logger.warning(f"⏰ [Low] Subgoal超时 at Node {current_node}, "
-                           f"phase={self.env.current_phase}, target="
-                           f"{getattr(self.env, 'current_target_node', None) or getattr(self.env, 'current_deployment_target', None)}")
-            return self.get_state(), -1.0, False, True, {'timeout': True}
+            self.env._need_reset_to_last_vnf = False
+            self.env._consecutive_timeout_count += 1
+
+            # ── [DIAG] 超时时打印关键导航信息 ────────────────────────────────
+            _ph = getattr(self.env, 'current_phase', '?')
+            _tgt = (getattr(self.env, 'current_deployment_target', None)
+                    if _ph == 'vnf_deployment'
+                    else getattr(self.env, 'current_target_node', None))
+            _dist = self._get_hop_distance(current_node, _tgt) if _tgt is not None else '?'
+            _conn = len(self.env.current_tree.get('connected_dests', set())) if self.env.current_tree else 0
+            _alld = len(self.env.current_request.get('dest', [])) if self.env.current_request else 0
+            _max_steps = getattr(self.env, 'max_subgoal_steps', 25)
+            logger.warning(
+                f"⏰ [Low] 超时 at Node {current_node} "
+                f"(连续超时: {self.env._consecutive_timeout_count}次) | "
+                f"phase={_ph} target={_tgt} hop_dist={_dist} "
+                f"steps_limit={_max_steps} dest_progress={_conn}/{_alld}"
+            )
+            # ─────────────────────────────────────────────────────────────
+
+            if self.env._consecutive_timeout_count >= 3:
+                # ── [DIAG] 失败时打印完整状态快照，区分是超时问题还是资源问题 ──
+                _vt = len(self.env.current_request.get('vnf', [])) if self.env.current_request else 0
+                _vd = getattr(self.env, 'next_vnf_idx', 0)
+                _dt = len(self.env.current_request.get('dest', [])) if self.env.current_request else 0
+                _dc_conn = len(self.env.current_tree.get('connected_dests', set())) if self.env.current_tree else 0
+                try:
+                    _dc_tensions = {
+                        n: round(1.0 - self.env.resource_mgr.pool.get_available_cpu(n) / 100.0, 2)
+                        for n in getattr(self.env, 'dc_nodes', [])
+                    }
+                except Exception:
+                    _dc_tensions = {}
+                try:
+                    _bw_tensions = {}
+                    if _tgt is not None:
+                        neighbors = self.env.resource_mgr.get_neighbors(current_node)
+                        bw_req = self.env.current_request.get('bw_origin', 0.0) if self.env.current_request else 0.0
+                        _bw_tensions = {
+                            nbr: round(self.env.resource_mgr.pool.get_available_bandwidth(current_node, nbr), 1)
+                            for nbr in neighbors
+                        }
+                except Exception:
+                    _bw_tensions = {}
+                logger.warning(
+                    f"❌ [Low] 连续超时{self.env._consecutive_timeout_count}次，Episode失败 | "
+                    f"VNF={_vd}/{_vt} Dest={_dc_conn}/{_dt} | "
+                    f"phase={_ph} cur={current_node} target={_tgt} hop_dist={_dist} | "
+                    f"max_subgoal_steps={_max_steps} | "
+                    f"DC资源紧张度={_dc_tensions} | "
+                    f"邻居可用带宽={_bw_tensions}"
+                )
+                # ─────────────────────────────────────────────────────────
+                self.env._consecutive_timeout_count = 0
+                return self.get_state(), -20.0, True, False, {
+                    'fail': True, 'reason': 'consecutive_timeout'
+                }
+            return self.get_state(), -5.0, False, True, {'timeout': True}
 
         if self.env.current_phase == 'vnf_deployment':
             return self._handle_vnf_deployment(current_node, target_action, is_stay)
@@ -209,11 +261,20 @@ class LowLevelController:
                 deploy_success = self.env._try_deploy(target_goal)
 
             if deploy_success:
+                self.env._consecutive_timeout_count = 0  # VNF部署成功，清零超时计数
+                if not hasattr(self.env, 'chain_nodes'):
+                    self.env.chain_nodes = []
+                self.env.chain_nodes.append(current_node)
+
                 self.env.next_vnf_idx += 1
                 vnf_list = self.env.current_request.get('vnf', [])
                 current_count = self.env.next_vnf_idx
 
                 if current_count >= len(vnf_list):
+                    # 🔥 修复致命漏洞1：只封印真正的主干节点，不再封印 nodes_on_tree
+                    # 将 Source 到 VNF(k-1) 彻底锁死
+                    self.env.sfc_upstream_nodes = set(self.env.chain_nodes[:-1])
+
                     info = {'phase': 'vnf_complete', 'all_vnf_deployed': True,
                             'deployed_count': current_count, 'total_vnf': len(vnf_list)}
                     self._reset_vnf_phase_only()
@@ -223,15 +284,30 @@ class LowLevelController:
                             'deployed_count': current_count, 'total_vnf': len(vnf_list)}
                     return self.get_state(), 10.0, False, True, info
             else:
+                try:
+                    avail_cpu = self.env.resource_mgr.pool.get_available_cpu(target_goal)
+                    avail_mem = self.env.resource_mgr.pool.get_available_memory(target_goal)
+                except Exception:
+                    avail_cpu, avail_mem = 0.0, 0.0
+                self.env._consecutive_timeout_count = getattr(self.env, '_consecutive_timeout_count', 0) + 1
+                logger.warning(
+                    f"❌ [Low] VNF部署失败 节点{target_goal}: "
+                    f"CPU可用={avail_cpu:.1f} MEM可用={avail_mem:.1f} "
+                    f"(连续失败:{self.env._consecutive_timeout_count}次)"
+                )
                 info = {'deploy_fail': True, 'vnf_idx': self.env.next_vnf_idx,
-                        'reason': 'resource_insufficient'}
+                        'reason': 'resource_insufficient',
+                        'avail_cpu': avail_cpu, 'avail_mem': avail_mem}
                 self._reset_vnf_phase_only()
+                if self.env._consecutive_timeout_count >= 3:
+                    self.env._consecutive_timeout_count = 0
+                    return self.get_state(), -20.0, True, False, {**info, 'fail': True}
                 return self.get_state(), -5.0, False, True, info
         else:
             return self.get_state(), -0.5, False, False, {'warning': 'wait_for_stay'}
 
     # ==================================================================
-    # 目的地连接（到达奖励与步数挂钩）
+    # 目的地连接
     # ==================================================================
     def _handle_destination_connection(self, current_node, target_action, is_stay):
         target_goal = getattr(self.env, 'current_target_node', None)
@@ -246,9 +322,16 @@ class LowLevelController:
             if target_goal not in self.env.current_tree['connected_dests']:
                 self.env.current_tree['connected_dests'].add(target_goal)
 
-            # 🔥 到达奖励与步数挂钩：走得越快奖励越高
             steps_used = getattr(self.env, 'subgoal_step_count', 50)
-            step_reward = max(20.0 - steps_used * 0.5, 5.0)
+            # ── [FIX 树长1] 加大步数惩罚：每多走1步超出最短路就扣1.5分，允许负奖励
+            # 原来 max(20-steps*0.5, 5)，40步仍得5分，绕路代价几乎为零。
+            _tgt_node = getattr(self.env, 'current_target_node', None)
+            if _tgt_node is not None:
+                _min_hops = self._get_hop_distance(self.env.current_node_location, _tgt_node) + 1
+            else:
+                _min_hops = 1
+            step_reward = max(20.0 - max(0, steps_used - _min_hops) * 1.5, -5.0)
+            # ──────────────────────────────────────────────────────────────────
 
             try:
                 all_dests = set(int(x) for x in self.env.current_request.get('dest', []))
@@ -257,34 +340,102 @@ class LowLevelController:
                 all_dests, connected = set(), set()
 
             if all_dests.issubset(connected) and len(all_dests) > 0:
-                logger.info("✅ [Episode完成] 所有目的地已连接")
+                logger.info(
+                    f"✅ [Episode完成] 所有目的地已连接，生成合法多播树！"
+                    f" connected={len(connected)}/{len(all_dests)} steps_used={steps_used}"
+                )
+                self.env._consecutive_timeout_count = 0
+                self.env._bw_fail_count = 0
                 self._archive_episode_success_only()
                 self._add_request_to_lifecycle_manager()
-                return self.get_state(), 50.0, True, False, {
+
+                # ── [SFC验证] 检查chain_nodes数量和source可达性 ──────────────
+                _chain = getattr(self.env, 'chain_nodes', [])
+                _tree = self.env.current_tree.get('tree', {})
+                _src = self.env.current_request.get('source', None)
+                _vnf_list = self.env.current_request.get('vnf', [])
+                _sfc_ok = True
+                try:
+                    if _chain and _tree and _src is not None:
+                        import networkx as _nx
+                        _G = _nx.Graph()
+                        for (u, v) in _tree.keys():
+                            _G.add_edge(u, v)
+                        # 验证1: chain长度 == VNF数量
+                        if len(_chain) != len(_vnf_list):
+                            _sfc_ok = False
+                            logger.warning(
+                                f"⚠️ [SFC违规] chain长度={len(_chain)} ≠ VNF数量={len(_vnf_list)}"
+                                f" chain={_chain}"
+                            )
+                        # 验证2: source和每个VNF节点都在图里且可达
+                        for _vnf_node in _chain:
+                            if _vnf_node not in _G or _src not in _G:
+                                _sfc_ok = False
+                                logger.warning(
+                                    f"⚠️ [SFC违规] source={_src}或VNF={_vnf_node}不在树中"
+                                    f" G.nodes={list(_G.nodes)}"
+                                )
+                            elif not _nx.has_path(_G, _src, _vnf_node):
+                                _sfc_ok = False
+                                logger.warning(
+                                    f"⚠️ [SFC违规] source={_src}→VNF={_vnf_node}不可达"
+                                )
+                    # 验证3: 每条Source→Dest路径是否依次经过全部VNF
+                    if _sfc_ok and _src in _G:
+                        _dests = [int(d) for d in self.env.current_request.get('dest', [])]
+                        for _d in _dests:
+                            if _d not in _G:
+                                continue
+                            try:
+                                _path = _nx.shortest_path(_G, _src, _d)
+                                _vnf_hit = [v for v in _chain if v in _path]
+                                _all_hit = all(v in _path for v in _chain)
+                                # 检查顺序：VNF在路径上的index必须按chain顺序递增
+                                if _all_hit:
+                                    _idxs = [_path.index(v) for v in _chain]
+                                    _order_ok = _idxs == sorted(_idxs)
+                                else:
+                                    _order_ok = False
+                                if _all_hit and _order_ok:
+                                    logger.info(f"✅ [SFC路径] src={_src}→dst={_d}: {_path} VNF={_chain} ✓")
+                                else:
+                                    logger.warning(f"⚠️ [SFC路径违规] src={_src}→dst={_d}: {_path} | 命中VNF={_vnf_hit} 应有={_chain} 顺序={'✓' if _order_ok else '✗'}")
+                                    _sfc_ok = False
+                            except Exception:
+                                pass
+                    if _sfc_ok:
+                        logger.info(f"✅ [SFC验证通过] chain={_chain} source={_src}")
+                except Exception as _e:
+                    logger.debug(f"[SFC验证] 跳过（异常）: {_e}")
+                # ─────────────────────────────────────────────────────────────
+
+                return self.get_state(), 100.0, True, False, {
                     'episode_complete': True, 'all_destinations_connected': True,
-                    'success': True, 'connected_count': len(connected)
+                    'success': True, 'connected_count': len(connected),
+                    'sfc_valid': _sfc_ok, 'chain_nodes': _chain
                 }
             else:
                 self.env.subgoal_step_count = 0
                 self.env.current_target_node = None
+
+                # 🔥 约束2核心防线：当前目标连接完成，设置flag通知下一个子目标开始时回切到 last_vnf
+                # ⚠️ 不在此处直接瞬移，由step_low_level入口的flag逻辑执行，防止时序错误
+                if hasattr(self.env, 'chain_nodes') and len(self.env.chain_nodes) > 0:
+                    self.env._need_reset_to_last_vnf = True
+                if hasattr(self.env, 'current_path_trace'):
+                    self.env.current_path_trace = []
+
                 return self.get_state(), step_reward, False, True, {'dest_connected': True}
         else:
             return self.get_state(), -0.5, False, False, {'warning': 'wait_for_stay'}
 
     # ==================================================================
-    # 移动处理（距离引导 + 步数递增 + 防绕圈）
+    # 移动处理（带共享边奖励逻辑）
     # ==================================================================
     def _handle_movement(self, current_node, target_action, target_goal):
-        """
-        收敛强化版:
-        1. 新边 -0.3 / 复用 -0.05
-        2. 距离引导 ±0.6*delta（核心）
-        3. 步数递增惩罚
-        4. 绕圈递增惩罚
-        """
         next_node = int(target_action)
 
-        # 原地不动
         if next_node == current_node:
             if current_node != target_goal:
                 neighbors = self.env.resource_mgr.get_neighbors(current_node)
@@ -292,57 +443,87 @@ class LowLevelController:
                 valid_neighbors = [n for n in neighbors if
                                    self.env.resource_mgr.pool.get_available_bandwidth(current_node, n) >= bw_req]
                 if not valid_neighbors:
+                    # 🔥 奖励修正: -10 资源耗尽导致的困境死锁
                     return self.get_state(), -10.0, True, False, {'error': 'trapped'}
                 return self.get_state(), -1.0, False, False, {'warning': 'stay'}
 
-        # 带宽检查
         bw_req = self.env.current_request.get('bw_origin', 0.0)
         edge_key = tuple(sorted((current_node, next_node)))
+
+        # 🔥 约束4落实: 严格区分新边和共享边
         is_new_edge = edge_key not in self.env.current_tree.get('tree', {})
 
         if is_new_edge:
-            # 新边：必须检查带宽
             try:
-                has_bw = self.env.resource_mgr.pool.get_available_bandwidth(current_node, next_node) >= bw_req
+                avail_bw = self.env.resource_mgr.pool.get_available_bandwidth(current_node, next_node)
+                has_bw = avail_bw >= bw_req
             except:
                 has_bw = False
+                avail_bw = 0.0
             if not has_bw:
+                self.env._bw_fail_count = getattr(self.env, '_bw_fail_count', 0) + 1
+                # ── [DIAG] 带宽不足：记录目标距离，判断是绕路难还是带宽真的耗尽 ──
+                _dist_via_next = self._get_hop_distance(next_node, target_goal) if target_goal is not None else '?'
+                _dist_cur = self._get_hop_distance(current_node, target_goal) if target_goal is not None else '?'
+                logger.debug(
+                    f"⚠️ [Low.BW] 带宽不足 {current_node}→{next_node} | "
+                    f"需={bw_req:.1f} 可用={avail_bw:.1f} | "
+                    f"target={target_goal} cur_dist={_dist_cur} next_dist={_dist_via_next} | "
+                    f"bw_fail_count={self.env._bw_fail_count}"
+                )
+                # ─────────────────────────────────────────────────────────
+                if self.env._bw_fail_count >= 10:
+                    logger.warning(
+                        f"❌ [Low] 带宽连续失败{self.env._bw_fail_count}次，Episode失败 | "
+                        f"cur={current_node} target={target_goal} bw_req={bw_req:.1f}"
+                    )
+                    self.env._bw_fail_count = 0
+                    return self.get_state(), -20.0, True, False, {
+                        'fail': True, 'reason': 'bandwidth_exhausted',
+                        'required_bw': bw_req, 'available_bw': avail_bw
+                    }
                 return self.get_state(), -2.0, False, False, {'error': 'no_bandwidth', 'edge': (current_node, next_node)}
-        # 已建树边：带宽已在首次建边时分配，复用免检
 
-        # [1] 新旧边奖励
+        # 🔥 鼓励共享边: 共享边 0 惩罚，新边加大惩罚防止乱走
+        # ── [FIX 树长2] 新边惩罚从 -0.5 加强到 -1.2
+        # 原来距离奖励 +0.6 就能完全抵消 -0.5，agent 不在乎多走新边。
         if is_new_edge:
-            reward = -0.3
+            reward = -1.2
             action_type = "NewPath"
         else:
-            reward = -0.05
+            reward = 0.0
             action_type = "Reuse"
 
-        # [2] 距离引导（最关键）
         if target_goal is not None:
             try:
                 dist_before = self._get_hop_distance(current_node, target_goal)
                 dist_after = self._get_hop_distance(next_node, target_goal)
                 if dist_before < 9999 and dist_after < 9999:
-                    delta = dist_before - dist_after  # 正=靠近目标
+                    delta = dist_before - dist_after
                     reward += 0.6 * delta
             except:
                 pass
 
-        # [3] 步数递增惩罚
         if not hasattr(self.env, 'current_path_trace'):
             self.env.current_path_trace = []
         step_count = len(self.env.current_path_trace)
+        # 防止利用复用边(0惩罚)无限刷距离奖励，引入随步数增长的硬性微小惩罚
         reward += -0.05 * (step_count / 10.0)
 
-        # [4] 绕圈递增惩罚
+        # ── [FIX] 强化兜圈惩罚 ───────────────────────────────────────────
+        # 原来 -0.8*visit_count 太弱，复用边 reward=0 加距离奖励可以完全抵消，
+        # 导致 hop_dist=2 时仍然兜圈 40 步超时（EP610/611/614 等大量此类失败）。
         recent_window = self.env.current_path_trace[-15:]
         visit_count = recent_window.count(next_node)
         if visit_count >= 2:
-            reward += -0.8 * visit_count
+            reward += -2.0 * visit_count  # 从 -0.8 加强到 -2.0
+        elif visit_count == 1:
+            reward += -0.5               # 第一次重复也给轻惩罚，鼓励探索新路
+        # ─────────────────────────────────────────────────────────────────
 
-        # 物理状态更新
         self.env.current_node_location = next_node
+
+        # 🔥 共享边不重复计费，且添加 tree_usage 作为引用计数扩展
         if is_new_edge:
             self.env.resource_mgr.allocate_bandwidth(current_node, next_node, bw_req)
             if 'tree' not in self.env.current_tree:
@@ -351,12 +532,17 @@ class LowLevelController:
             self.env.nodes_on_tree.add(current_node)
             self.env.nodes_on_tree.add(next_node)
 
+        # 记录边引用次数（为后续按次释放做结构准备）
+        if 'tree_usage' not in self.env.current_tree:
+            self.env.current_tree['tree_usage'] = {}
+        self.env.current_tree['tree_usage'][edge_key] = self.env.current_tree['tree_usage'].get(edge_key, 0) + 1
+
         self.env.current_path_trace.append(next_node)
 
         return self.get_state(), reward, False, False, {'moved': True, 'type': action_type}
 
     # ==================================================================
-    # 动作掩码 (binary mask)
+    # 动作掩码 (强制主干不回流)
     # ==================================================================
     def get_low_level_action_mask(self):
         mask = np.zeros(self.env.n, dtype=np.float32)
@@ -367,7 +553,6 @@ class LowLevelController:
         if self.env.current_request:
             bw_req = self.env.current_request.get('bw_origin', 0.0)
 
-        # 获取已建树边（复用已建树边不需要额外带宽）
         tree_edges = set()
         if hasattr(self.env, 'current_tree') and self.env.current_tree:
             for edge_key in self.env.current_tree.get('tree', {}).keys():
@@ -378,10 +563,8 @@ class LowLevelController:
         for nbr in neighbors:
             edge_key = tuple(sorted((current, nbr)))
             if edge_key in tree_edges:
-                # 已建树边：免费复用，始终可走
-                mask[nbr] = 1.0
+                mask[nbr] = 1.0 # 复用边无条件开放
             else:
-                # 新边：需要检查带宽
                 avail_bw = self.env.resource_mgr.pool.get_available_bandwidth(current, nbr)
                 if avail_bw >= bw_req:
                     mask[nbr] = 1.0
@@ -393,11 +576,24 @@ class LowLevelController:
             target = getattr(self.env, 'current_target_node', None)
 
         if target is not None and current == target:
+            # ── [FIX] 已到达目标节点：强制只允许 stay，完全屏蔽所有邻居 ──────
+            # 原逻辑：mask[current]=1 但邻居也全开着，agent 学不会"到了就停"，
+            # 导致 hop_dist=0 时仍然乱走直到超时（EP612 等大量此类失败）。
+            mask[:] = 0.0
             mask[current] = 1.0
+            return mask
+            # ─────────────────────────────────────────────────────────────
         else:
             mask[current] = 0.0
+            # ── [FIX] 目标恰好在1跳邻居时，强制只开放该邻居，防止绕路兜圈 ──
+            if target is not None:
+                dist_to_target = self._get_hop_distance(current, target)
+                if dist_to_target == 1 and 0 <= target < len(mask) and mask[target] > 0:
+                    mask[:] = 0.0
+                    mask[target] = 1.0
+                    return mask
+            # ───────────────────────────────────────────────────────────────
 
-        # 防绕圈
         if hasattr(self.env, 'current_path_trace') and len(self.env.current_path_trace) >= 1:
             recent_trace = self.env.current_path_trace[-10:]
             visit_counts = {}
@@ -421,20 +617,16 @@ class LowLevelController:
                     if remaining >= 1:
                         mask[nbr] = 0.0
 
-        # 兜底
         if np.sum(mask) == 0:
-            # 优先：复用已建树边（免费）
             for nbr in neighbors:
                 edge_key = tuple(sorted((current, nbr)))
                 if edge_key in tree_edges:
                     mask[nbr] = 1.0
-            # 其次：检查带宽
             if np.sum(mask) == 0:
                 for nbr in neighbors:
                     avail_bw = self.env.resource_mgr.pool.get_available_bandwidth(current, nbr)
                     if avail_bw >= bw_req:
                         mask[nbr] = 1.0
-            # 最终兜底：原地等待
             if np.sum(mask) == 0:
                 mask[current] = 1.0
 
@@ -452,9 +644,8 @@ class LowLevelController:
                 cpu_reqs = self.env.current_request.get('cpu_origin', [10.0])
                 current_vnf_demand = cpu_reqs[idx] if idx < len(cpu_reqs) else 10.0
 
-        BASE_FEATURE_DIM = 5   # [cpu, mem, fit_factor, 0.5, 0.5]
-        DYNAMIC_FEATURE_DIM = 3 # [tree_member, connected, is_target]
-        TOTAL_FEATURE_DIM = BASE_FEATURE_DIM + DYNAMIC_FEATURE_DIM  # 不再依赖padding到硬编码14
+        BASE_FEATURE_DIM = 5
+        DYNAMIC_FEATURE_DIM = 3
 
         base_features = []
         for node in range(self.env.n):
@@ -581,15 +772,14 @@ class LowLevelController:
         self.env.current_deployment_target = None
         self.env.current_target_node = None
         self.env.subgoal_step_count = 0
+        self.env._need_reset_to_last_vnf = False  # 清除回位flag防污染
         if hasattr(self.env, 'current_path_trace'):
             self.env.current_path_trace = []
+        # 🔥 彻底清空主干记录变量防污染
+        self.env.chain_nodes = []
+        self.env.sfc_upstream_nodes = set()
 
     def _reset_vnf_phase_only(self):
-        """
-        [P2修复] VNF 部署成功后的轻量重置
-        不再清除 current_phase —— 阶段切换由 set_high_level_goal 统一管理
-        只清除部署目标和步数计数器
-        """
-        # 原代码: self.env.current_phase = None  ← 这会导致下次 step 无法识别阶段
         self.env.current_deployment_target = None
         self.env.subgoal_step_count = 0
+        self.env._consecutive_timeout_count = 0  # 切换subgoal时清零超时计数

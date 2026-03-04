@@ -18,6 +18,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torch
 from utils.visualizer import SFCVisualizer
+from envs.modules.HRL_Coordinator import visualize_multicast_trees
 from trainer.training_analyzer import TrainingAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -84,11 +85,23 @@ class Phase3RLTrainer:
         # 使用 tqdm 显示进度条，替代刷屏日志
         pbar = tqdm(range(num_episodes), desc="Training", unit="ep")
 
+        trees_data = []  # 收集每个episode的树数据供可视化
+
         for episode in pbar:
             # 执行 Episode
             total_reward, info = self.coordinator.run_episode(
                 max_steps=self.max_steps_per_episode
             )
+
+            # --- 收集树快照供可视化 ---
+            if info.get('tree_snapshot') and info.get('req_snapshot'):
+                trees_data.append({
+                    'ep':      episode + 1,
+                    'success': info.get('success', False),
+                    'req':     info['req_snapshot'],
+                    'tree':    info['tree_snapshot'],
+                    'chain':   info.get('chain_nodes', []),
+                })
 
             # --- 统计数据采集 ---
             self.stats['rewards'].append(total_reward)
@@ -117,9 +130,10 @@ class Phase3RLTrainer:
 
             # --- 训练 Agent（先更新权重和 epsilon，再记录快照）---
             # update_policies() 是正确入口，包含 _update_epsilon() 调用
+            losses = {}
             if hasattr(self.agent, 'update_policies'):
                 try:
-                    self.agent.update_policies()
+                    losses = self.agent.update_policies() or {}
                 except Exception as e:
                     logger.debug(f"agent.update_policies() 异常: {e}")
             elif hasattr(self.agent, 'learn'):
@@ -143,12 +157,37 @@ class Phase3RLTrainer:
                 agent=self.agent,
             )
 
+            # --- 采集剩余资源量 ---
+            try:
+                total_cpu_avail = sum(
+                    self.env.resource_mgr.pool.get_available_cpu(i)
+                    for i in range(self.env.n)
+                )
+                avg_cpu_avail = total_cpu_avail / self.env.n
+            except Exception:
+                avg_cpu_avail = 0.0
+
+            try:
+                bw_vals = []
+                for u in range(self.env.n):
+                    for v in self.env.resource_mgr.get_neighbors(u):
+                        if v > u:
+                            bw_vals.append(self.env.resource_mgr.pool.get_available_bandwidth(u, v))
+                avg_bw_avail = sum(bw_vals) / len(bw_vals) if bw_vals else 0.0
+            except Exception:
+                avg_bw_avail = 0.0
+
             # --- 进度条更新 ---
             eps_low = getattr(self.agent, 'epsilon_low', None)
+            high_loss = losses.get('high_loss', 0.0)
+            low_loss = losses.get('low_loss', 0.0)
             postfix = {
-                'Success': f"{success_rate:.1%}",
-                'Reward': f"{total_reward:.1f}",
-                'ResUtil': f"{res_util:.2f}",
+                'Suc': f"{success_rate:.1%}",
+                'Rwd': f"{total_reward:.1f}",
+                'CPU': f"{avg_cpu_avail:.1f}",
+                'BW': f"{avg_bw_avail:.1f}",
+                'HLoss': f"{high_loss:.3f}",
+                'LLoss': f"{low_loss:.3f}",
             }
             if eps_low is not None:
                 postfix['ε'] = f"{eps_low:.3f}"
@@ -158,6 +197,12 @@ class Phase3RLTrainer:
             self.writer.add_scalar('Episode/Reward', total_reward, episode)
             self.writer.add_scalar('Episode/SuccessRate', success_rate, episode)
             self.writer.add_scalar('Episode/ResourceUtil', res_util, episode)
+            self.writer.add_scalar('Resource/AvgCPU', avg_cpu_avail, episode)
+            self.writer.add_scalar('Resource/AvgBW', avg_bw_avail, episode)
+            if high_loss > 0:
+                self.writer.add_scalar('Loss/HighLevel', high_loss, episode)
+            if low_loss > 0:
+                self.writer.add_scalar('Loss/LowLevel', low_loss, episode)
             if tree_len > 0:
                 self.writer.add_scalar('Episode/TreeLength', tree_len, episode)
 
@@ -179,6 +224,8 @@ class Phase3RLTrainer:
                     f"Ep {episode}: Rate={success_rate:.2%} | "
                     f"Rwd={total_reward:.1f} | "
                     f"Util={res_util:.2f} | "
+                    f"CPU剩余={avg_cpu_avail:.1f} BW剩余={avg_bw_avail:.1f} | "
+                    f"HLoss={high_loss:.4f} LLoss={low_loss:.4f} | "
                     f"TreeLen={avg_tree_len:.1f}{eps_str}"
                 )
 
@@ -194,6 +241,18 @@ class Phase3RLTrainer:
         logger.info("=" * 40)
 
         self._save_final_model(num_episodes)
+
+        # 生成多播树可视化
+        if trees_data:
+            try:
+                import os
+                vis_dir = os.path.join(str(self.output_dir.parent), 'visualization')
+                os.makedirs(vis_dir, exist_ok=True)
+                vis_path = os.path.join(vis_dir, 'multicast_trees_vis.png')
+                visualize_multicast_trees(trees_data, save_path=vis_path)
+                logger.info(f'🎨 多播树可视化已保存: {vis_path}')
+            except Exception as e:
+                logger.warning(f'⚠️ 可视化生成失败: {e}')
 
         # 打印最终统计
         valid_tree_lens = [l for l in self.stats['tree_lengths'] if l > 0]
