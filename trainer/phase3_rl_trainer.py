@@ -120,9 +120,17 @@ class Phase3RLTrainer:
             if info.get('success', False):
                 success_count += 1
                 try:
-                    tree_len = len(self.env.current_tree.get('tree', {}))
+                    _sfc_snap = info.get('sfc_snapshot') or {}
+                    _all_edges = set()
+                    for _seg in _sfc_snap.get('spine_paths', []):
+                        for _i in range(len(_seg)-1):
+                            _all_edges.add(tuple(sorted((_seg[_i], _seg[_i+1]))))
+                    for _bp in _sfc_snap.get('branch_paths', {}).values():
+                        for _i in range(len(_bp)-1):
+                            _all_edges.add(tuple(sorted((_bp[_i], _bp[_i+1]))))
+                    tree_len = len(_all_edges) if _all_edges else                         len(self.env.current_tree.get('tree', {}))
                 except Exception:
-                    tree_len = 0
+                    tree_len = len(self.env.current_tree.get('tree', {}))
             self.stats['tree_lengths'].append(tree_len)
 
             # 3. 成功率
@@ -243,24 +251,37 @@ class Phase3RLTrainer:
 
         self._save_final_model(num_episodes)
 
-        # 生成多播树可视化：每个 episode 独立存一张图
+        # 生成多播树可视化 + 路径打印
         if trees_data:
             try:
                 import os
                 vis_dir = os.path.join(str(self.output_dir.parent), 'visualization')
                 os.makedirs(vis_dir, exist_ok=True)
-                saved, failed = 0, 0
-                for d in trees_data:
-                    ep_id = d.get('ep', '?')
-                    fname = f'sfc_tree_ep{ep_id:04d}.png' if isinstance(ep_id, int) else f'sfc_tree_ep{ep_id}.png'
-                    vis_path = os.path.join(vis_dir, fname)
+                for _td in trees_data:
+                    _ep   = _td.get('ep', '?')
+                    _succ = _td.get('success', False)
+                    _sfc  = _td.get('sfc_snapshot') or {}
+                    _req  = _td.get('req') or {}
+                    # ── 路径打印 ──────────────────────────────────────
+                    print(f"\n{'='*55}")
+                    print(f"Ep {_ep} {'✓' if _succ else '✗'}  "
+                          f"src={_req.get('source','?')}  "
+                          f"dest={_req.get('dest','?')}")
+                    print(f"  chain : {_sfc.get('chain_nodes','?')}")
+                    for _k, _seg in enumerate(_sfc.get('spine_paths', [])):
+                        print(f"  spine[{_k}]: {_seg}")
+                    _br = _sfc.get('branch_roots', {})
+                    for _d, _path in _sfc.get('branch_paths', {}).items():
+                        _root = _br.get(_d, _br.get(str(_d), '?'))
+                        print(f"  branch dest={_d} root={_root}: {_path}")
+                    # ── 单图可视化 ────────────────────────────────────
+                    _ep_str = str(_ep).zfill(4)
+                    _vis_path = os.path.join(vis_dir, f'sfc_tree_ep{_ep_str}.png')
                     try:
-                        visualize_sfc_tree_publication(d, save_path=vis_path)
-                        saved += 1
-                    except Exception as e_inner:
-                        logger.debug(f'  Ep{ep_id} 可视化跳过: {e_inner}')
-                        failed += 1
-                logger.info(f'🎨 SFC树可视化完成: {saved} 张已保存至 {vis_dir}，{failed} 张跳过')
+                        visualize_sfc_tree_publication(_td, save_path=_vis_path)
+                    except Exception as _ve:
+                        logger.warning(f'可视化 ep{_ep} 失败: {_ve}')
+                logger.info(f'🎨 可视化已保存到: {vis_dir}/')
             except Exception as e:
                 logger.warning(f'⚠️ 可视化生成失败: {e}')
 

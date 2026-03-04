@@ -143,10 +143,7 @@ class HRL_Coordinator:
             _vnf_list = self.env.current_request.get('vnf', []) if self.env.current_request else []
             _vnf_done = getattr(self.env, 'next_vnf_idx', 0) >= len(_vnf_list) if _vnf_list else False
 
-            # ── [SFC-DAG] dest阶段path_guide：从last_vnf出发到dest_i ─────────
-            # spine路径已在VNF阶段记录进current_sfc['spine_paths']
-            # dest阶段只需计算 last_vnf → dest_i 的路径（branch）
-            # RL agent跟随这条路径走，走完后记录为branch_path
+            # ── dest阶段path_guide：从last_vnf出发到dest_i ─────────────
             if _vnf_done and len(_chain) >= 1:
                 last_vnf = _chain[-1]
                 planned_path = self.env.low_level_controller.compute_bw_aware_path(
@@ -315,6 +312,33 @@ class HRL_Coordinator:
                         high_done = True
                         high_reward += 30.0
                         episode_done = True
+                        # ── 分叉多样性奖励 + 树总长奖励 ──────────────
+                        try:
+                            _sfc2 = getattr(self.env, 'current_sfc', None)
+                            if _sfc2:
+                                # 树总长奖励（边数越少越好，鼓励路径复用）
+                                _all_e = set()
+                                for _sg in _sfc2.get('spine_paths', []):
+                                    for _i in range(len(_sg)-1):
+                                        _all_e.add(tuple(sorted((_sg[_i],_sg[_i+1]))))
+                                for _bp in _sfc2.get('branch_paths', {}).values():
+                                    for _i in range(len(_bp)-1):
+                                        _all_e.add(tuple(sorted((_bp[_i],_bp[_i+1]))))
+                                _len_bonus = max(0.0, (23 - len(_all_e)) * 0.5)
+                                high_reward += _len_bonus
+                                logger.debug(f"[TreeQuality] len={len(_all_e)} "
+                                             f"len_bonus={_len_bonus:.1f}")
+                                # spine回绕惩罚
+                                _seen_spine = set()
+                                _overlap = 0
+                                for _sg in _sfc2.get('spine_paths', []):
+                                    for _nd in _sg[1:]:
+                                        if _nd in _seen_spine: _overlap += 1
+                                        _seen_spine.add(_nd)
+                                if _overlap > 0:
+                                    high_reward -= 5.0 * _overlap
+                        except Exception:
+                            pass
                 except:
                     pass
 
@@ -467,6 +491,7 @@ class HRL_Coordinator:
                     'chain_nodes': list(_sfc.get('chain_nodes', [])),
                     'spine_paths': [list(p) for p in _sfc.get('spine_paths', [])],
                     'branch_paths': {k: list(v) for k, v in _sfc.get('branch_paths', {}).items()},
+                    'branch_roots': {k: v for k, v in _sfc.get('branch_roots', {}).items()},
                 }
         except Exception:
             pass

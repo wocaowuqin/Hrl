@@ -191,15 +191,45 @@ class HighLevelController:
             _already = set(getattr(self.env, 'chain_nodes', []))
 
             if hasattr(self.env, 'dc_nodes'):
+                _llc = getattr(self.env, 'low_level_controller', None)
+                # 前进约束：第k个VNF离source的距离 必须 > 第k-1个VNF离source的距离
+                # 保证spine沿 source→dest 方向单调推进，不回绕
+                _prev_vnf = (list(_already)[-1] if _already
+                             else (_source if _source != -1 else None))
+                _dist_prev_from_src = (_llc._get_hop_distance(_source, _prev_vnf)
+                                       if _llc and _prev_vnf is not None and _source != -1
+                                       else 0)
+                _strict_mask = np.zeros(n, dtype=np.float32)
+                _loose_mask  = np.zeros(n, dtype=np.float32)
                 for node in self.env.dc_nodes:
                     if 0 <= node < n:
-                        if node == _source:       continue  # 不允许部署在source
-                        if node in _dests:        continue  # 不允许部署在dest
-                        if node in _already:      continue  # 不允许重复部署
+                        if node == _source:  continue
+                        if node in _dests:   continue
+                        if node in _already: continue
                         avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
                         avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
                         if avail_cpu >= req_cpu and avail_mem >= req_mem:
-                            mask[node] = 1.0
+                            _dist_node = (_llc._get_hop_distance(_source, node)
+                                          if _llc and _source != -1 else 0)
+                            # 严格前进：离source更远
+                            if _dist_node > _dist_prev_from_src:
+                                _strict_mask[node] = 1.0
+                            # 宽松：至少一样远（fallback用）
+                            if _dist_node >= _dist_prev_from_src:
+                                _loose_mask[node] = 1.0
+                # 优先严格前进；若无节点满足则退回宽松；再无则不限制
+                if np.sum(_strict_mask) > 0:
+                    mask = _strict_mask
+                elif np.sum(_loose_mask) > 0:
+                    mask = _loose_mask
+                else:
+                    # 极端情况：全部DC都在source附近，放开限制
+                    for node in self.env.dc_nodes:
+                        if 0 <= node < n and node != _source and node not in _dests and node not in _already:
+                            avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
+                            avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
+                            if avail_cpu >= req_cpu and avail_mem >= req_mem:
+                                mask[node] = 1.0
 
             if np.sum(mask) == 0:
                 logger.warning("⚠️ [Mask] 所有DC节点资源不足，返回全0")

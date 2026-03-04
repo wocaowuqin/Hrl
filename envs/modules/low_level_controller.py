@@ -52,6 +52,28 @@ class LowLevelController:
         logger.info("✅ [LowLevelController] 初始化完成（强制SFC状态机优化版）")
 
     # ==================================================================
+    # 分叉点选择
+    # ==================================================================
+    def _get_best_branch_point(self, dest_node, chain_nodes):
+        """
+        从已部署 VNF 中选距 dest_node 跳数最近的作为 branch 起点。
+        tie-break: 距离相同时选 chain_nodes 中 index 更大的（更靠近末端 VNF）。
+        """
+        if not chain_nodes:
+            return chain_nodes[-1] if chain_nodes else None
+        best_vnf = chain_nodes[-1]
+        best_dist = 9999
+        best_ci = -1
+        for ci, vnf in enumerate(chain_nodes):
+            d = self._get_hop_distance(vnf, dest_node)
+            if d < best_dist or (d == best_dist and ci > best_ci):
+                best_dist = d
+                best_ci = ci
+                best_vnf = vnf
+        logger.debug(f"[BranchPoint] dest={dest_node} → vnf={best_vnf}(dist={best_dist})")
+        return best_vnf
+
+    # ==================================================================
     # Hop Distance 缓存
     # ==================================================================
     def _build_hop_distance_cache(self):
@@ -352,6 +374,9 @@ class LowLevelController:
                     _sfc = getattr(self.env, 'current_sfc', None)
                     if _sfc is not None and _sfc['chain_nodes']:
                         _last_vnf = _sfc['chain_nodes'][-1]
+                        if 'branch_roots' not in _sfc:
+                            _sfc['branch_roots'] = {}
+                        _sfc['branch_roots'][target_goal] = _last_vnf
                         _G_topo = _nx.Graph()
                         for _u in range(self.env.n):
                             for _v in self.env.resource_mgr.get_neighbors(_u):
@@ -418,7 +443,7 @@ class LowLevelController:
                             _branch_ok = (
                                 len(_branch) > 0 and
                                 _sfc['chain_nodes'] and
-                                _branch[0] == _sfc['chain_nodes'][-1] and
+                                _branch[0] in set(_sfc['chain_nodes']) and
                                 _branch[-1] == _d
                             )
                             _all_present = _spine_ok and _branch_ok
