@@ -143,27 +143,18 @@ class HRL_Coordinator:
             _vnf_list = self.env.current_request.get('vnf', []) if self.env.current_request else []
             _vnf_done = getattr(self.env, 'next_vnf_idx', 0) >= len(_vnf_list) if _vnf_list else False
 
-            # ── [FIX SFC路径约束] dest阶段强制路径经过全部VNF节点 ──────────────
-            # 原逻辑：直接计算 current_pos→dest_i 最短路，完全绕过VNF主干
-            # 修复：分段计算 current→VNF1→VNF2→VNF3→dest_i，拼接成完整路径
-            # 保证每条dest连接路径上必然经过全部VNF节点，满足SFC约束
+            # ── [SFC-DAG] dest阶段path_guide：从last_vnf出发到dest_i ─────────
+            # spine路径已在VNF阶段记录进current_sfc['spine_paths']
+            # dest阶段只需计算 last_vnf → dest_i 的路径（branch）
+            # RL agent跟随这条路径走，走完后记录为branch_path
             if _vnf_done and len(_chain) >= 1:
-                waypoints = list(_chain) + [target_node]
-                full_path = []
-                seg_start = current_pos
-                path_ok = True
-                for wp in waypoints:
-                    if seg_start == wp:
-                        continue
-                    seg = self.env.low_level_controller.compute_bw_aware_path(seg_start, wp)
-                    if not seg:
-                        path_ok = False
-                        break
-                    full_path.extend(seg[1:] if len(seg) > 1 else [wp])
-                    seg_start = wp
-                if path_ok and full_path:
-                    planned_path = full_path
-                    logger.debug(f"[Coord] SFC路径 waypoints={waypoints} path={planned_path}")
+                last_vnf = _chain[-1]
+                planned_path = self.env.low_level_controller.compute_bw_aware_path(
+                    last_vnf, target_node)
+                if planned_path and len(planned_path) > 1:
+                    planned_path = planned_path[1:]
+                elif planned_path and len(planned_path) == 1:
+                    planned_path = [target_node]
                 else:
                     planned_path = None
                     self._unreachable_targets.add(target_node)
@@ -466,6 +457,19 @@ class HRL_Coordinator:
         except Exception:
             pass
         chain_snapshot = list(getattr(self.env, 'chain_nodes', []))
+        # 收集 current_sfc（分层DAG）快照
+        sfc_snapshot = None
+        try:
+            _sfc = getattr(self.env, 'current_sfc', None)
+            if _sfc:
+                import copy
+                sfc_snapshot = {
+                    'chain_nodes': list(_sfc.get('chain_nodes', [])),
+                    'spine_paths': [list(p) for p in _sfc.get('spine_paths', [])],
+                    'branch_paths': {k: list(v) for k, v in _sfc.get('branch_paths', {}).items()},
+                }
+        except Exception:
+            pass
         # ──────────────────────────────────────────────────────────────────
 
         return total_reward, {
@@ -480,6 +484,7 @@ class HRL_Coordinator:
             'tree_snapshot': tree_snapshot,
             'req_snapshot': req_snapshot,
             'chain_nodes': chain_snapshot,
+            'sfc_snapshot': sfc_snapshot,
         }
 
     def _fallback_success_check(self):
@@ -547,125 +552,211 @@ class HRL_Coordinator:
         return dict(self.stats)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🎨  多播树可视化工具函数
+# 🎨  论文级 SFC 多播树可视化工具函数
 #     用法（训练结束后）：
-#       from core.hrl.HRL_Coordinator import visualize_multicast_trees
-#       visualize_multicast_trees(trees_data, save_path="multicast_trees_vis.png")
+#       from core.hrl.HRL_Coordinator import visualize_sfc_tree_publication
 #
-#     trees_data 格式（每个episode收集一条）：
+#     data 格式：
 #       {
-#         'ep':      episode编号 (int),
-#         'success': 是否成功 (bool),
-#         'req':     req_snapshot (dict, from info['req_snapshot']),
-#         'tree':    tree_snapshot (dict, from info['tree_snapshot']),
-#         'chain':   chain_nodes (list, from info['chain_nodes']),
+#         'req':          req_snapshot (dict, from info['req_snapshot']),
+#         'sfc_snapshot': sfc_snapshot (dict, from info['sfc_snapshot']),
 #       }
 # ═══════════════════════════════════════════════════════════════════════════════
-def visualize_multicast_trees(trees_data, save_path="multicast_trees_vis.png",
-                               cols=5, rows=2, figsize=(22, 9)):
+def visualize_sfc_tree_publication(data, save_path="sfc_tree_pub.png"):
     """
-    把 trees_data 列表里前 cols*rows 个episode的多播树画成网格图并保存。
-    每棵树中：绿色=源节点, 红色=目的地, 蓝色=VNF节点, 灰色=中间节点。
+    论文级 SFC 多播树可视化（归一化坐标系修复版）
+    - Spine 水平等距排列，全部归一化到 x∈[0,1]
+    - Branch 在 last_vnf 正下方扇形展开，间距由 dest 数量自适应
+    - 所有边只用已知坐标绘制，不产生交叉
+    - 高 DPI
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    import networkx as nx
+    import matplotlib.patches as mpatches
+    import numpy as np
 
-    n_show = min(len(trees_data), cols * rows)
-    fig, axes = plt.subplots(rows, cols, figsize=figsize)
-    axes = axes.flatten()
+    req          = data.get('req', {})
+    sfc          = data.get('sfc_snapshot', {})
+    chain        = sfc.get('chain_nodes', [])
+    spine_paths  = sfc.get('spine_paths', [])
+    branch_paths = sfc.get('branch_paths', {})
 
-    # 图例只画一次
-    legend_drawn = False
+    source = req.get('source')
+    # dest 列表：优先从 req，没有则从 branch_paths key
+    req_dests = req.get('dest', [])
+    dests = [int(d) for d in req_dests] if req_dests else [int(d) for d in branch_paths.keys()]
 
-    for idx in range(rows * cols):
-        ax = axes[idx]
-        if idx >= n_show:
-            ax.axis('off')
-            continue
+    if not spine_paths:
+        print("No valid SFC data")
+        return
 
-        data    = trees_data[idx]
-        req     = data.get('req') or {}
-        tree    = data.get('tree') or {}
-        ep      = data.get('ep', idx + 1)
-        success = data.get('success', False)
-        chain   = data.get('chain', [])
+    # ── 1. 构造 spine 序列（去重保持顺序）─────────────────────────────────
+    spine_seq = []
+    seen = set()
+    for seg in spine_paths:
+        for node in seg:
+            if node not in seen:
+                spine_seq.append(node)
+                seen.add(node)
 
-        title_color = 'green' if success else 'red'
-        ax.set_title(f"Ep {ep} (" + ("Success" if success else "Fail") + ")",
-                     color=title_color, fontweight='bold', fontsize=9)
+    n_spine  = len(spine_seq)
+    # 按 chain 节点在 spine_seq 中的出现顺序重排，确保 V1→V2→V3 与路径一致
+    chain_set = set(chain)
+    chain_ordered = [n for n in spine_seq if n in chain_set]
+    # 补上不在 spine_seq 里的 chain 节点（理论上不应有，但保险起见）
+    for n in chain:
+        if n not in chain_ordered:
+            chain_ordered.append(n)
+    chain = chain_ordered
 
-        edges = list(tree.get('tree', {}).keys())
-        if not edges:
-            ax.text(0.5, 0.5, "No Tree", ha='center', va='center',
-                    color='gray', fontsize=10)
-            ax.axis('off')
-            continue
+    last_vnf = chain[-1] if chain else spine_seq[-1]
 
-        G = nx.Graph()
-        G.add_edges_from(edges)
-
-        source = req.get('source')
-        dests  = [int(d) for d in req.get('dest', [])]
-
-        # VNF节点：优先用 chain_nodes，fallback用 placement
-        if chain:
-            vnf_nodes = list(chain)
+    # ── 2. 归一化 spine 坐标（y=0.78，x 均匀分布在 [0.04, 0.96]）──────────
+    x_left, x_right = 0.04, 0.96
+    spine_norm = {}
+    for i, node in enumerate(spine_seq):
+        if n_spine > 1:
+            x = x_left + (x_right - x_left) * i / (n_spine - 1)
         else:
-            vnf_nodes = []
-            placement = tree.get('placement', {})
-            for p_k, p_v in placement.items():
-                if isinstance(p_v, dict) and 'node' in p_v:
-                    vnf_nodes.append(p_v['node'])
-                elif isinstance(p_k, tuple) and len(p_k) > 0:
-                    vnf_nodes.append(p_k[0])
+            x = 0.5
+        spine_norm[node] = (x, 0.78)
 
-        try:
-            pos = nx.spring_layout(G, seed=42)
-        except Exception:
-            pos = nx.random_layout(G)
+    lv_x = spine_norm[last_vnf][0]   # last_vnf 的归一化 x
 
-        all_nodes  = list(G.nodes())
-        gray_nodes = [n for n in all_nodes
-                      if n != source and n not in dests and n not in vnf_nodes]
+    # ── 3. dest 扇形坐标（y=0.12，x 在 last_vnf 附近均匀展开）──────────────
+    n_dest = len(dests)
+    half_span = min(0.40, 0.10 * n_dest)   # 自适应宽度，最多 ±0.40
+    if n_dest > 1:
+        dest_xs = [lv_x - half_span + i * 2 * half_span / (n_dest - 1)
+                   for i in range(n_dest)]
+    else:
+        dest_xs = [lv_x]
 
-        # 画各类节点
-        if gray_nodes:
-            nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=gray_nodes,
-                                   node_color='#bdc3c7', node_size=260)
-        vnf_in_G = [v for v in vnf_nodes if v in G.nodes()]
-        if vnf_in_G:
-            nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=vnf_in_G,
-                                   node_color='#3498db', node_size=320,
-                                   edgecolors='#2980b9', linewidths=1.5)
-        dest_in_G = [d for d in dests if d in G.nodes()]
-        if dest_in_G:
-            nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=dest_in_G,
-                                   node_color='#e74c3c', node_size=340,
-                                   edgecolors='#c0392b', linewidths=1.5)
-        if source is not None and source in G.nodes():
-            nx.draw_networkx_nodes(G, pos, ax=ax, nodelist=[source],
-                                   node_color='#2ecc71', node_size=380,
-                                   edgecolors='#27ae60', linewidths=2)
+    dest_norm = {d: (dest_xs[i], 0.12) for i, d in enumerate(sorted(dests))}
 
-        nx.draw_networkx_edges(G, pos, ax=ax, width=1.4,
-                               edge_color='#7f8c8d', alpha=0.8)
-        nx.draw_networkx_labels(G, pos, ax=ax, font_size=7, font_weight='bold')
+    # ── 4. branch 中间节点坐标（线性插值，避免重叠）─────────────────────────
+    branch_mid_norm = {}
+    for d_key, bpath in branch_paths.items():
+        d = int(d_key)
+        if d not in dest_norm:
+            continue
+        dx, dy = dest_norm[d]
+        # 起点：last_vnf（branch 总从 last_vnf 出发）
+        sx, sy = spine_norm[last_vnf]
+        mid_nodes = [n for n in bpath if n not in spine_norm and int(n) not in dest_norm]
+        n_mid = len(mid_nodes)
+        for j, node in enumerate(mid_nodes):
+            frac = (j + 1) / (n_mid + 1)
+            bx = sx + frac * (dx - sx)
+            by = sy + frac * (dy - sy)
+            if node not in branch_mid_norm:
+                branch_mid_norm[node] = (bx, by)
 
-        if not legend_drawn:
-            ax.plot([], [], 'o', color='#2ecc71', label='Source', markersize=8)
-            ax.plot([], [], 'o', color='#e74c3c', label='Dest',   markersize=8)
-            ax.plot([], [], 'o', color='#3498db', label='VNF',    markersize=8)
-            ax.legend(loc='upper left', fontsize=7, markerscale=0.9,
-                      framealpha=0.8)
-            legend_drawn = True
+    def get_pos(node):
+        if node in spine_norm:
+            return spine_norm[node]
+        if node in branch_mid_norm:
+            return branch_mid_norm[node]
+        ni = int(node) if not isinstance(node, int) else node
+        if ni in dest_norm:
+            return dest_norm[ni]
+        return (lv_x, 0.45)
 
-        ax.axis('off')
+    # ── 5. 画布 ──────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_axis_off()
 
-    plt.suptitle("Multicast Trees Visualization", fontsize=13, fontweight='bold', y=1.01)
+    # ── 6. 绘制 spine 边（黑色粗线，带箭头）─────────────────────────────────
+    spine_edge_set = set()
+    for seg in spine_paths:
+        for i in range(len(seg) - 1):
+            u, v = seg[i], seg[i + 1]
+            spine_edge_set.add((u, v))
+            ux, uy = get_pos(u)
+            vx, vy = get_pos(v)
+            ax.annotate('', xy=(vx, vy), xytext=(ux, uy),
+                        xycoords='axes fraction', textcoords='axes fraction',
+                        arrowprops=dict(arrowstyle='->', color='#2c3e50',
+                                        lw=2.2, mutation_scale=14))
+
+    # ── 7. 绘制 branch 边（橙色线，从 last_vnf 直连 dest）───────────────────
+    # 修复：不依赖 branch_paths 里的中间路径节点判断，
+    # 直接从 last_vnf 画到对应 dest，保证不交叉。
+    for d_key in branch_paths.keys():
+        d = int(d_key)
+        if d not in dest_norm:
+            continue
+        sx, sy = spine_norm[last_vnf]
+        dx, dy = dest_norm[d]
+        ax.annotate('', xy=(dx, dy), xytext=(sx, sy),
+                    xycoords='axes fraction', textcoords='axes fraction',
+                    arrowprops=dict(arrowstyle='->', color='#e67e22',
+                                    lw=2.0, mutation_scale=13, alpha=0.9))
+
+    # ── 8. 绘制节点 ───────────────────────────────────────────────────────────
+    def draw_node(x, y, fc, ec, r, label=None, fs=7, fc_text='white', zorder=4):
+        circ = plt.Circle((x, y), r, color=fc, ec=ec, lw=1.5,
+                           zorder=zorder, transform=ax.transAxes, clip_on=False)
+        ax.add_patch(circ)
+        if label is not None:
+            ax.text(x, y, str(label), ha='center', va='center',
+                    fontsize=fs, fontweight='bold', color=fc_text,
+                    zorder=zorder + 1, transform=ax.transAxes)
+
+    # 中间灰色 spine 节点
+    vnf_set = set(chain)
+    for node in spine_seq:
+        if node == source or node in vnf_set:
+            continue
+        draw_node(*spine_norm[node], '#bdc3c7', '#95a5a6', 0.022, label=node, fc_text='#333')
+
+    # VNF 节点（蓝色）
+    for k, vnf in enumerate(chain):
+        x, y = spine_norm[vnf]
+        draw_node(x, y, '#2980b9', '#1a5276', 0.032, label=vnf, fs=8)
+        ax.text(x, y + 0.07, f'V{k+1}', ha='center', va='bottom',
+                fontsize=9, color='#1a5276', fontweight='bold',
+                transform=ax.transAxes)
+
+    # Dest 节点（红色，按 sorted 顺序，和 dest_norm 一致）
+    for d in sorted(dests):
+        draw_node(*dest_norm[d], '#c0392b', '#922b21', 0.028, label=d, fs=8)
+
+    # Source 节点（绿色）
+    if source is not None and source in spine_norm:
+        draw_node(*spine_norm[source], '#27ae60', '#1e8449', 0.036, label=source, fs=9)
+
+    # ── 9. 图例 & 标题 ────────────────────────────────────────────────────────
+    patches = [
+        mpatches.Patch(color='#27ae60', label='Source'),
+        mpatches.Patch(color='#2980b9', label='VNF'),
+        mpatches.Patch(color='#bdc3c7', label='Relay'),
+        mpatches.Patch(color='#c0392b', label='Dest'),
+        mpatches.Patch(color='#2c3e50', label='Spine'),
+        mpatches.Patch(color='#e67e22', label='Branch'),
+    ]
+    ax.legend(handles=patches, loc='upper left', fontsize=8,
+              bbox_to_anchor=(0.0, 1.0), framealpha=0.9,
+              edgecolor='#ccc', ncol=6, handlelength=1.2)
+
+    n_dest_actual = len(dests)
+    flow = ' → '.join(['S'] + [f'V{k+1}' for k in range(len(chain))] + [f'D×{n_dest_actual}'])
+    ax.text(0.5, 0.03, flow, ha='center', va='bottom',
+            fontsize=9, color='#555', style='italic',
+            transform=ax.transAxes)
+
+    ep   = data.get('ep', '')
+    succ = data.get('success', None)
+    title = "SFC Multicast Tree (Layered DAG Model)"
+    if ep != '':
+        status = ' ✓' if succ else ' ✗' if succ is not None else ''
+        title += f"  —  Ep {ep}{status}"
+    ax.set_title(title, fontsize=13, fontweight='bold', pad=16)
+
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  ✅ 多播树可视化已保存: {save_path}")
-    return save_path
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ 论文级图已保存: {save_path}")

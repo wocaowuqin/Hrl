@@ -18,7 +18,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torch
 from utils.visualizer import SFCVisualizer
-from envs.modules.HRL_Coordinator import visualize_multicast_trees
+from envs.modules.HRL_Coordinator import visualize_sfc_tree_publication
 from trainer.training_analyzer import TrainingAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -94,13 +94,14 @@ class Phase3RLTrainer:
             )
 
             # --- 收集树快照供可视化 ---
-            if info.get('tree_snapshot') and info.get('req_snapshot'):
+            if info.get('req_snapshot'):
                 trees_data.append({
-                    'ep':      episode + 1,
-                    'success': info.get('success', False),
-                    'req':     info['req_snapshot'],
-                    'tree':    info['tree_snapshot'],
-                    'chain':   info.get('chain_nodes', []),
+                    'ep':           episode + 1,
+                    'success':      info.get('success', False),
+                    'req':          info['req_snapshot'],
+                    'tree':         info.get('tree_snapshot'),
+                    'chain':        info.get('chain_nodes', []),
+                    'sfc_snapshot': info.get('sfc_snapshot'),  # DAG结构
                 })
 
             # --- 统计数据采集 ---
@@ -242,15 +243,24 @@ class Phase3RLTrainer:
 
         self._save_final_model(num_episodes)
 
-        # 生成多播树可视化
+        # 生成多播树可视化：每个 episode 独立存一张图
         if trees_data:
             try:
                 import os
                 vis_dir = os.path.join(str(self.output_dir.parent), 'visualization')
                 os.makedirs(vis_dir, exist_ok=True)
-                vis_path = os.path.join(vis_dir, 'multicast_trees_vis.png')
-                visualize_multicast_trees(trees_data, save_path=vis_path)
-                logger.info(f'🎨 多播树可视化已保存: {vis_path}')
+                saved, failed = 0, 0
+                for d in trees_data:
+                    ep_id = d.get('ep', '?')
+                    fname = f'sfc_tree_ep{ep_id:04d}.png' if isinstance(ep_id, int) else f'sfc_tree_ep{ep_id}.png'
+                    vis_path = os.path.join(vis_dir, fname)
+                    try:
+                        visualize_sfc_tree_publication(d, save_path=vis_path)
+                        saved += 1
+                    except Exception as e_inner:
+                        logger.debug(f'  Ep{ep_id} 可视化跳过: {e_inner}')
+                        failed += 1
+                logger.info(f'🎨 SFC树可视化完成: {saved} 张已保存至 {vis_dir}，{failed} 张跳过')
             except Exception as e:
                 logger.warning(f'⚠️ 可视化生成失败: {e}')
 

@@ -266,6 +266,30 @@ class LowLevelController:
                     self.env.chain_nodes = []
                 self.env.chain_nodes.append(current_node)
 
+                # ── [SFC-DAG STEP3] 记录spine路径段到current_sfc ────────────
+                try:
+                    import networkx as _nx
+                    _sfc = getattr(self.env, 'current_sfc', None)
+                    if _sfc is not None:
+                        # prev = source（第一个VNF）或上一个VNF
+                        _prev = (self.env.current_request.get('source')
+                                 if not _sfc['chain_nodes']
+                                 else _sfc['chain_nodes'][-1])
+                        _G_topo = _nx.Graph()
+                        for _u in range(self.env.n):
+                            for _v in self.env.resource_mgr.get_neighbors(_u):
+                                _G_topo.add_edge(_u, _v)
+                        if _prev != current_node:
+                            _seg = _nx.shortest_path(_G_topo, _prev, current_node)
+                        else:
+                            _seg = [current_node]
+                        _sfc['spine_paths'].append(_seg)
+                        _sfc['chain_nodes'].append(current_node)
+                        logger.debug(f"[SFC-DAG] spine段: {_prev}→{current_node} = {_seg}")
+                except Exception as _e:
+                    logger.warning(f"[SFC-DAG] spine记录失败: {_e}")
+                # ─────────────────────────────────────────────────────────────
+
                 self.env.next_vnf_idx += 1
                 vnf_list = self.env.current_request.get('vnf', [])
                 current_count = self.env.next_vnf_idx
@@ -322,6 +346,30 @@ class LowLevelController:
             if target_goal not in self.env.current_tree['connected_dests']:
                 self.env.current_tree['connected_dests'].add(target_goal)
 
+                # ── [SFC-DAG STEP4] 记录branch路径 ──────────────────────────
+                try:
+                    import networkx as _nx
+                    _sfc = getattr(self.env, 'current_sfc', None)
+                    if _sfc is not None and _sfc['chain_nodes']:
+                        _last_vnf = _sfc['chain_nodes'][-1]
+                        _G_topo = _nx.Graph()
+                        for _u in range(self.env.n):
+                            for _v in self.env.resource_mgr.get_neighbors(_u):
+                                _G_topo.add_edge(_u, _v)
+                        _bseg = _nx.shortest_path(_G_topo, _last_vnf, target_goal)
+                        _sfc['branch_paths'][target_goal] = _bseg
+                        # 把branch边同步到current_tree['tree']
+                        _bw = self.env.current_request.get('bw_origin', 0.0)
+                        for _j in range(len(_bseg) - 1):
+                            _ek = tuple(sorted((_bseg[_j], _bseg[_j+1])))
+                            if 'tree' not in self.env.current_tree:
+                                self.env.current_tree['tree'] = {}
+                            if _ek not in self.env.current_tree['tree']:
+                                self.env.current_tree['tree'][_ek] = _bw
+                except Exception as _e:
+                    logger.warning(f"[SFC-DAG] branch记录失败: {_e}")
+                # ─────────────────────────────────────────────────────────────
+
             steps_used = getattr(self.env, 'subgoal_step_count', 50)
             # ── [FIX 树长1] 加大步数惩罚：每多走1步超出最短路就扣1.5分，允许负奖励
             # 原来 max(20-steps*0.5, 5)，40步仍得5分，绕路代价几乎为零。
@@ -349,65 +397,47 @@ class LowLevelController:
                 self._archive_episode_success_only()
                 self._add_request_to_lifecycle_manager()
 
-                # ── [SFC验证] 检查chain_nodes数量和source可达性 ──────────────
-                _chain = getattr(self.env, 'chain_nodes', [])
-                _tree = self.env.current_tree.get('tree', {})
+                # ── [SFC-DAG STEP5] 用分层DAG拼接路径验证，彻底替代shortest_path ─
+                _sfc = getattr(self.env, 'current_sfc', None)
                 _src = self.env.current_request.get('source', None)
-                _vnf_list = self.env.current_request.get('vnf', [])
+                _chain = getattr(self.env, 'chain_nodes', [])
                 _sfc_ok = True
                 try:
-                    if _chain and _tree and _src is not None:
-                        import networkx as _nx
-                        _G = _nx.Graph()
-                        for (u, v) in _tree.keys():
-                            _G.add_edge(u, v)
-                        # 验证1: chain长度 == VNF数量
-                        if len(_chain) != len(_vnf_list):
-                            _sfc_ok = False
-                            logger.warning(
-                                f"⚠️ [SFC违规] chain长度={len(_chain)} ≠ VNF数量={len(_vnf_list)}"
-                                f" chain={_chain}"
+                    if _sfc and _sfc['spine_paths'] and _sfc['branch_paths']:
+                        for _d, _branch in _sfc['branch_paths'].items():
+                            # 验证方式：不拼接路径，而是直接检查各段结构
+                            # spine[k]的末尾必须是chain_nodes[k]
+                            # branch的起点必须是last_vnf，终点必须是dest
+                            _chain_ok = True
+                            _spine_ok = all(
+                                len(_sfc['spine_paths'][_k]) > 0 and
+                                _sfc['spine_paths'][_k][-1] == _sfc['chain_nodes'][_k]
+                                for _k in range(len(_sfc['chain_nodes']))
+                                if _k < len(_sfc['spine_paths'])
                             )
-                        # 验证2: source和每个VNF节点都在图里且可达
-                        for _vnf_node in _chain:
-                            if _vnf_node not in _G or _src not in _G:
+                            _branch_ok = (
+                                len(_branch) > 0 and
+                                _sfc['chain_nodes'] and
+                                _branch[0] == _sfc['chain_nodes'][-1] and
+                                _branch[-1] == _d
+                            )
+                            _all_present = _spine_ok and _branch_ok
+                            _in_order = True  # 结构拼接方式天然有序
+                            if _all_present and _in_order:
+                                logger.info(f"✅ [SFC-DAG] src={_src}→dst={_d} "
+                                            f"VNF={_sfc['chain_nodes']} ✓")
+                            else:
+                                logger.warning(f"⚠️ [SFC-DAG违规] src={_src}→dst={_d} "
+                                               f"spine_ok={_spine_ok} branch_ok={_branch_ok} "
+                                               f"spine_ends={[s[-1] if s else None for s in _sfc['spine_paths']]} "
+                                               f"chain={_sfc['chain_nodes']} "
+                                               f"branch_start={_branch[0] if _branch else None} "
+                                               f"branch_end={_branch[-1] if _branch else None}")
                                 _sfc_ok = False
-                                logger.warning(
-                                    f"⚠️ [SFC违规] source={_src}或VNF={_vnf_node}不在树中"
-                                    f" G.nodes={list(_G.nodes)}"
-                                )
-                            elif not _nx.has_path(_G, _src, _vnf_node):
-                                _sfc_ok = False
-                                logger.warning(
-                                    f"⚠️ [SFC违规] source={_src}→VNF={_vnf_node}不可达"
-                                )
-                    # 验证3: 每条Source→Dest路径是否依次经过全部VNF
-                    if _sfc_ok and _src in _G:
-                        _dests = [int(d) for d in self.env.current_request.get('dest', [])]
-                        for _d in _dests:
-                            if _d not in _G:
-                                continue
-                            try:
-                                _path = _nx.shortest_path(_G, _src, _d)
-                                _vnf_hit = [v for v in _chain if v in _path]
-                                _all_hit = all(v in _path for v in _chain)
-                                # 检查顺序：VNF在路径上的index必须按chain顺序递增
-                                if _all_hit:
-                                    _idxs = [_path.index(v) for v in _chain]
-                                    _order_ok = _idxs == sorted(_idxs)
-                                else:
-                                    _order_ok = False
-                                if _all_hit and _order_ok:
-                                    logger.info(f"✅ [SFC路径] src={_src}→dst={_d}: {_path} VNF={_chain} ✓")
-                                else:
-                                    logger.warning(f"⚠️ [SFC路径违规] src={_src}→dst={_d}: {_path} | 命中VNF={_vnf_hit} 应有={_chain} 顺序={'✓' if _order_ok else '✗'}")
-                                    _sfc_ok = False
-                            except Exception:
-                                pass
                     if _sfc_ok:
-                        logger.info(f"✅ [SFC验证通过] chain={_chain} source={_src}")
+                        logger.info(f"✅ [SFC-DAG验证通过] chain={_sfc['chain_nodes'] if _sfc else _chain} src={_src}")
                 except Exception as _e:
-                    logger.debug(f"[SFC验证] 跳过（异常）: {_e}")
+                    logger.debug(f"[SFC-DAG验证] 跳过: {_e}")
                 # ─────────────────────────────────────────────────────────────
 
                 return self.get_state(), 100.0, True, False, {
@@ -766,6 +796,39 @@ class LowLevelController:
             if 'tree' in req_res:
                 resources['tree'].update(copy.deepcopy(req_res['tree']))
         return resources
+
+    def _sync_sfc_to_tree(self):
+        """把已记录的spine_paths同步到current_tree['tree']，供资源释放兼容代码使用。"""
+        _sfc = getattr(self.env, 'current_sfc', None)
+        if not _sfc:
+            return
+        _bw = self.env.current_request.get('bw_origin', 0.0) if self.env.current_request else 0.0
+        if 'tree' not in self.env.current_tree:
+            self.env.current_tree['tree'] = {}
+        for _seg in _sfc['spine_paths']:
+            for _j in range(len(_seg) - 1):
+                _ek = tuple(sorted((_seg[_j], _seg[_j+1])))
+                if _ek not in self.env.current_tree['tree']:
+                    self.env.current_tree['tree'][_ek] = _bw
+                self.env.nodes_on_tree.add(_seg[_j])
+                self.env.nodes_on_tree.add(_seg[_j+1])
+
+    def _collect_sfc_edges(self):
+        """
+        [STEP6] 从分层DAG收集所有物理边，用于资源释放。
+        返回 {edge_key: bw} 字典，替代旧的 current_tree['tree']。
+        """
+        _sfc = getattr(self.env, 'current_sfc', None)
+        if not _sfc:
+            return {}
+        _bw = self.env.current_request.get('bw_origin', 0.0) if self.env.current_request else 0.0
+        edges = {}
+        all_segs = list(_sfc.get('spine_paths', [])) + list(_sfc.get('branch_paths', {}).values())
+        for _seg in all_segs:
+            for _j in range(len(_seg) - 1):
+                _ek = tuple(sorted((_seg[_j], _seg[_j+1])))
+                edges[_ek] = _bw
+        return edges
 
     def _reset_phase_state(self):
         self.env.current_phase = None

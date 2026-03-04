@@ -457,6 +457,14 @@ class SFC_HIRL_Env(gym.Env):
         self._need_reset_to_last_vnf = False
         # ─────────────────────────────────────────────────────────────────────
 
+        # ── [SFC-DAG] 分层流图结构（替代无向树）────────────────────────────
+        self.current_sfc = {
+            'chain_nodes': [],      # [v1, v2, v3] 已部署VNF节点列表
+            'spine_paths': [],      # [[s..v1], [v1..v2], [v2..v3]] 主干路径
+            'branch_paths': {}      # {dest: [v3..dest]} 分支路径
+        }
+        # ─────────────────────────────────────────────────────────────────────
+
         # HRL 分支管理状态
         self.branch_states = {}
         self.current_branch_id = None
@@ -782,6 +790,14 @@ class SFC_HIRL_Env(gym.Env):
         self.chain_nodes = []
         self.sfc_upstream_nodes = set()
         self._need_reset_to_last_vnf = False
+
+        # ── [SFC-DAG] 每个episode重置分层流图 ───────────────────────────────
+        self.current_sfc = {
+            'chain_nodes': [],
+            'spine_paths': [],
+            'branch_paths': {}
+        }
+        # ─────────────────────────────────────────────────────────────────────
 
         # 10. 获取下一个请求
         if self.online_mode:
