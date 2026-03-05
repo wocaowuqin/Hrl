@@ -329,9 +329,20 @@ def inject_dynamic_dimensions(config, env):
     if 'gnn' not in config:
         config['gnn'] = {}
 
-    config['gnn']['node_feat_dim'] = env.resource_mgr.node_feat_dim
-    config['gnn']['edge_feat_dim'] = env.resource_mgr.edge_feat_dim
-    config['gnn']['request_feat_dim'] = env.resource_mgr.request_dim
+    # ── [SDG-HRL] node_feat_dim 由 model.yaml 决定（20维），不再从 resource_mgr 覆盖
+    # resource_mgr.node_feat_dim = 6+K_vnf+3 = 17（旧计算公式，已过时）
+    # 只在 yaml 里没有配置时才用 resource_mgr 的值作为 fallback
+    if 'node_feat_dim' not in config['gnn']:
+        config['gnn']['node_feat_dim'] = env.resource_mgr.node_feat_dim
+        logger.info(f"  node_feat_dim (from env): {config['gnn']['node_feat_dim']}")
+    else:
+        logger.info(f"  node_feat_dim (from yaml): {config['gnn']['node_feat_dim']} ✓")
+
+    # edge_feat_dim 和 request_feat_dim 同样只作 fallback
+    if 'edge_feat_dim' not in config['gnn']:
+        config['gnn']['edge_feat_dim'] = env.resource_mgr.edge_feat_dim
+    if 'request_feat_dim' not in config['gnn']:
+        config['gnn']['request_feat_dim'] = env.resource_mgr.request_dim
 
     # 🔥 新增：注入 HRL 配置
     if 'hrl' not in config:
@@ -477,7 +488,7 @@ def main():
     args = argparse.Namespace(
         phase='phase3',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
         gpu=0,  # GPU ID, 设为 -1 则强制使用 CPU
-        seed=42,  # 随机种子
+        seed=100,  # 随机种子
         goal_strategy='adaptive'  # Phase 3 的目标策略: 'relative', 'adaptive', 'hybrid'
     )
     # =========================================================================
@@ -503,6 +514,23 @@ def main():
             setup_hrl_config(config)
             # 命令行参数覆盖
             config['hrl']['goal_strategy'] = args.goal_strategy
+
+            # ── RL 训练超参数（在 IL 预训练权重基础上微调）──────────
+            # 学习率要小：避免破坏 IL 预训练的好权重
+            # decay_steps 要大：让 epsilon 衰减慢一点，多探索
+            config['training'] = config.get('training', {})
+            config['training'].setdefault('lr_high',          1e-5)   # IL后微调用小lr
+            config['training'].setdefault('lr_low',           1e-5)   # 同上
+            config['training'].setdefault('batch_size',        64)    # 更稳定的梯度估计
+            config['training'].setdefault('gamma',            0.99)
+            config['training'].setdefault('target_update_freq', 500)  # 更频繁同步target网络
+            config['training'].setdefault('buffer_size',     100000)
+            config['training'].setdefault('epsilon', {
+                'initial':     0.20,   # 从0.2开始（IL已有好底子，不需要太多随机）
+                'final':       0.02,   # 衰减到0.02（几乎全利用）
+                'decay_steps': 150000, # 2000ep × 75步 = 15万步，整个训练期间线性衰减
+            })
+            logger.info("✅ RL 训练超参数已注入 (小学习率微调模式)")
 
         logger.info(f"✅ 配置加载成功")
     except Exception as e:
@@ -580,11 +608,34 @@ def main():
         logger.info("=" * 70)
 
         try:
-            # 直接使用上面初始化的全局 env
-            expert_solver = env.policy_helper.expert
+            # 直接实例化 MSFCE_Solver，不依赖 env.policy_helper
+            from core.expert.expert_msfce.core.solver import MSFCE_Solver
+            from core.expert.expert_msfce.utils.config import SolverConfig
+            from pathlib import Path
+
+            ckpt_dir  = get_config_path(config, 'ckpt_dir')
+            input_dir = config.get('path', config.get('paths', {})).get('input_dir', 'data/input_dir')
+            path_db   = Path(input_dir) / 'US_Backbone_path.mat'
+
+            topo_matrix = config['topology']['matrix']  # 真实拓扑（在上面已加载）
+            dc_nodes    = config.get('env', {}).get('dc_nodes', list(range(topo_matrix.shape[0])))
+            capacities  = {
+                'cpu':       config.get('env', {}).get('cap_cpu',       80.0),
+                'memory':    config.get('env', {}).get('cap_mem',       60.0),
+                'bandwidth': config.get('env', {}).get('link_capacity', 90.0),
+            }
+
+            expert_solver = MSFCE_Solver(
+                path_db_file=path_db,
+                topology_matrix=topo_matrix,
+                dc_nodes=dc_nodes,
+                capacities=capacities,
+                config=SolverConfig(),
+            )
             logger.info("✅ Expert Solver 已加载")
         except Exception as e:
             logger.error(f"❌ Expert Solver 获取失败: {e}")
+            import traceback; traceback.print_exc()
             return
 
         output_dir = get_config_path(config, 'expert_data_dir')
@@ -695,6 +746,47 @@ def main():
 
             logger.info("✅ Agent 初始化成功")
 
+            # ── [SDG-HRL] 实例化 GNN Wrapper 并注入 agent.encoder ──────────
+            # MulticastGATWrapperVectorized.gat.encoder = SharedEncoder(含 tree_bias)
+            # 注入后 _get_graph_embedding() 将使用真实 GNN 特征而非 zeros
+            try:
+                from core.gnn.multicast_gat_wrapper_vectorized import MulticastGATWrapperVectorized
+                _gnn_cfg = config.get('gnn', {})
+                _gnn_wrapper = MulticastGATWrapperVectorized(
+                    node_feat_dim  = _gnn_cfg.get('node_feat_dim',  20),
+                    edge_feat_dim  = _gnn_cfg.get('edge_feat_dim',   5),
+                    request_dim    = _gnn_cfg.get('request_feat_dim', 24),
+                    n_actions      = _gnn_cfg.get('num_actions',     28),
+                    hidden_dim     = _gnn_cfg.get('hidden_dim',     128),
+                    num_gat_layers = _gnn_cfg.get('num_gat_layers',   2),
+                    num_heads      = _gnn_cfg.get('num_heads',        4),
+                ).to(agent.device)
+
+                # 注入：agent.encoder 指向 wrapper 内部的 SharedEncoder
+                # _get_graph_embedding 会调用 encoder(x, edge_index, batch)
+                agent.encoder = _gnn_wrapper.gat.encoder
+                agent.encoder.train()  # 允许梯度更新（随 low_policy 一起训练）
+                for param in agent.encoder.parameters():
+                    param.requires_grad = True
+
+                # 同时把 wrapper 保存到 agent，方便后续访问
+                agent.gnn_wrapper = _gnn_wrapper
+
+                logger.info(f"✅ [SDG-HRL] GNN Wrapper 注入成功")
+                logger.info(f"   node_feat_dim={_gnn_cfg.get('node_feat_dim',20)}, "
+                            f"tree_bias={agent.encoder.tree_bias.item():.3f}")
+
+                # ── [关键] 将 encoder 参数加入 optimizer_low ────────────────
+                # 不调用此方法，tree_bias 有梯度但不会被 step() 更新（永远=0.5）
+                if hasattr(agent, 'register_encoder_to_optimizer'):
+                    agent.register_encoder_to_optimizer(
+                        lr=config.get('training', {}).get('lr_low', 1e-4) * 0.1
+                    )
+            except Exception as _e:
+                logger.warning(f"⚠️ [SDG-HRL] GNN Wrapper 注入失败（不影响训练）: {_e}")
+                import traceback; traceback.print_exc()
+            # ──────────────────────────────────────────────────────────────
+
         except Exception as e:
             logger.error(f"❌ Agent 初始化失败: {e}")
             import traceback
@@ -703,7 +795,10 @@ def main():
 
         # 2. 加载预训练模型 (智能适配版)
         ckpt_dir = get_config_path(config, 'ckpt_dir')
-        pretrained_path = os.path.join(ckpt_dir, "il_model_final.pth")
+        # 优先加载验证集最优模型（早停保存），回退到 final
+        pretrained_path = os.path.join(ckpt_dir, "il_model_best.pth")
+        if not os.path.exists(pretrained_path):
+            pretrained_path = os.path.join(ckpt_dir, "il_model_final.pth")
 
         if os.path.exists(pretrained_path):
             logger.info(f"📥 正在加载预训练模型: {pretrained_path}")
@@ -747,6 +842,19 @@ def main():
                 logger.error(f"❌ 模型加载错误: {e}")
         else:
             logger.warning(f"⚠️ 未找到预训练模型: {pretrained_path}")
+
+        # ── Phase3 开始前重置 optimizer lr（IL 训练后 lr 可能被 scheduler 降低）──
+        # 使用 config 里设置的小 lr（1e-5），确保 RL 微调阶段不破坏 IL 权重
+        rl_lr_high = config.get('training', {}).get('lr_high', 1e-5)
+        rl_lr_low  = config.get('training', {}).get('lr_low',  1e-5)
+        if hasattr(agent, 'optimizer_high'):
+            for pg in agent.optimizer_high.param_groups:
+                pg['lr'] = rl_lr_high
+            logger.info(f"🔧 重置 optimizer_high lr = {rl_lr_high}")
+        if hasattr(agent, 'optimizer_low'):
+            for pg in agent.optimizer_low.param_groups:
+                pg['lr'] = rl_lr_low
+            logger.info(f"🔧 重置 optimizer_low  lr = {rl_lr_low}")
 
         # =========================================================
         # 🔥 初始化 HRL Coordinator

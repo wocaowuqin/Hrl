@@ -227,7 +227,7 @@ def analyze_requests(requests):
 def main():
     """主函数"""
 
-    dataset_path = r"E:\pycharmworkspace\HRL-GNN for Multicast-aware SFC Orchestration\data\input_dir\phase3_events_by_slot.pkl"
+    dataset_path = r"/data/input_dir/时间间隔为5请求到达率为8时/phase3_events_by_slot.pkl"
 
     # 尝试查找请求文件
     import os

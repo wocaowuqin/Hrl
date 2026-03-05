@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
-from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn import GATv2Conv, GCNConv
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +24,15 @@ class SharedEncoder(nn.Module):
         # ====================================================
 
         # 默认配置
-        node_feat_dim = 17
+        node_feat_dim = 20          # [SDG-HRL] 17→20（+vnf_depth, is_dc, progress_ratio）
         edge_feat_dim = 5
         request_dim = 24
         hidden_dim = 128
         self.num_layers = kwargs.get('num_layers', 2)
 
-        # 🔥 新增：动态特征维度（默认最后3维）
-        self.num_dynamic_features = kwargs.get('num_dynamic_features', 3)
+        # [SDG-HRL] 动态特征维度：原3维 → 新6维
+        # [tree_mask, connected_mask, is_target, vnf_depth, is_dc, progress_ratio]
+        self.num_dynamic_features = kwargs.get('num_dynamic_features', 6)
 
         # 情况 A: 传入了一个 config 对象或字典
         if len(args) == 1 and (isinstance(args[0], dict) or hasattr(args[0], 'get') or hasattr(args[0], 'gnn')):
@@ -73,11 +74,12 @@ class SharedEncoder(nn.Module):
         # 🔥 计算静态特征维度
         self.static_feat_dim = self.node_feat_dim - self.num_dynamic_features
 
-        logger.info(f"🔍 [SharedEncoder V2.0] Init:")
-        logger.info(f"   Total Node Feat: {self.node_feat_dim}")
-        logger.info(f"   Static Feat: {self.static_feat_dim}")
-        logger.info(f"   Dynamic Feat: {self.num_dynamic_features}")
-        logger.info(f"   Edge: {self.edge_feat_dim}, Req: {self.request_dim}, Hidden: {self.hidden_dim}")
+        logger.info(f"🔍 [SharedEncoder SDG-HRL] Init:")
+        logger.info(f"   Total Node Feat: {self.node_feat_dim} (static={self.static_feat_dim}, dynamic={self.num_dynamic_features})")
+        logger.info(f"   Dynamic dims: [tree_mask, connected_mask, is_target, vnf_depth, is_dc, progress_ratio]")
+        logger.info(f"   Edge: {self.edge_feat_dim} [bw_rem, bw_use, hop, is_tree_edge, reserved]")
+        logger.info(f"   Request: {self.request_dim}, Hidden: {self.hidden_dim}")
+        logger.info(f"   Tree-aware Bias: learnable scalar (init=0.5)")
 
         # ====================================================
         # 2. 网络构建 - 双流架构
@@ -118,6 +120,21 @@ class SharedEncoder(nn.Module):
         self.fusion = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
         self.output_dim = self.hidden_dim
 
+        # ── [TA-HGRL] Tree Stream：仅在多播树边上做消息传递 ───────────────
+        self.tree_conv1 = GCNConv(self.static_feat_dim, self.hidden_dim)
+        self.tree_conv2 = GCNConv(self.hidden_dim, self.hidden_dim)
+        self.tree_fusion = nn.Sequential(
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU()
+        )
+
+        # ── [SDG-HRL] Tree-aware Attention Bias ─────────────────────────────
+        # 可学习标量参数，调制树边的注意力权重
+        # 初始化为0.5（轻微正偏置），训练中自适应调整
+        # 理论动机：多播树构建倾向于沿已建立结构生长（inductive bias）
+        self.tree_bias = nn.Parameter(torch.tensor(0.5))
+
         # 状态标记
         self._warned = set()
         self._step_count = 0
@@ -146,60 +163,106 @@ class SharedEncoder(nn.Module):
             # 截断
             return tensor[..., :expected_dim]
 
-    def forward(self, x, edge_index, edge_attr=None, req_vec=None, batch=None):
+    def forward(self, x, edge_index, edge_attr=None, req_vec=None, batch=None, tree_edge_index=None):
         device = x.device
         self._step_count += 1
 
         # 1. 自动修复节点特征
         x = self._fix_dim(x, self.node_feat_dim, "node_feat")
 
-        # 🔥🔥🔥 2. 显式分离静态和动态特征
-        static_x = x[:, :-self.num_dynamic_features]  # 前N-3维：静态拓扑特征
-        dynamic_x = x[:, -self.num_dynamic_features:]  # 后3维：[tree_mask, connected_mask, progress_ratio]
+        # ── [SDG-HRL] 2. 显式分离静态和动态特征 ─────────────────────────────
+        # 静态流 (dim 0 ~ N-6): CPU/Mem/fit + padding
+        # 动态流 (dim N-6 ~ N): tree_mask, connected_mask, is_target,
+        #                        vnf_depth, is_dc, progress_ratio
+        static_x  = x[:, :-self.num_dynamic_features]   # [N, 14]
+        dynamic_x = x[:, -self.num_dynamic_features:]   # [N, 6]
 
-        # 3. 提取进度信号（假设动态特征第3维是进度）
-        # progress_ratio 范围 [0.0, 1.0]
-        progress_ratio = dynamic_x[:, -1:]
-        is_completed = (progress_ratio >= 0.99).float()  # 判定任务是否已部署完成
+        # ── [SDG-HRL] 3. 从动态特征中提取各语义子维度 ──────────────────────
+        # dim 5 (index -1) = progress_ratio: 全局SFC完成度
+        # dim 4 (index -2) = is_dc:          是否DC节点
+        # dim 3 (index -3) = vnf_depth:      SFC链路位置编码
+        progress_ratio = dynamic_x[:, -1:]              # [N, 1] ∈ [0,1]
+        is_dc_feat     = dynamic_x[:, -2:-1]            # [N, 1] ∈ {0,1}
+        vnf_depth_feat = dynamic_x[:, -3:-2]            # [N, 1] ∈ [0,1]
+        is_completed   = (progress_ratio >= 0.99).float()
 
         # 4. 自动修复边缘特征
         if self.edge_feat_dim > 0:
+            num_edges = edge_index.shape[1]
             if edge_attr is None:
-                num_edges = edge_index.shape[1]
                 edge_attr = torch.zeros(num_edges, self.edge_feat_dim, device=device)
             else:
                 edge_attr = self._fix_dim(edge_attr, self.edge_feat_dim, "edge_attr")
+                if edge_attr.shape[0] != num_edges:
+                    edge_attr = torch.zeros(num_edges, self.edge_feat_dim, device=device)        # ── [SDG-HRL] 5. Tree-aware Attention Bias ──────────────────────────
+        # is_tree_edge = edge_attr[:, 3] ∈ {0,1}
+        # 通过可学习参数 tree_bias 对树边的注意力权重施加归纳偏置
+        # 物理意义：鼓励GNN优先沿已建立的多播树结构传播信息
+        #   tree_bias > 0 → 树边信息权重更强（期望收敛后 bias > 0）
+        #   tree_bias < 0 → 抑制树内传播（不期望，但允许学习）
+        # 防御：经验回放里可能存有旧格式的 1D edge_attr，需先修复为 2D
+        if edge_attr.dim() == 1:
+            # 1D → reshape 为 [E, 1]，再 pad 到标准5维
+            edge_attr = edge_attr.unsqueeze(1)
+        if edge_attr.shape[1] < self.edge_feat_dim:
+            pad = torch.zeros(
+                edge_attr.shape[0],
+                self.edge_feat_dim - edge_attr.shape[1],
+                device=edge_attr.device
+            )
+            edge_attr = torch.cat([edge_attr, pad], dim=1)
 
-        # 🔵 5. 静态流：GAT卷积捕捉拓扑结构
+        biased_edge_attr = edge_attr.clone()
+        if edge_attr.shape[1] >= 4:
+            is_tree_edge = edge_attr[:, 3:4]
+            # 路径A: 树边专属增强（is_tree_edge=1时才激活）
+            tree_boost_conditional = self.tree_bias * is_tree_edge
+            # 路径B: 全局偏置（0.01 × tree_bias 让梯度始终非零，不依赖is_tree_edge）
+            tree_boost_global = self.tree_bias * 1.0
+            biased_edge_attr = torch.cat([
+                edge_attr[:, 0:1] + tree_boost_conditional + tree_boost_global,
+                edge_attr[:, 1:]
+            ], dim=1)
+
+        # 🔵 6. 静态流：GATv2卷积（使用 biased edge_attr）
         try:
-            static_emb = self.conv1(static_x, edge_index, edge_attr=edge_attr)
+            static_emb = self.conv1(static_x, edge_index, edge_attr=biased_edge_attr)
             static_emb = F.relu(static_emb)
-            static_emb = self.conv2(static_emb, edge_index, edge_attr=edge_attr)
+            static_emb = self.conv2(static_emb, edge_index, edge_attr=biased_edge_attr)
             static_emb = F.relu(static_emb)
         except RuntimeError as e:
             logger.error(f"❌ [SharedEncoder] GAT Forward Failed: {e}")
             raise e
 
-        # 🟢 6. 动态流：MLP处理状态特征
+        # ── [TA-HGRL] 7a. Tree Stream ────────────────────────────────────
+        n_nodes = static_x.size(0)
+        if tree_edge_index is None or tree_edge_index.size(1) == 0:
+            _sl = torch.arange(n_nodes, device=device).unsqueeze(0).repeat(2, 1)
+            tree_ei = _sl
+        else:
+            tree_ei = tree_edge_index.to(device)
+        tree_emb = F.relu(self.tree_conv1(static_x, tree_ei))
+        tree_emb = F.relu(self.tree_conv2(tree_emb,  tree_ei))
+        # 双流融合：Topology + Tree → 结构感知节点嵌入
+        static_emb = self.tree_fusion(torch.cat([static_emb, tree_emb], dim=-1))
+
+        # 🟢 7b. 动态流：MLP处理6维状态特征
         state_emb = F.relu(self.state_fc1(dynamic_x))
         state_emb = F.relu(self.state_fc2(state_emb))
 
-        # 🔥 7. 增强版门控机制：引入完成态强力抑制
-        # 原有的注意力权重
+        # ── [SDG-HRL] 8. 增强版门控融合 ──────────────────────────────────────
+        # 门控由完整6维动态特征驱动（包含vnf_depth和is_dc信号）
         gate_weights = torch.sigmoid(self.gate_fc(dynamic_x))
 
-        # 🔥 [新增逻辑] 如果进度已满，大幅降低静态特征(拓扑惯性)的影响力
-        # 这会减弱 Agent 留在旧有树节点(静态特征强)的倾向，迫使它关注目的地
-        completion_inhibition = 1.0 - (is_completed * 0.8)  # 进度满时削弱 80% 拓扑特征
+        # 完成态抑制：VNF全部部署后压制拓扑惯性，迫使agent关注dest
+        completion_inhibition = 1.0 - (is_completed * 0.8)
         gate_weights = gate_weights * completion_inhibition
 
-        # 🔥 融合：动态特征通过增强门控调制静态特征
+        # 融合：树感知静态流 × 门控 + 动态流（完成态放大）
         modulated_static = static_emb * gate_weights
-
-        # 进度满时，让 state_emb（包含进度信息）占据主导地位
         node_emb = modulated_static + (state_emb * (1.0 + is_completed * 2.0))
 
-        # 8. 请求特征处理 (保持原有逻辑)
+        # 9. 请求特征处理（保持原有逻辑）
         if self.req_fc is not None:
             if req_vec is None:
                 batch_size = 1 if batch is None else (batch.max().item() + 1)
@@ -212,7 +275,7 @@ class SharedEncoder(nn.Module):
             batch_size = 1 if batch is None else (batch.max().item() + 1)
             req_emb = torch.zeros(batch_size, self.hidden_dim, device=device)
 
-        # 9. 智能扩展
+        # 10. 智能扩展
         if batch is None:
             batch = torch.zeros(node_emb.size(0), dtype=torch.long, device=device)
 
@@ -225,8 +288,11 @@ class SharedEncoder(nn.Module):
             else:
                 req_expanded = req_emb[batch]
 
-        # 10. 最终融合
+# 11. 最终融合
         combined = torch.cat([node_emb, req_expanded], dim=-1)
         out = self.fusion(combined)
+
+        # ── [SDG-HRL] tree_bias 直接调制输出，梯度路径最短 ─────────────────
+        out = out * (1.0 + 0.1 * self.tree_bias)
 
         return out

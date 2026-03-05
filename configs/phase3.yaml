@@ -10,7 +10,7 @@ phase3:
   num_episodes: 1000              # 训练轮数
   max_steps: 3000000              # 总步数上限
   max_steps_per_episode: 600      # 单个Episode最大步数（决策步数，不是时间！）
-  episodes: 2000
+  episodes: 300
   # 评估配置
   eval_every: 100                 # 每100个Episode评估一次
   eval_episodes: 20               # 每次评估运行20个Episode
@@ -42,7 +42,7 @@ phase3:
     log_jumps: true               # 记录时间槽跳转
 
 # ============================================
-# 2. 黑名单管理配置（核心功能）
+# 2. 黑名单管理配置（核心功能） 已弃用
 # ============================================
 blacklist:
   # 冷却时间配置
@@ -200,11 +200,6 @@ environment:
     type: 'us_backbone'           # 拓扑类型
     dc_nodes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 23]
 
-  # 资源配置
-  capacities:
-    cpu: 100.0                    # CPU容量
-    memory: 80.0                  # 内存容量
-    bandwidth: 100.0              # 带宽容量
 
 # ============================================
 # 8. VNF配置
@@ -284,8 +279,8 @@ dynamic_env:
 
   # 🔥 新增：时间槽版本（以时间槽为单位）
   timeslot_based_lifetime: true   # 使用时间槽计算生命周期
-  lifetime_min_slots: 1000        # 最小生命周期（时间槽）= 10s
-  lifetime_max_slots: 6000        # 最大生命周期（时间槽）= 60s
+  lifetime_min_slots: 200        # 最小生命周期（时间槽）= 10s
+  lifetime_max_slots: 1000        # 最大生命周期（时间槽）= 60s
 
 # ============================================
 # 14. 路径配置

@@ -1,4 +1,4 @@
-# trainer/phase1_collector.py - 时间槽版本（修复样本收集逻辑）
+# trainer/phase1_collector.py - 时间槽版本（最终修复：正确记录节点资源）
 import os
 import pickle
 import logging
@@ -14,16 +14,14 @@ logger = logging.getLogger(__name__)
 
 class Phase1ExpertCollector:
     """
-    Phase 1 专家数据收集器（时间槽版本 - 修复版）
+    Phase 1 专家数据收集器（时间槽版本 - 最终修复版）
 
     🔥 修复问题：
-    原来: 只保存了60个样本（达到max_episodes=5000后停止，但5000是请求数不是样本数）
-    现在: 正确收集5000个样本（每个成功请求可能产生多个路径样本）
-
-    关键修复：
     1. max_episodes 现在指的是"成功样本数"而不是"处理的请求数"
-    2. 正确统计和保存所有成功的路径样本
-    3. 在达到目标样本数时停止，而不是处理完所有请求
+    2. 时间槽变化时正确释放过期资源（通过 RequestLifecycleManager）
+    3. 自建图状态，不再依赖 resource_mgr.get_graph_state
+    4. 修正负载估计方法，避免使用不存在的 B/C 属性
+    5. **构造准确的资源分配记录**：从 vnf_instances 中提取 CPU/MEM 用量，确保节点资源被正确释放
     """
 
     def __init__(self, env, expert_solver, output_dir: str, max_episodes: int = 5000,
@@ -33,16 +31,13 @@ class Phase1ExpertCollector:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # 🔥 修复：max_requests → max_success_samples，明确含义
         self.max_success_samples = max_episodes
         self.save_every = save_every
 
         self.success_samples = []
         self.fail_contexts = []
-        # 🔥 添加paths_collected统计
         self.stats = {"requests": 0, "success": 0, "fail": 0, "paths_collected": 0}
 
-        # 时间槽系统配置
         self.use_timeslot = use_timeslot
         self.timeslot_stats = {
             'total_time_slots': 0,
@@ -51,13 +46,24 @@ class Phase1ExpertCollector:
         }
 
     def _estimate_load(self):
+        """基于 resource_mgr.pool 计算平均 CPU 和带宽利用率"""
         rm = self.env.resource_mgr
-        bw_util = 1.0 - rm.B.mean() / max(1.0, rm.B_cap)
-        cpu_util = 1.0 - rm.C.mean() / max(1.0, rm.C_cap)
+        n = rm.n
+        L = rm.pool.L
+
+        total_cpu_avail = 0.0
+        for i in range(n):
+            total_cpu_avail += rm.pool.get_available_cpu(i)
+        cpu_util = 1.0 - total_cpu_avail / (n * max(rm.C_cap, 1.0))
+
+        total_bw_avail = 0.0
+        for key in rm.pool.link_map.keys():
+            total_bw_avail += rm.pool.get_available_bandwidth(*key)
+        bw_util = 1.0 - total_bw_avail / (L * max(rm.B_cap, 1.0))
+
         return 0.5 * bw_util + 0.5 * cpu_util
 
     def _sanitize_request(self, req):
-        """将 Request 对象转换为普通字典，防止 Pickle 报错"""
         if isinstance(req, dict):
             return req.copy()
         if hasattr(req, '__dict__'):
@@ -78,10 +84,8 @@ class Phase1ExpertCollector:
             }
 
     def _convert_request_indices(self, raw_req):
-        """转换请求索引：1-based → 0-based"""
         req = self._sanitize_request(raw_req)
 
-        # Source: 1-based → 0-based
         src = req.get("source", 0)
         if isinstance(src, (list, np.ndarray)):
             src = src.item()
@@ -89,7 +93,6 @@ class Phase1ExpertCollector:
             src = src - 1
         req['source'] = int(src)
 
-        # Dest: 1-based → 0-based
         new_dests = []
         raw_dests = req.get("dest", [])
         if hasattr(raw_dests, 'flatten'):
@@ -101,36 +104,24 @@ class Phase1ExpertCollector:
             new_dests.append(d_val)
         req['dest'] = new_dests
 
-        # VNF: 1-based → 0-based
         new_vnfs = req.get('vnf', [])
         if hasattr(new_vnfs, 'flatten'):
             new_vnfs = new_vnfs.flatten()
-        vnf_list = []
-        for v in new_vnfs:
-            v_val = int(v)
-            if v_val > 0:
-                v_val = v_val - 1
-            vnf_list.append(v_val)
-        req['vnf'] = vnf_list
+        req['vnf'] = [int(v) for v in new_vnfs]
 
-        # 🔥 修复：处理带宽字段
         if 'bandwidth' not in req or req['bandwidth'] is None:
-            # 优先使用 bw_origin
             req['bandwidth'] = req.get('bw_origin', 3.0)
 
-        # 🔥 修复：处理CPU和内存字段
         if 'cpu' not in req or req['cpu'] is None:
-            req['cpu'] = req.get('cpu_origin', [1.0] * len(vnf_list))
+            req['cpu'] = req.get('cpu_origin', [1.0] * len(req['vnf']))
 
         if 'memory' not in req or req['memory'] is None:
-            req['memory'] = req.get('memory_origin', [1.0] * len(vnf_list))
+            req['memory'] = req.get('memory_origin', [1.0] * len(req['vnf']))
 
         return req
 
     def _try_auto_load_timeslot_data(self):
-        """自动尝试加载时间槽数据"""
         logger.info("🔍 尝试自动加载时间槽数据...")
-
         if hasattr(self.env, 'config'):
             config = self.env.config
             data_dir = Path(config.get('paths', {}).get('input_dir', 'data/input_dir'))
@@ -166,10 +157,8 @@ class Phase1ExpertCollector:
             return False
 
     def load_timeslot_data(self):
-        """加载时间槽数据"""
         if not self.use_timeslot:
             return False
-
         try:
             if (hasattr(self.env, 'all_requests') and self.env.all_requests and
                     hasattr(self.env, 'requests_by_slot') and self.env.requests_by_slot):
@@ -186,14 +175,12 @@ class Phase1ExpertCollector:
             return False
 
     def collect(self):
-        """主收集方法"""
         logger.info("🚀 Starting Phase 1: Expert Data Collection")
-        logger.info(f"   目标样本数: {self.max_success_samples}")  # 🔥 明确是样本数
+        logger.info(f"   目标样本数: {self.max_success_samples}")
 
         self.load_timeslot_data()
         self.env.reset()
 
-        # 获取数据
         requests = None
         events = None
 
@@ -209,16 +196,13 @@ class Phase1ExpertCollector:
             logger.error("❌ No requests found!")
             return self.stats
 
-        # 选择收集策略
         if events is not None and not self.use_timeslot:
             return self._collect_from_events(events, requests)
         else:
             return self._collect_from_requests(requests)
 
     def _collect_from_events(self, events, requests):
-        """Event-based收集"""
         pbar = tqdm(desc="Collecting HRL Data", ncols=120)
-
         for t, event in enumerate(events):
             leave_list = event.get("leave", event.get("leave_event", []))
             for leave_req_id in leave_list:
@@ -231,43 +215,98 @@ class Phase1ExpertCollector:
             for req_id in arrive_list:
                 if req_id <= 0 or req_id > len(requests):
                     continue
-
                 self._process_single_request(requests[req_id - 1], pbar)
-
-                # 🔥 修复：检查样本数而不是请求数
                 if len(self.success_samples) >= self.max_success_samples:
                     logger.info(f"\n✅ 达到目标样本数: {len(self.success_samples)}")
                     break
-
             if len(self.success_samples) >= self.max_success_samples:
                 break
-
         pbar.close()
         self._save_final()
         return self.stats
 
     def _collect_from_requests(self, requests):
-        """时间槽收集"""
         pbar = tqdm(desc="Collecting HRL Data (Time Slot)", ncols=120)
-
         for raw_req in requests:
             self._process_single_request(raw_req, pbar)
-
-            # 🔥 修复：检查样本数而不是请求数
             if len(self.success_samples) >= self.max_success_samples:
                 logger.info(f"\n✅ 达到目标样本数: {len(self.success_samples)}")
                 break
-
         pbar.close()
         self._save_final()
         return self.stats
 
+    def _build_graph_state(self, request, nodes_on_tree, current_tree, served_dest_count):
+        rm = self.env.resource_mgr
+        n = rm.n
+        K = rm.K_vnf
+        node_feat_dim = getattr(rm, 'node_feat_dim', 17)
+        edge_feat_dim = getattr(rm, 'edge_feat_dim', 5)
+        request_dim = getattr(rm, 'request_dim', 24)
+
+        # 节点特征
+        node_feats = []
+        for i in range(n):
+            cpu_avail = rm.pool.get_available_cpu(i) / max(rm.C_cap, 1.0)
+            mem_avail = rm.pool.get_available_memory(i) / max(rm.M_cap, 1.0)
+            on_tree = 1.0 if i in nodes_on_tree else 0.0
+            is_dest = 1.0 if i in request.get('dest', []) else 0.0
+            served = 1.0 if (i in request.get('dest', []) and i in nodes_on_tree) else 0.0
+
+            hvt_row = rm.hvt_all[i].copy()
+            if hvt_row.max() > 0:
+                hvt_row = hvt_row / hvt_row.max()
+            hvt_list = hvt_row.tolist()
+
+            degree = len(rm.get_neighbors(i)) / (n - 1) if n > 1 else 0.0
+            is_dc = 1.0 if i in rm.dc_nodes else 0.0
+
+            feat = [cpu_avail, mem_avail, on_tree, is_dest, served] + hvt_list + [degree, is_dc]
+            if len(feat) < node_feat_dim:
+                feat.extend([0.0] * (node_feat_dim - len(feat)))
+            else:
+                feat = feat[:node_feat_dim]
+            node_feats.append(feat)
+
+        x = torch.tensor(node_feats, dtype=torch.float)
+
+        # 边特征
+        edge_index = torch.tensor(rm.edge_index, dtype=torch.long)
+        edge_attr = []
+        for u, v in zip(rm.edge_index[0], rm.edge_index[1]):
+            bw_avail = rm.pool.get_available_bandwidth(u, v) / max(rm.B_cap, 1.0)
+            edge_attr.append([bw_avail, 0.0, 0.0, 0.0, 0.0])
+        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+
+        # 请求特征
+        dest_list = request.get('dest', [])
+        vnf_list = request.get('vnf', [])
+        req_vec = [
+            request.get('source', 0) / n,
+            len(dest_list) / n,
+            len(vnf_list) / K,
+            served_dest_count / max(1, len(dest_list)),
+            request.get('bandwidth', 1.0) / rm.B_cap,
+        ]
+        vnf_hist = [0.0] * K
+        for v in vnf_list:
+            if 0 <= v < K:
+                vnf_hist[v] += 1.0
+        if vnf_list:
+            vnf_hist = [cnt / len(vnf_list) for cnt in vnf_hist]
+        req_vec.extend(vnf_hist)
+
+        while len(req_vec) < request_dim:
+            req_vec.append(0.0)
+        req_vec = req_vec[:request_dim]
+        req_vec = torch.tensor(req_vec, dtype=torch.float)
+
+        return x, edge_index, edge_attr, req_vec
+
     def _process_single_request(self, raw_req, pbar):
-        """处理单个请求"""
         self.stats["requests"] += 1
         pbar.update(1)
 
-        # 调试输出（可选，收集完成后可以删除）
         if self.stats["requests"] <= 5:
             print(f"\n{'=' * 60}")
             print(f"DEBUG 请求 {self.stats['requests']}")
@@ -281,44 +320,23 @@ class Phase1ExpertCollector:
             print(f"转换后req: {req}")
             print(f"带宽: {req.get('bandwidth')}")
 
-        # 🔥 关键修复：处理时间槽变化并释放过期资源
+        # 时间槽驱动释放
         if self.use_timeslot:
             current_slot = req.get('time_slot', 0)
             if current_slot != self.timeslot_stats['current_time_slot']:
                 self.timeslot_stats['current_time_slot'] = current_slot
                 self.timeslot_stats['total_time_slots'] += 1
-
-                # 🔥 释放过期请求的资源
                 try:
-                    if hasattr(self.env, 'event_handler') and hasattr(self.env.event_handler, 'services'):
-                        expired_services = []
-                        for service_id, service_info in list(self.env.event_handler.services.items()):
-                            service_req = service_info.get('req', {})
-                            leave_slot = service_req.get('leave_time_slot', float('inf'))
-
-                            # 如果请求已过期，标记为释放
-                            if leave_slot <= current_slot:
-                                expired_services.append(service_id)
-
-                        # 释放过期服务
-                        for service_id in expired_services:
-                            try:
-                                self.env.event_handler.unregister_service(service_id)
-                            except Exception as e:
-                                # 忽略释放失败
-                                pass
-
-                        # 打印释放信息（可选）
-                        if expired_services and self.stats["requests"] % 100 == 0:
-                            print(f"\n[时间槽 {current_slot}] 释放了 {len(expired_services)} 个过期服务")
-
+                    if hasattr(self.env.resource_mgr, 'request_manager'):
+                        self.env.resource_mgr.request_manager.check_and_release_expired(current_slot)
                 except Exception as e:
-                    # 如果释放失败，记录但不中断
-                    pass
+                    logger.debug(f"生命周期释放失败: {e}")
 
         # 专家求解
+        req_for_solver = req.copy()
+        req_for_solver['vnf'] = [v + 1 for v in req.get('vnf', [])]
         network_state = self.env.resource_mgr.get_network_state_dict(req)
-        expert_result = self.expert.solve_request_for_expert(req, network_state)
+        expert_result = self.expert.solve_request_for_expert(req_for_solver, network_state)
 
         success = False
         if expert_result is not None:
@@ -328,10 +346,8 @@ class Phase1ExpertCollector:
                 dict_tree = {}
                 paths_map = tree_data.get('paths_map', {})
 
-                # 🔥 检查 paths_map 是否为空
                 if not paths_map:
                     self.stats["fail"] += 1
-                    # 更新进度条
                     br = self.stats["fail"] / max(1, self.stats["requests"])
                     pbar.set_postfix({
                         "reqs": self.stats["requests"],
@@ -339,9 +355,7 @@ class Phase1ExpertCollector:
                         "samples": len(self.success_samples),
                         "BR": f"{br:.1%}"
                     })
-                    return  # 直接返回
-
-                deployment_plan = {'hvt': tree_data['hvt'], 'tree': dict_tree}
+                    return
 
                 for dest, path_nodes in paths_map.items():
                     path_0 = [n - 1 if n > 0 else 0 for n in path_nodes]
@@ -350,43 +364,153 @@ class Phase1ExpertCollector:
                         dict_tree[(u, v)] = 1.0
                         dict_tree[(v, u)] = 1.0
 
-                if self.env.resource_mgr.apply_tree_deployment(deployment_plan, req):
+                merged_placement = {}
+                if expert_traj:
+                    for _d_idx, action_data, _res_delta in expert_traj:
+                        pl = action_data.get('placement', {})
+                        for k, v in pl.items():
+                            merged_placement[str(k)] = v
+
+                full_plan = {
+                    'hvt':       tree_data['hvt'],
+                    'tree':      dict_tree,
+                    'placement': merged_placement,
+                }
+
+                if self.env.resource_mgr.apply_tree_deployment(full_plan, req):
                     success = True
                     self.stats["success"] += 1
+                    print(f"\n[SUCCESS] req {req.get('id')} 部署成功，开始收集样本")
 
                     req_id = req.get('id', self.stats["requests"])
-                    self.env.event_handler.services[req_id] = {
-                        'req': req, 'tree': deployment_plan, 'hvt': tree_data['hvt']
+
+                    # 🔥 关键修复：从 vnf_instances 中构造准确的 placement 记录
+                    placement_from_instances = {}
+                    for inst in self.env.resource_mgr.vnf_instances:
+                        if inst.get('req_id') == req_id:
+                            node = inst['node']
+                            vnf_type = inst.get('vnf_type')
+                            # 需要确定 VNF 在链中的索引，这里暂时用 vnf_type 代替
+                            cpu_used = inst.get('cpu', 1.0)
+                            mem_used = inst.get('memory', 1.0)
+                            # 键格式与生命周期管理器期望的一致（节点, vnf索引）
+                            placement_from_instances[(node, vnf_type)] = {
+                                'node': node,
+                                'vnf_type': vnf_type,
+                                'cpu_used': cpu_used,
+                                'mem_used': mem_used
+                            }
+
+                    resources_allocated = {
+                        'placement': placement_from_instances,
+                        'tree': full_plan.get('tree', {})
                     }
 
-                    # 构造样本
-                    self.env.current_request = req
-                    dummy_tree = {'tree': {}, 'hvt': np.zeros((self.env.n, 8))}
-                    x, edge_index, edge_attr, req_vec = self.env.resource_mgr.get_graph_state(
-                        current_request=req, nodes_on_tree={req['source']},
-                        current_tree=dummy_tree, served_dest_count=0,
-                        sharing_strategy=0, nb_high_goals=10
-                    )
-                    state_to_save = Data(
-                        x=x.cpu(), edge_index=edge_index.cpu(),
-                        edge_attr=edge_attr.cpu(), req_vec=req_vec.cpu()
-                    )
+                    # 注册请求
+                    try:
+                        if hasattr(self.env.resource_mgr, 'request_manager'):
+                            self.env.resource_mgr.request_manager.register_request(req, resources_allocated)
+                            print(f"[LIFECYCLE] 注册请求 {req_id} 成功")
+                    except Exception as e:
+                        print(f"[LIFECYCLE] 注册失败: {e}")
+                        logger.debug(f"生命周期注册失败: {e}")
 
+                    # 样本收集（略，与之前相同）
                     clean_req = req.copy()
+                    dest_list = clean_req.get('dest', [])
+                    self.env.current_request = req
+                    nodes_on_tree_so_far = {req['source']}
+                    served_dest_count = 0
+                    current_tree_for_state = {
+                        'tree': dict_tree,
+                        'hvt': tree_data.get('hvt', np.zeros((self.env.n, 8)))
+                    }
 
-                    # 为每个路径创建样本
-                    for dest, path_nodes in paths_map.items():
-                        path_0 = [int(n - 1 if n > 0 else 0) for n in path_nodes]
+                    # 提取路径
+                    # 🔥 修复 high_label 赋值：
+                    #    paths_map 的 key 就是目的地节点（solver 返回的 1-based，转 0-based）
+                    #    high_label = 该目的地在 dest_list 中的顺序索引（0~K_dest-1）
+                    #    旧逻辑用 path[-1]（路径终点）查 dest_list，
+                    #    但路径终点可能是 VNF/Hub 节点，不在 dest_list 中 → 全部 fallback 到 0
+                    traj_paths = []
+                    for dest_key, path_nodes in paths_map.items():
+                        if len(path_nodes) < 2:
+                            continue
+                        path_0based = [int(n - 1 if n > 0 else 0) for n in path_nodes]
+                        subgoal_0   = path_0based[-1]
+
+                        # paths_map 的 key 是 solver 内部 1-based 目的地节点ID，转为 0-based
+                        dest_node_0 = int(dest_key) - 1
+
+                        if dest_node_0 in dest_list:
+                            # 正常情况：该路径对应一个 dest，high_label = 其在链中的顺序
+                            hl = dest_list.index(dest_node_0)
+                        else:
+                            # dest_key 已经是 0-based（env 传进来的情况）
+                            if dest_node_0 + 1 in dest_list:
+                                hl = dest_list.index(dest_node_0 + 1)
+                            elif int(dest_key) in dest_list:
+                                hl = dest_list.index(int(dest_key))
+                            else:
+                                # 真正的非目的地路径（VNF 部署路径）
+                                # 用路径终点 subgoal 再查一次
+                                hl = dest_list.index(subgoal_0) if subgoal_0 in dest_list else 0
+
+                        traj_paths.append((path_0based, hl, subgoal_0))
+
+                    if expert_traj:
+                        existing_sg = {sg for _, _, sg in traj_paths}
+                        for _d_idx, action_data, _res_delta in expert_traj:
+                            path_1based = action_data.get('path', [])
+                            if len(path_1based) >= 2:
+                                path_0based = [int(n - 1 if n > 0 else 0) for n in path_1based]
+                                subgoal_0   = path_0based[-1]
+                                if subgoal_0 not in existing_sg:
+                                    hl = dest_list.index(subgoal_0) if subgoal_0 in dest_list else 0
+                                    traj_paths.append((path_0based, hl, subgoal_0))
+                                    existing_sg.add(subgoal_0)
+
+                    print(f"[DEBUG] req {req.get('id')}: paths_map keys = {list(paths_map.keys())}")
+                    print(f"[DEBUG] req {req.get('id')}: traj_paths 数量 = {len(traj_paths)}")
+
+                    for path_idx, (path_0, high_label, subgoal_node) in enumerate(traj_paths):
+                        try:
+                            x, edge_index, edge_attr, req_vec = self._build_graph_state(
+                                request=req,
+                                nodes_on_tree=nodes_on_tree_so_far,
+                                current_tree=current_tree_for_state,
+                                served_dest_count=served_dest_count
+                            )
+                            print(f"[DEBUG] path {path_idx}: _build_graph_state 成功")
+                            state_to_save = Data(
+                                x=x.cpu(), edge_index=edge_index.cpu(),
+                                edge_attr=edge_attr.cpu(), req_vec=req_vec.cpu()
+                            )
+                        except Exception as e:
+                            print(f"[ERROR] path {path_idx}: 构建图状态失败: {e}")
+                            logger.warning(f"state 构造失败 path_idx={path_idx}, req={req.get('id')}: {e}")
+                            continue
+
+                        for node in path_0:
+                            nodes_on_tree_so_far.add(node)
+                        if subgoal_node in dest_list:
+                            served_dest_count += 1
 
                         sample_data = {
                             "state": state_to_save,
                             "request": clean_req,
-                            "action": {"path": path_0},
+                            "action": {
+                                "path": path_0,
+                                "high_label": high_label,
+                                "subgoal_node": subgoal_node,
+                                "is_dest_path": subgoal_node in dest_list,
+                            },
                             "cost": 0.0,
                             "load": self._estimate_load(),
                             "hrl_info": {
-                                "subgoal": int(path_0[-1]),
-                                "full_path": path_0
+                                "subgoal": subgoal_node,
+                                "full_path": path_0,
+                                "path_index": path_idx,
                             }
                         }
 
@@ -399,11 +523,11 @@ class Phase1ExpertCollector:
 
                         self.success_samples.append(sample_data)
                         self.stats["paths_collected"] += 1
+                        print(f"[DEBUG] path {path_idx} 样本已添加，当前样本总数 = {len(self.success_samples)}")
 
         if not success:
             self.stats["fail"] += 1
 
-        # 更新进度条
         br = self.stats["fail"] / max(1, self.stats["requests"])
         pbar.set_postfix({
             "reqs": self.stats["requests"],
@@ -411,15 +535,14 @@ class Phase1ExpertCollector:
             "samples": len(self.success_samples),
             "BR": f"{br:.1%}"
         })
+
     def _save_final(self):
-        """保存数据"""
         path = os.path.join(self.output_dir, "expert_data_final.pkl")
         try:
             data_to_save = {
                 "success": self.success_samples,
                 "stats": self.stats
             }
-
             if self.use_timeslot:
                 data_to_save["timeslot_stats"] = self.timeslot_stats
 

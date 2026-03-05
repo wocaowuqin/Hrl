@@ -101,56 +101,48 @@ class ExpertDataset(Dataset):
 
     def _convert_path_to_steps(self, trans: Dict) -> List[Dict]:
         """
-        将一条完整路径拆解为多个训练样本：
-        1. High-Level Label: 这条路的终点是第几个目的地？
-        2. Low-Level Label: 当前节点的下一跳是谁？
+        将一条完整路径拆解为多个 step 级训练样本。
 
-        🔥 优化：只保留终点在dest中的路径，过滤Hub路径
+        Phase1 新格式：action 里直接存了 high_label，无需重新推断。
+        兼容旧格式：action 里只有 path，则从 dest_list 推断。
         """
-        path = trans['action']['path']
-        req = trans.get('request', {})  # Phase 1 必须保存 request 信息
+        action = trans['action']
+        path = action['path']
+        req  = trans.get('request', {})
 
         if not path or len(path) < 2:
             return []
 
-        steps = []
-
-        # 🔥 [优化] 确定 Subgoal 并过滤
-        subgoal_node = int(path[-1])
-        if subgoal_node >= 28: subgoal_node %= 28
-
-        # 获取目的地列表
-        dest_list = req.get('dest', [])
-
-        # 🔥 [关键优化] 只保留终点在dest中的路径
-        if subgoal_node not in dest_list:
-            # 这是到Hub的中间路径，跳过
-            return []
-
-        # 确定 High Action Index
-        try:
-            high_action_idx = dest_list.index(subgoal_node)
-            if high_action_idx >= 10:
+        # ── 优先读 Phase1 直接存的 high_label ────────────────
+        if 'high_label' in action:
+            high_action_idx = int(action['high_label'])
+        else:
+            # 旧格式兼容：从 dest_list 推断
+            subgoal_node = int(path[-1])
+            if subgoal_node >= 28:
+                subgoal_node %= 28
+            dest_list = req.get('dest', [])
+            if subgoal_node in dest_list:
+                high_action_idx = dest_list.index(subgoal_node)
+                if high_action_idx >= 10:
+                    high_action_idx = 0
+            else:
                 high_action_idx = 0
-        except ValueError:
-            # 理论上不应该到这里，因为已经检查过了
-            return []
 
-        # 3. 生成每一步的样本
+        # ── 生成每一步的样本 ──────────────────────────────────
+        steps = []
+        state = trans.get('state')
         for step_idx in range(len(path) - 1):
             curr_node = int(path[step_idx])
-            next_node = int(path[step_idx + 1])  # Low-Level Label
-
-            # 节点 ID 修正
+            next_node = int(path[step_idx + 1])
             if curr_node >= 28: curr_node %= 28
             if next_node >= 28: next_node %= 28
 
-            step_trans = {
-                'state': trans.get('state'),  # GNN Data Object
-                'high_label': high_action_idx,  # High-Level 监督信号
-                'low_label': next_node  # Low-Level 监督信号
-            }
-            steps.append(step_trans)
+            steps.append({
+                'state':      state,
+                'high_label': high_action_idx,
+                'low_label':  next_node,
+            })
 
         return steps
 
@@ -221,6 +213,36 @@ class Phase2ILTrainer:
         self.num_workers = 0 if platform.system() == 'Windows' else 4
         self._prepare_data(expert_data_path)
 
+        # 🔥 修复: Phase2 时 agent.encoder=None → _get_graph_embedding 返回 zeros(1,dim)
+        # 为 agent 创建并赋予一个可训练的 GNN encoder，用于将图批次正确映射到 (B, state_dim)
+        node_feat_dim = config.get('node_feat_dim',   17)
+        state_dim     = config.get('hrl', {}).get('state_dim', 128)
+
+        if agent.encoder is None:
+            import torch.nn.functional as F
+            from torch_geometric.nn import global_mean_pool, SAGEConv
+
+            class _SimpleGNNEncoder(nn.Module):
+                def __init__(self, in_d, hid_d, out_d):
+                    super().__init__()
+                    self.conv1 = SAGEConv(in_d,  hid_d)
+                    self.conv2 = SAGEConv(hid_d, hid_d)
+                    self.proj  = nn.Linear(hid_d, out_d)
+
+                def forward(self, x, edge_index, batch=None):
+                    x = F.relu(self.conv1(x, edge_index))
+                    x = F.relu(self.conv2(x, edge_index))
+                    if batch is None:
+                        batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+                    return self.proj(global_mean_pool(x, batch))
+
+            gnn_enc = _SimpleGNNEncoder(node_feat_dim, state_dim, state_dim).to(self.device)
+            agent.encoder = gnn_enc
+            logger.info(f"✅ Phase2: 创建内嵌 GNNEncoder ({node_feat_dim}->{state_dim}->{state_dim})")
+            if self.is_hrl:
+                self.optimizer_high.add_param_group({'params': gnn_enc.parameters()})
+                logger.info("   📎 encoder 参数已加入 optimizer_high")
+
         # 早停
         self.early_stopping = EarlyStopping(patience=20)
 
@@ -271,26 +293,55 @@ class Phase2ILTrainer:
         return graph_batch, high_labels, low_labels
 
     def run(self):
-        """主运行循环"""
+        """主运行循环（修复版：加入验证、早停、LR调度）"""
         if not self.train_loader:
             logger.error("❌ 数据未就绪，停止训练")
             return
 
         logger.info("🚀 开始 Phase 2 模仿学习 (HRL Mode)...")
+        best_val_loss = float('inf')
+
         for epoch in range(1, self.epochs + 1):
             train_loss = self._train_epoch(epoch)
 
-            # 日志统计
-            if self._loss_count > 0 and epoch % 10 == 0:
-                avg_h = self._loss_high_sum / self._loss_count
-                avg_l = self._loss_low_sum / self._loss_count
-                logger.info(f"📊 Epoch {epoch} 分离Loss: High={avg_h:.4f}, Low={avg_l:.4f}")
+            # ── 验证 ─────────────────────────────────────────
+            val_loss = self._validate_epoch(epoch)
 
+            # ── LR 调度（根据验证loss降lr）────────────────────
+            if self.is_hrl:
+                self.scheduler_high.step(val_loss)
+                self.scheduler_low.step(val_loss)
+                cur_lr = self.optimizer_high.param_groups[0]['lr']
+            else:
+                cur_lr = self.optimizer.param_groups[0]['lr']
+
+            # ── 日志 ──────────────────────────────────────────
             if epoch % 10 == 0:
+                avg_h = self._loss_high_sum / max(1, self._loss_count)
+                avg_l = self._loss_low_sum / max(1, self._loss_count)
+                logger.info(
+                    f"Epoch {epoch:>4} | TrainL={train_loss:.4f} | ValL={val_loss:.4f} | "
+                    f"High={avg_h:.4f} Low={avg_l:.4f} | lr={cur_lr:.2e}"
+                )
+
+            # ── 保存最优模型 ───────────────────────────────────
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self._save_checkpoint("best")
+                logger.info(f"  💾 新最优验证Loss={val_loss:.4f}，已保存 il_model_best.pth")
+
+            if epoch % 50 == 0:
                 self._save_checkpoint(epoch)
 
+            # ── 早停 ──────────────────────────────────────────
+            if self.early_stopping(val_loss):
+                logger.info(f"⏹️  早停触发 (epoch={epoch}, best_val={best_val_loss:.4f})")
+                break
+
+        # 保存最终模型
         self._save_checkpoint("final")
-        logger.info("✅ Phase 2 完成")
+        logger.info(f"✅ Phase 2 完成 | 最佳验证Loss={best_val_loss:.4f}")
+        logger.info("   💡 建议Phase3加载 il_model_best.pth 而非 il_model_final.pth")
 
     def _train_epoch(self, epoch):
         """
