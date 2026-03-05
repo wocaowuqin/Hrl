@@ -209,21 +209,28 @@ class Phase3RLTrainer:
 
             # --- 采集剩余资源量 ---
             try:
-                total_cpu_avail = sum(
-                    self.env.resource_mgr.pool.get_available_cpu(i)
-                    for i in range(self.env.n)
-                )
-                avg_cpu_avail = total_cpu_avail / self.env.n
+                dc_nodes = getattr(self.env, 'dc_nodes', list(range(self.env.n)))
+                cpu_used = sum(
+                    max(0.0, self.env.resource_mgr.pool.cpu_cap[i]
+                        - self.env.resource_mgr.pool.get_available_cpu(i))
+                    for i in dc_nodes)
+                cpu_cap = sum(self.env.resource_mgr.pool.cpu_cap[i] for i in dc_nodes)
+                avg_cpu_avail = cpu_used / max(cpu_cap, 1.0) * 100.0  # 占用率%
             except Exception:
                 avg_cpu_avail = 0.0
 
             try:
-                bw_vals = []
+                bw_used_total = 0.0
+                bw_cap_total  = 0.0
                 for u in range(self.env.n):
                     for v in self.env.resource_mgr.get_neighbors(u):
                         if v > u:
-                            bw_vals.append(self.env.resource_mgr.pool.get_available_bandwidth(u, v))
-                avg_bw_avail = sum(bw_vals) / len(bw_vals) if bw_vals else 0.0
+                            key = tuple(sorted((u, v)))
+                            cap   = self.env.resource_mgr.pool.bw_cap.get(key, 0.0)
+                            avail = self.env.resource_mgr.pool.get_available_bandwidth(u, v)
+                            bw_used_total += max(0.0, cap - avail)
+                            bw_cap_total  += cap
+                avg_bw_avail = bw_used_total / max(bw_cap_total, 1.0) * 100.0  # 占用率%
             except Exception:
                 avg_bw_avail = 0.0
 
@@ -234,8 +241,8 @@ class Phase3RLTrainer:
             postfix = {
                 'Suc': f"{success_rate:.1%}",
                 'Rwd': f"{total_reward:.1f}",
-                'CPU': f"{avg_cpu_avail:.1f}",
-                'BW': f"{avg_bw_avail:.1f}",
+                'CPU': f"{avg_cpu_avail:.1f}%",
+                'BW': f"{avg_bw_avail:.1f}%",
                 'HLoss': f"{high_loss:.3f}",
                 'LLoss': f"{low_loss:.3f}",
             }
@@ -302,7 +309,7 @@ class Phase3RLTrainer:
                     f"Ep {episode}: Rate={success_rate:.2%} | "
                     f"Rwd={total_reward:.1f} | "
                     f"Util={res_util:.2f} | "
-                    f"CPU={avg_cpu_avail:.1f} BW={avg_bw_avail:.1f} | "
+                    f"CPU={avg_cpu_avail:.1f}% BW={avg_bw_avail:.1f}% | "
                     f"HLoss={high_loss:.4f} LLoss={low_loss:.4f} | "
                     f"TreeLen={avg_tree_len:.1f} Sharing={avg_sharing:.3f}"
                     f"{_tb_str}{eps_str}"

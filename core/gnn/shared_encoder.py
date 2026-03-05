@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
-from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn import GATv2Conv, GCNConv
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,15 @@ class SharedEncoder(nn.Module):
         self.fusion = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
         self.output_dim = self.hidden_dim
 
+        # ── [TA-HGRL] Tree Stream：仅在多播树边上做消息传递 ───────────────
+        self.tree_conv1 = GCNConv(self.static_feat_dim, self.hidden_dim)
+        self.tree_conv2 = GCNConv(self.hidden_dim, self.hidden_dim)
+        self.tree_fusion = nn.Sequential(
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU()
+        )
+
         # ── [SDG-HRL] Tree-aware Attention Bias ─────────────────────────────
         # 可学习标量参数，调制树边的注意力权重
         # 初始化为0.5（轻微正偏置），训练中自适应调整
@@ -154,7 +163,7 @@ class SharedEncoder(nn.Module):
             # 截断
             return tensor[..., :expected_dim]
 
-    def forward(self, x, edge_index, edge_attr=None, req_vec=None, batch=None):
+    def forward(self, x, edge_index, edge_attr=None, req_vec=None, batch=None, tree_edge_index=None):
         device = x.device
         self._step_count += 1
 
@@ -225,7 +234,19 @@ class SharedEncoder(nn.Module):
             logger.error(f"❌ [SharedEncoder] GAT Forward Failed: {e}")
             raise e
 
-        # 🟢 7. 动态流：MLP处理6维状态特征
+        # ── [TA-HGRL] 7a. Tree Stream ────────────────────────────────────
+        n_nodes = static_x.size(0)
+        if tree_edge_index is None or tree_edge_index.size(1) == 0:
+            _sl = torch.arange(n_nodes, device=device).unsqueeze(0).repeat(2, 1)
+            tree_ei = _sl
+        else:
+            tree_ei = tree_edge_index.to(device)
+        tree_emb = F.relu(self.tree_conv1(static_x, tree_ei))
+        tree_emb = F.relu(self.tree_conv2(tree_emb,  tree_ei))
+        # 双流融合：Topology + Tree → 结构感知节点嵌入
+        static_emb = self.tree_fusion(torch.cat([static_emb, tree_emb], dim=-1))
+
+        # 🟢 7b. 动态流：MLP处理6维状态特征
         state_emb = F.relu(self.state_fc1(dynamic_x))
         state_emb = F.relu(self.state_fc2(state_emb))
 

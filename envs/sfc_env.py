@@ -223,7 +223,7 @@ class SFC_HIRL_Env(gym.Env):
 
         # 4.1 步数控制
         # 从配置读取最大低层步数 (默认 50)
-        self.max_subgoal_steps = config.get('max_low_steps', 40)
+        self.max_subgoal_steps = config.get('max_low_steps', 25)
         self.subgoal_step_count = 0  # 统一的低层步数计数器 (替代 _low_step_count)
 
         # 4.2 目标控制
@@ -852,19 +852,19 @@ class SFC_HIRL_Env(gym.Env):
             self.current_node_location = 0
             # 不返回，继续生成状态
 
-# 13. 生成初始状态
-        # ── [SDG-HRL] reset时同步 edge_index 到 env ──────────────────────
+        # 13. 生成初始状态
+        # ── [SDG-HRL] 每episode同步 edge_index + 构建 edge_attr ───────────
         import torch
         if hasattr(self.resource_mgr, 'edge_index'):
             self.edge_index = torch.from_numpy(
                 self.resource_mgr.edge_index).long()
-        self.edge_attr = None
+        if hasattr(self.resource_mgr, 'build_edge_attr'):
+            self.edge_attr = self.resource_mgr.build_edge_attr(
+                current_tree=getattr(self, 'current_tree', None))
+        else:
+            self.edge_attr = None
         # ─────────────────────────────────────────────────────────────────
         initial_state = self.get_state()
-        # ── 同步 get_state() 写入的 edge_attr 回 env ──────────────────────
-        if hasattr(self.resource_mgr, 'edge_attr'):
-            self.edge_attr = self.resource_mgr.edge_attr
-        # ─────────────────────────────────────────────────────────────────
 
         info = {
             'request': req,

@@ -1,3 +1,4 @@
+import torch
 """
 envs/modules/fused_resource_manager.py
 ==================================================
@@ -434,8 +435,6 @@ class RequestLifecycleManager:
                 vnf_list = info['request'].get('vnf', [])
                 vnf_type = vnf_list[vnf_idx] if vnf_idx < len(vnf_list) else vnf_idx
                 self.resource_manager.release_node_resource(node, vnf_type, cpu_used, mem_used)
-                cpu_rel += cpu_used   # ← 修复：累加已释放的CPU
-                mem_rel += mem_used   # ← 修复：累加已释放的MEM
 
         # 释放链路资源
         tree = resources.get('tree', {})
@@ -715,14 +714,15 @@ class FusedResourceManager:
         self.hvt_all = np.zeros((self.n, self.K_vnf), dtype=int)
         self.vnf_instances = []
 
-        # 构建边索引
+        # 构建边索引 + 边特征
         self._build_edge_index()
+        self._build_edge_attr()
 
         # 状态维度（兼容GNN）
         self.dim_request = 10
         self.dim_network = self.n * 2 + self.pool.L + self.n * self.K_vnf
         self.STATE_VECTOR_SIZE = self.dim_network + self.dim_request
-        self.node_feat_dim = 6 + self.K_vnf + 3
+        self.node_feat_dim = 6 + self.K_vnf + 3 + 3  # [SDG-HRL] +vnf_depth, +progress, +phase_flag → 20
         self.edge_feat_dim = 5
         self.request_dim = 24
 
@@ -750,6 +750,67 @@ class FusedResourceManager:
                 if eid not in self.phys_to_graph_edges:
                     self.phys_to_graph_edges[eid] = []
                 self.phys_to_graph_edges[eid].append(idx)
+
+    def _build_edge_attr(self):
+        """
+        构建静态边特征矩阵（初始化时调用一次）
+        edge_attr: [E, 5]
+          [0] bw_remaining     — 归一化可用带宽（动态，初始=1.0）
+          [1] bw_utilization   — 带宽利用率（动态，初始=0.0）
+          [2] hop_weight_norm  — 拓扑跳数权重归一化（静态）
+          [3] is_tree_edge     — 是否被当前树占用（动态，初始=0.0）
+          [4] reserved         — 预留带宽比例（动态，初始=0.0）
+        """
+        rows, cols = self.edge_index[0], self.edge_index[1]
+        E = len(rows)
+        max_bw  = max(1.0, max(self.pool.bw_cap.values()) if self.pool.bw_cap else 1.0)
+        max_hop = max(1.0, float(self.edge_hops.max()) if len(self.edge_hops) > 0 else 1.0)
+
+        attr = np.zeros((E, 5), dtype=np.float32)
+        for idx, (u, v) in enumerate(zip(rows, cols)):
+            cap   = self.pool.bw_cap.get((u, v), self.pool.bw_cap.get((v, u), max_bw))
+            avail = self.pool.bw_avail.get((u, v), self.pool.bw_avail.get((v, u), cap))
+            # 维度与 shared_encoder 期望一致:
+            # [0] bw_remaining (avail/cap)
+            # [1] bw_utilization (1 - avail/cap)
+            # [2] hop_weight_norm
+            # [3] is_tree_edge (动态更新，初始0)
+            # [4] reserved (bw_reserved/cap)
+            util = 1.0 - avail / max(1.0, cap)
+            attr[idx, 0] = avail / max(1.0, cap)         # bw_remaining
+            attr[idx, 1] = util                          # bw_utilization
+            attr[idx, 2] = self.edge_hops[idx] / max_hop # hop_weight_norm
+            attr[idx, 3] = 0.0                           # is_tree_edge (动态)
+            attr[idx, 4] = 0.0                           # reserved (动态)
+        self.edge_attr = attr
+        self._edge_attr_max_bw  = max_bw
+        self._edge_attr_max_hop = max_hop
+        logger.debug(f"[FusedRM] edge_attr 构建完成: shape={attr.shape}")
+
+    def build_dynamic_edge_attr(self):
+        """
+        [SDG-HRL] 动态刷新 edge_attr（每step调用，更新带宽占用和树使用情况）
+        返回 torch.Tensor [E, 5]，供 get_state() 直接使用
+        """
+        rows, cols = self.edge_index[0], self.edge_index[1]
+        E   = len(rows)
+        attr = self.edge_attr.copy()  # 在静态基础上更新动态部分
+
+        # 当前树占用的边集合
+        tree_edges = set()
+        if hasattr(self, 'current_tree') and self.current_tree:
+            for (u, v) in self.current_tree.get('tree', {}).keys():
+                tree_edges.add((u, v))
+                tree_edges.add((v, u))
+
+        for idx, (u, v) in enumerate(zip(rows, cols)):
+            cap   = self.pool.bw_cap.get((u, v), self.pool.bw_cap.get((v, u), self._edge_attr_max_bw))
+            avail = self.pool.get_available_bandwidth(u, v)
+            attr[idx, 0] = avail / max(1.0, cap)
+            attr[idx, 1] = 1.0 - attr[idx, 0]           # bw_util
+            attr[idx, 3] = 1.0 if (u, v) in tree_edges else 0.0  # is_tree_edge
+
+        return torch.from_numpy(attr).float()
 
     # ---------- 事务接口 ----------
     def begin_transaction(self, request_id: str) -> str:

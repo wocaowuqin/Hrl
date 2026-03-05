@@ -73,29 +73,34 @@ class GoalConditionedLowLevelPolicy(nn.Module):
         )
 
         # ============================================
-        # 3. Fusion（状态-目标融合）
+        # 3. [TA-HGRL] Goal-Conditioned Attention
+        #    Goal(Query) × Nodes(Key,Value) → 目标制导注意力
+        #    让subgoal主动"审视"全网节点，聚焦最优下一跳
         # ============================================
-        self.fusion = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+        self.goal_attention = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=4,
+            dropout=dropout,
+            batch_first=True
         )
+        self.attn_norm = nn.LayerNorm(self.hidden_dim)
 
         # ============================================
-        # 4. Actor（Q Network - 动作选择）
+        # 4. Actor（Q Network）
+        #    输入: cat[attn_context, goal_proj] → hidden*2
         # ============================================
         self.actor = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(self.hidden_dim, self.action_dim)
         )
 
         # ============================================
-        # 5. Critic（Value Network - 状态评估）
+        # 5. Critic（Value Network）
         # ============================================
         self.critic = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(self.hidden_dim, 1)
@@ -112,42 +117,43 @@ class GoalConditionedLowLevelPolicy(nn.Module):
             action_mask: Optional[torch.Tensor] = None
     ) -> tuple:
         """
-        前向传播
+        [TA-HGRL] Goal-Conditioned Attention Forward
 
         Args:
-            state_emb: 状态嵌入 [batch, state_dim]
-            goal_emb: Goal embedding [batch, goal_dim] (可选)
-            action_mask: 动作mask [batch, action_dim] (可选)
+            state_emb: 状态嵌入 [batch, state_dim]  (全图均值或节点序列)
+            goal_emb:  Goal embedding [batch, goal_dim]
+            action_mask: [batch, action_dim]  1=可选 0=禁止
 
         Returns:
-            logits: 动作logits [batch, action_dim]
-            value: 状态价值 [batch, 1]
+            logits: [batch, action_dim]
+            value:  [batch, 1]
         """
-        # 投影状态
-        state_proj = self.state_projection(state_emb)
+        B = state_emb.size(0)
 
-        # 如果提供了goal，进行融合
-        if goal_emb is not None:
-            # 投影goal
-            goal_proj = self.goal_projection(goal_emb)
+        # 1. 投影: Linear作用于最后维度，兼容 [B,H] 和 [B,N,H]
+        state_proj = self.state_projection(state_emb)   # [B,H] 或 [B,N,H]
+        goal_proj  = (self.goal_projection(goal_emb)
+                      if goal_emb is not None
+                      else torch.zeros(B, self.hidden_dim, device=state_emb.device))  # [B,H]
 
-            # 融合state和goal
-            fused = torch.cat([state_proj, goal_proj], dim=1)
-            fused = self.fusion(fused)
-        else:
-            # 没有goal时，直接使用state
-            fused = state_proj
+        # 2. [TA-HGRL Fix] Goal-Conditioned Cross-Attention
+        #    Query = goal [B,1,H]
+        #    Key/Value = 全网N个节点特征序列 [B,N,H]（或退化为[B,1,H]）
+        query = goal_proj.unsqueeze(1)                           # [B, 1, H]
+        kv    = (state_proj if state_proj.dim() == 3            # [B, N, H] ✓
+                 else state_proj.unsqueeze(1))                   # [B, 1, H] 兜底
+        attn_out, _ = self.goal_attention(query=query, key=kv, value=kv)
+        attn_context = self.attn_norm(attn_out.squeeze(1) + goal_proj)  # 残差 [B,H]
 
-        # Actor输出（Q值）
+        # 3. 拼接 → Actor/Critic
+        fused  = torch.cat([attn_context, goal_proj], dim=-1)   # [B, H*2]
         logits = self.actor(fused)
 
-        # 应用mask
+        # 4. Mask
         if action_mask is not None:
             logits = logits.masked_fill(action_mask == 0, float('-inf'))
 
-        # Critic输出（状态价值）
         value = self.critic(fused)
-
         return logits, value
 
     def select_action(self, state_emb, goal_emb, action_mask=None, epsilon=0.1):

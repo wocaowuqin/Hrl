@@ -87,7 +87,7 @@ class LowLevelController:
             self._hop_dist_cache = dict(nx.all_pairs_shortest_path_length(G))
             logger.debug(f"✅ [HopDist] 预计算完成: {n}节点, {G.number_of_edges()}边")
         except Exception as e:
-            logger.debug(f"⚠️ [HopDist] 预计算失败: {e}")
+            logger.warning(f"⚠️ [HopDist] 预计算失败: {e}")
             self._hop_dist_cache = None
 
     def _get_hop_distance(self, u, v):
@@ -206,7 +206,7 @@ class LowLevelController:
             _conn = len(self.env.current_tree.get('connected_dests', set())) if self.env.current_tree else 0
             _alld = len(self.env.current_request.get('dest', [])) if self.env.current_request else 0
             _max_steps = getattr(self.env, 'max_subgoal_steps', 25)
-            logger.debug(
+            logger.warning(
                 f"⏰ [Low] 超时 at Node {current_node} "
                 f"(连续超时: {self.env._consecutive_timeout_count}次) | "
                 f"phase={_ph} target={_tgt} hop_dist={_dist} "
@@ -238,7 +238,7 @@ class LowLevelController:
                         }
                 except Exception:
                     _bw_tensions = {}
-                logger.debug(
+                logger.warning(
                     f"❌ [Low] 连续超时{self.env._consecutive_timeout_count}次，Episode失败 | "
                     f"VNF={_vd}/{_vt} Dest={_dc_conn}/{_dt} | "
                     f"phase={_ph} cur={current_node} target={_tgt} hop_dist={_dist} | "
@@ -309,7 +309,7 @@ class LowLevelController:
                         _sfc['chain_nodes'].append(current_node)
                         logger.debug(f"[SFC-DAG] spine段: {_prev}→{current_node} = {_seg}")
                 except Exception as _e:
-                    logger.debug(f"[SFC-DAG] spine记录失败: {_e}")
+                    logger.warning(f"[SFC-DAG] spine记录失败: {_e}")
                 # ─────────────────────────────────────────────────────────────
 
                 self.env.next_vnf_idx += 1
@@ -336,7 +336,7 @@ class LowLevelController:
                 except Exception:
                     avail_cpu, avail_mem = 0.0, 0.0
                 self.env._consecutive_timeout_count = getattr(self.env, '_consecutive_timeout_count', 0) + 1
-                logger.debug(
+                logger.warning(
                     f"❌ [Low] VNF部署失败 节点{target_goal}: "
                     f"CPU可用={avail_cpu:.1f} MEM可用={avail_mem:.1f} "
                     f"(连续失败:{self.env._consecutive_timeout_count}次)"
@@ -392,7 +392,7 @@ class LowLevelController:
                             if _ek not in self.env.current_tree['tree']:
                                 self.env.current_tree['tree'][_ek] = _bw
                 except Exception as _e:
-                    logger.debug(f"[SFC-DAG] branch记录失败: {_e}")
+                    logger.warning(f"[SFC-DAG] branch记录失败: {_e}")
                 # ─────────────────────────────────────────────────────────────
 
             steps_used = getattr(self.env, 'subgoal_step_count', 50)
@@ -452,7 +452,7 @@ class LowLevelController:
                                 logger.debug(f"✅ [SFC-DAG] src={_src}→dst={_d} "
                                             f"VNF={_sfc['chain_nodes']} ✓")
                             else:
-                                logger.debug(f"⚠️ [SFC-DAG违规] src={_src}→dst={_d} "
+                                logger.warning(f"⚠️ [SFC-DAG违规] src={_src}→dst={_d} "
                                                f"spine_ok={_spine_ok} branch_ok={_branch_ok} "
                                                f"spine_ends={[s[-1] if s else None for s in _sfc['spine_paths']]} "
                                                f"chain={_sfc['chain_nodes']} "
@@ -528,7 +528,7 @@ class LowLevelController:
                 )
                 # ─────────────────────────────────────────────────────────
                 if self.env._bw_fail_count >= 10:
-                    logger.debug(
+                    logger.warning(
                         f"❌ [Low] 带宽连续失败{self.env._bw_fail_count}次，Episode失败 | "
                         f"cur={current_node} target={target_goal} bw_req={bw_req:.1f}"
                     )
@@ -691,119 +691,151 @@ class LowLevelController:
     # 状态构建
     # ==================================================================
     def get_state(self):
+        """
+        构建节点特征矩阵，维度 = node_feat_dim = 6 + K_vnf + 3 = 17
+        [0]  avail_cpu  / C_cap          — CPU资源占用率
+        [1]  avail_mem  / M_cap          — 内存资源占用率
+        [2]  fit_factor                  — 当前VNF需求是否满足 (+1/-1)
+        [3]  is_dc                       — 是否为数据中心节点
+        [4]  is_current                  — 是否为当前所在节点
+        [5]  hop_dist_norm               — 到目标节点的归一化跳数距离
+        [6~13] hvt_all[node]             — K_vnf=8维VNF部署状态
+        [14] on_tree                     — 是否在当前多播树上
+        [15] connected_dest              — 是否已连接目的地
+        [16] is_target                   — 是否为当前目标节点
+        [17] vnf_depth_norm              — VNF链进度 (next_vnf_idx / total_vnf)
+        [18] progress_ratio              — subgoal步数进度 (steps / horizon)
+        [19] phase_flag                  — 阶段标志 (0=vnf_deploy, 1=dest_connect, 0.5=other)
+        总计: 6 + K_vnf(8) + 3 + 3 = 20维
+        """
+        rm = self.env.resource_mgr
+        K_vnf    = rm.K_vnf           # 8
+        C_cap    = max(1, rm.C_cap)
+        M_cap    = max(1, rm.M_cap)
+        n        = self.env.n
+
+        # ── 当前VNF需求 ───────────────────────────────────────────────
         current_vnf_demand = 0.0
-        vnf_list = []
         if self.env.current_request:
-            vnf_list = self.env.current_request.get('vnf', [])
-            idx = getattr(self.env, 'next_vnf_idx', 0)
+            vnf_list  = self.env.current_request.get('vnf', [])
+            idx       = getattr(self.env, 'next_vnf_idx', 0)
             if idx < len(vnf_list):
                 cpu_reqs = self.env.current_request.get('cpu_origin', [10.0])
                 current_vnf_demand = cpu_reqs[idx] if idx < len(cpu_reqs) else 10.0
 
-        # ── [SDG-HRL] 维度定义 ──────────────────────────────────────────────
-        # 静态维度 (dim 0-13): 资源特征 + padding
-        # 动态维度 (dim 14-19): 树状态 + SFC结构感知特征
-        #   dim 14: tree_mask          - 节点是否在当前多播树中
-        #   dim 15: connected_mask     - 节点是否是已连接的dest
-        #   dim 16: is_target          - 节点是否是当前子目标
-        #   dim 17: vnf_depth          - [新增] SFC链路位置编码 ∈ [0,1]
-        #   dim 18: is_dc              - [新增] 是否是DC节点（可部署VNF）
-        #   dim 19: progress_ratio     - [新增] 全局SFC完成进度 ∈ [0,1]
-        # ──────────────────────────────────────────────────────────────────
-        BASE_FEATURE_DIM = 5
-        DYNAMIC_FEATURE_DIM = 6  # 原3维 → 新6维
-
-        base_features = []
-        for node in range(self.env.n):
-            avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
-            avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
-            fit_factor = 1.0 if avail_cpu >= current_vnf_demand else -1.0
-            feat = [avail_cpu / 100.0, avail_mem / 100.0, fit_factor, 0.5, 0.5]
-            if len(feat) < 14:
-                feat += [0.0] * (14 - len(feat))
-            base_features.append(feat)
-
-        base_x = np.array(base_features, dtype=np.float32)
-
-        # ── 预计算动态特征所需的上下文 ──────────────────────────────────────
-        nodes_on_tree = getattr(self.env, 'nodes_on_tree', set())
-        connected_dests = self.env.current_tree.get('connected_dests', set()) if self.env.current_tree else set()
-
+        # ── 目标节点 ──────────────────────────────────────────────────
         target_node = None
         if self.env.current_phase == 'vnf_deployment':
             target_node = getattr(self.env, 'current_deployment_target', None)
         elif self.env.current_phase == 'destination_connection':
             target_node = getattr(self.env, 'current_target_node', None)
-
         target_node_int = -1
         if target_node is not None:
             try:
                 target_node_int = int(target_node)
-            except:
+            except Exception:
                 pass
 
-        # ── [新增] SFC链路位置编码：chain_nodes[k] → vnf_depth = (k+1)/M ──
-        # 语义：节点是第k个VNF时，depth=(k+1)/M；未部署VNF的节点depth=0
-        chain_nodes = getattr(self.env, 'chain_nodes', [])
-        total_vnf = max(len(vnf_list), 1)
-        chain_pos_map = {
-            node: (i + 1) / total_vnf
-            for i, node in enumerate(chain_nodes)
-        }
+        # ── 辅助信息 ──────────────────────────────────────────────────
+        current_node    = getattr(self.env, 'current_node_location', -1)
+        # dc_nodes: env → resource_mgr.pool → resource_mgr の順にフォールバック
+        _dc = getattr(self.env, 'dc_nodes', None)
+        if not _dc:
+            _dc = getattr(getattr(self.env, 'resource_mgr', None), 'dc_nodes', None)
+        if not _dc:
+            _dc = getattr(getattr(getattr(self.env, 'resource_mgr', None), 'pool', None), 'dc_nodes', None)
+        dc_nodes = set(_dc) if _dc else set()
+        nodes_on_tree   = getattr(self.env, 'nodes_on_tree', set())
+        connected_dests = (self.env.current_tree.get('connected_dests', set())
+                           if self.env.current_tree else set())
+        hvt_all = rm.hvt_all  # shape [n, K_vnf]
 
-        # ── [新增] 全局SFC完成进度 ─────────────────────────────────────────
-        # vnf阶段: next_vnf_idx/total_vnf; dest阶段: 1.0
-        next_vnf_idx = getattr(self.env, 'next_vnf_idx', 0)
-        progress_ratio = float(next_vnf_idx) / total_vnf  # ∈ [0, 1]
+        # 归一化跳数距离（到目标节点）
+        max_hops = max(1, n - 1)
+        def _hop(u, v):
+            if u < 0 or v < 0 or u == v:
+                return 0.0
+            try:
+                return self._get_hop_distance(u, v) / max_hops
+            except Exception:
+                return 1.0
 
-        # ── [新增] DC节点集合 ──────────────────────────────────────────────
-        dc_nodes_set = set(getattr(self.env, 'dc_nodes', []))
+        # ── Chain Positional Encoding 全局标量 [SDG-HRL] ────────────────
+        vnf_list_total = (self.env.current_request.get('vnf', [])
+                          if self.env.current_request else [])
+        total_vnf   = max(1, len(vnf_list_total))
+        cur_vnf_idx = getattr(self.env, 'next_vnf_idx', 0)
+        vnf_depth_norm = min(1.0, cur_vnf_idx / total_vnf)
 
-        dynamic_features = []
-        for node in range(self.env.n):
-            t_m       = 1.0 if node in nodes_on_tree else 0.0   # dim 14
-            c_m       = 1.0 if node in connected_dests else 0.0 # dim 15
-            is_target = 1.0 if node == target_node_int else 0.0 # dim 16
-            vnf_depth = chain_pos_map.get(node, 0.0)             # dim 17 [新增]
-            is_dc     = 1.0 if node in dc_nodes_set else 0.0    # dim 18 [新增]
-            prog      = progress_ratio                           # dim 19 [新增]
-            dynamic_features.append([t_m, c_m, is_target, vnf_depth, is_dc, prog])
+        subgoal_steps   = getattr(self.env, 'subgoal_step_count', 0)
+        subgoal_horizon = getattr(self.env, 'subgoal_horizon', 40)
+        progress_ratio  = min(1.0, subgoal_steps / max(1, subgoal_horizon))
 
-        full_x = np.concatenate([base_x, np.array(dynamic_features)], axis=1)
-        # full_x.shape = [N, 20]，其中静态14维 + 动态6维
-
-        # ── [SDG-HRL Day2] 每step更新 edge_attr（带宽状态 + is_tree_edge）──
-        # 在构建 Data 对象前调用，确保 edge_attr 反映当前树状态和带宽状态
-        if hasattr(self.env, 'resource_mgr') and hasattr(self.env.resource_mgr, 'update_edge_attr'):
-            _tree_edges = self.env.current_tree.get('tree', {}) if self.env.current_tree else {}
-            self.env.resource_mgr.update_edge_attr(tree_edges=_tree_edges)
-            # ── [关键] 立即同步回 env.edge_attr，get_state() 下方才能读到 ──
-            if hasattr(self.env.resource_mgr, 'edge_attr'):
-                self.env.edge_attr = self.env.resource_mgr.edge_attr
-
-        x_tensor = torch.from_numpy(full_x).float()
-        low_mask = self.get_low_level_action_mask()
-
-        # ── [SDG-HRL Day3预留] 构建树子图 edge_index ────────────────────────
-        # 此处预先构建 tree_edge_index，供 Tree-aware Attention Bias 使用
-        # 当前 Day1/Day2 阶段直接存入 Data 对象但 SharedEncoder 暂不使用
-        tree_edges = self.env.current_tree.get('tree', {}) if self.env.current_tree else {}
-        if tree_edges:
-            _t_src, _t_dst = [], []
-            for (u, v) in tree_edges.keys():
-                _t_src += [u, v]  # 无向 → 双向
-                _t_dst += [v, u]
-            tree_edge_index = torch.tensor([_t_src, _t_dst], dtype=torch.long)
+        phase = getattr(self.env, 'current_phase', 'other')
+        if phase == 'vnf_deployment':
+            phase_flag = 0.0
+        elif phase == 'destination_connection':
+            phase_flag = 1.0
         else:
-            # 空树：用自环占位，避免 GATv2 空图报错
-            tree_edge_index = torch.zeros((2, 1), dtype=torch.long)
+            phase_flag = 0.5
+
+        # ── 构建特征矩阵 [n, 20] ─────────────────────────────────────
+        features = np.zeros((n, 6 + K_vnf + 3 + 3), dtype=np.float32)  # 20维
+        for node in range(n):
+            avail_cpu  = rm.pool.get_available_cpu(node)
+            avail_mem  = rm.pool.get_available_memory(node)
+            fit_factor = 1.0 if avail_cpu >= current_vnf_demand else -1.0
+
+            # dim 0~5
+            features[node, 0] = avail_cpu / C_cap
+            features[node, 1] = avail_mem / M_cap
+            features[node, 2] = fit_factor
+            features[node, 3] = 1.0 if node in dc_nodes else 0.0
+            features[node, 4] = 1.0 if node == current_node else 0.0
+            features[node, 5] = _hop(node, target_node_int)
+
+            # dim 6~13 : hvt（VNF部署历史）
+            if 0 <= node < hvt_all.shape[0]:
+                features[node, 6:6 + K_vnf] = hvt_all[node, :K_vnf].astype(np.float32)
+
+            # dim 14~16 : dynamic
+            features[node, 6 + K_vnf]     = 1.0 if node in nodes_on_tree   else 0.0
+            features[node, 6 + K_vnf + 1] = 1.0 if node in connected_dests else 0.0
+            features[node, 6 + K_vnf + 2] = 1.0 if node == target_node_int  else 0.0
+
+            # dim 17~19 : chain positional encoding [SDG-HRL]
+            features[node, 6 + K_vnf + 3] = vnf_depth_norm
+            features[node, 6 + K_vnf + 4] = progress_ratio
+            features[node, 6 + K_vnf + 5] = phase_flag
+
+        x_tensor = torch.from_numpy(features).float()
+        low_mask  = self.get_low_level_action_mask()
+
+        # [SDG-HRL] 动态边特征（每step刷新带宽占用 + 树使用情况）
+        if hasattr(self.env, 'resource_mgr') and hasattr(self.env.resource_mgr, 'build_dynamic_edge_attr'):
+            edge_attr_tensor = self.env.resource_mgr.build_dynamic_edge_attr()
+        elif hasattr(self.env, 'edge_attr') and self.env.edge_attr is not None:
+            edge_attr_tensor = self.env.edge_attr
+        else:
+            edge_attr_tensor = None
+
+        # [TA-HGRL] 构建多播树边索引（tree_edge_index）
+        tree_edge_index = None
+        tree_dict = getattr(self.env, 'current_tree', None)
+        if tree_dict:
+            tree_edges_raw = tree_dict.get('tree', {})
+            if tree_edges_raw:
+                rows, cols = [], []
+                for (u, v) in tree_edges_raw.keys():
+                    rows += [u, v]; cols += [v, u]   # 无向
+                tree_edge_index = torch.tensor([rows, cols], dtype=torch.long)
 
         return Data(
             x=x_tensor,
             edge_index=self.env.edge_index if hasattr(self.env, 'edge_index') else None,
-            edge_attr=self.env.edge_attr if hasattr(self.env, 'edge_attr') else None,
-            tree_edge_index=tree_edge_index,  # [新增] 树子图，Day3使用
-            action_mask=torch.from_numpy(low_mask).bool().unsqueeze(0)
+            edge_attr=edge_attr_tensor,
+            tree_edge_index=tree_edge_index,
+            action_mask=torch.from_numpy(low_mask).bool().unsqueeze(0),
         )
 
     # ==================================================================
@@ -855,7 +887,7 @@ class LowLevelController:
             return self.env.request_manager.register_request(
                 request={'id': req_id,
                          'arrival_time': self.env.current_request.get('arrival_time', 0),
-                         'lifetime': self.env.current_request.get('lifetime', 50)},
+                         'lifetime': self.env.current_request.get('lifetime', 5.0)},
                 resources_allocated=resources)
         except:
             return False

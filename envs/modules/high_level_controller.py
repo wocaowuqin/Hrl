@@ -137,8 +137,8 @@ class HighLevelController:
                 if hasattr(self.env, 'low_level_controller') and hasattr(self.env.low_level_controller,
                                                                          '_calculate_tree_metrics'):
                     metrics = self.env.low_level_controller._calculate_tree_metrics()
-                    reward += -2.0 * metrics.get('redundancy', 0.0)
-                    reward += -0.5 * metrics.get('tree_n_edges', 0.0)
+                    reward += -3.0 * metrics.get('redundancy', 0.0)
+                    reward += -1.5 * metrics.get('tree_n_edges', 0.0)
                 return None, reward, True, False, {'all_done': True}
             else:
                 logger.warning(f"🔄 [High] 目标 {target_node} 已完成 -> Truncated")

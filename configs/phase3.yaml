@@ -10,7 +10,7 @@ phase3:
   num_episodes: 1000              # 训练轮数
   max_steps: 3000000              # 总步数上限
   max_steps_per_episode: 600      # 单个Episode最大步数（决策步数，不是时间！）
-  episodes: 3000
+  episodes: 300
   # 评估配置
   eval_every: 100                 # 每100个Episode评估一次
   eval_episodes: 20               # 每次评估运行20个Episode
@@ -279,8 +279,8 @@ dynamic_env:
 
   # 🔥 新增：时间槽版本（以时间槽为单位）
   timeslot_based_lifetime: true   # 使用时间槽计算生命周期
-  lifetime_min_slots: 1000        # 最小生命周期（时间槽）= 10s
-  lifetime_max_slots: 6000        # 最大生命周期（时间槽）= 60s
+  lifetime_min_slots: 200        # 最小生命周期（时间槽）= 10s
+  lifetime_max_slots: 1000        # 最大生命周期（时间槽）= 60s
 
 # ============================================
 # 14. 路径配置
