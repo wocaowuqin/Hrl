@@ -2,38 +2,67 @@
 # 基础模型参数
 base:
   hidden_dim: 128
-  learning_rate: 0.00025  # LR 与hyperparameters.py一致
+  learning_rate: 0.00025
   optimizer:
     type: "RMSprop"
     rho: 0.95
     epsilon: 1e-08
   loss: "mse"
-  batch_size: 32  # 与BATCH_SIZE一致
-  gamma: 0.99  # 折扣因子
-  exp_memory: 100000  # 经验池大小
+  batch_size: 32
+  gamma: 0.99
+  exp_memory: 100000
 
-# GNN模型参数
+# GNN模型参数 (SDG-HRL升级版)
 gnn:
-  node_feat_dim: 32
-  edge_feat_dim: 16
+  # ── 节点特征维度 (20维) ───────────────────────────────────────────────
+  # 静态维度 (dim 0-13):
+  #   dim0: avail_cpu / 100.0
+  #   dim1: avail_mem / 100.0
+  #   dim2: fit_factor in {-1, +1}   当前VNF的CPU可行性
+  #   dim3-4: 0.5 (placeholder)
+  #   dim5-13: 0.0 (padding)
+  # 动态维度 (dim 14-19):
+  #   dim14: tree_mask              节点是否在当前多播树中
+  #   dim15: connected_mask         节点是否是已连接的dest
+  #   dim16: is_target              节点是否是当前子目标
+  #   dim17: vnf_depth              [SDG-HRL] SFC链路位置编码, chain[k]->(k+1)/M
+  #   dim18: is_dc                  [SDG-HRL] 是否是DC节点
+  #   dim19: progress_ratio         [SDG-HRL] 全局SFC完成进度
+  node_feat_dim: 20
+  num_dynamic_features: 6
+
+  # ── 边特征维度 (5维) ─────────────────────────────────────────────────
+  # dim0: bw_remaining_norm   归一化剩余带宽
+  # dim1: bw_usage_ratio      带宽占用率
+  # dim2: hop_weight_norm     归一化链路权重
+  # dim3: is_tree_edge        [SDG-HRL核心] 是否被多播树占用
+  # dim4: reserved
+  edge_feat_dim: 5
   request_dim: 24
+
+  # ── 网络结构 (GATv2双流架构) ─────────────────────────────────────────
+  hidden_dim: 128
+  num_gat_layers: 2
+  num_heads: 4
+  dropout: 0.0
+
+  # ── Tree-aware Attention Bias ─────────────────────────────────────────
+  # 可学习标量 tree_bias，让GATv2感知多播树结构
+  tree_bias_init: 0.5
+
+  # ── 动作/目标空间 ─────────────────────────────────────────────────────
   num_goals: 10
-  num_actions: 100
-  layers:
-    - type: "GCN"
-      out_channels: 64
-      activation: "relu"
-    - type: "GCN"
-      out_channels: 128
-      activation: "relu"
+  num_actions: 28
 
 # HRL模型参数
 hrl:
+  state_dim: 128
+  adaptive_epsilon: true
   three_level:
     high_level:
       hidden_dim: 256
       layers: 2
-      meta_train_freq: 50  # 高层训练频率（META_TRAIN_FREQ）
+      meta_train_freq: 50
     mid_level:
       hidden_dim: 128
       layers: 2
@@ -43,6 +72,34 @@ hrl:
 
 # 训练策略参数
 training:
-  pre_train_steps: 100  # 预训练步数
-  train_freq: 4  # 训练频率
-  hard_update_frequency: 1000  # 目标网络硬更新频率
+  pre_train_steps: 100
+  train_freq: 4
+  hard_update_frequency: 1000
+  lr_high: 0.0001
+  lr_low: 0.0001
+  gamma: 0.99
+  tau: 0.005
+  batch_size: 32
+  buffer_size: 50000
+  clip_grad_norm: 1.0
+  huber_delta: 1.0
+  epsilon:
+    initial_high: 0.3
+    initial_low: 0.3
+    final_high: 0.02
+    final_low: 0.02
+    decay_steps: 200000
+
+# Phase3训练参数
+phase3:
+  episodes: 1000
+  save_every: 100
+  max_steps: 600
+
+# 奖励函数参数
+reward:
+  connect_bonus: 10.0
+  reuse_bonus: 1.5
+  step_cost: 0.05
+  illegal_penalty: 3.0
+  timeout_penalty: 100.0

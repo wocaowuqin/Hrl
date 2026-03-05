@@ -74,7 +74,7 @@ class SharedResourcePool:
         self.node_locks = [threading.RLock() for _ in range(self.n)]
 
         self._init_links(capacities.get('bandwidth', 100.0))
-        logger.info(f"[SharedPool] 初始化: {self.n} 节点, {len(self.link_map)} 链路")
+        logger.debug(f"[SharedPool] 初始化: {self.n} 节点, {len(self.link_map)} 链路")
 
     def _init_links(self, bw_cap: float):
         edge_id = 0
@@ -391,7 +391,7 @@ class RequestLifecycleManager:
                 'status': 'active'
             }
             self.stats['total_registered'] += 1
-            logger.info(f"[Lifecycle] 注册请求 {req_id}, 过期时间 {expire_time:.2f}")
+            logger.debug(f"[Lifecycle] 注册请求 {req_id}, 过期时间 {expire_time:.2f}")
             return True
 
     def check_and_release_expired(self, current_time: float) -> List[str]:
@@ -434,6 +434,8 @@ class RequestLifecycleManager:
                 vnf_list = info['request'].get('vnf', [])
                 vnf_type = vnf_list[vnf_idx] if vnf_idx < len(vnf_list) else vnf_idx
                 self.resource_manager.release_node_resource(node, vnf_type, cpu_used, mem_used)
+                cpu_rel += cpu_used   # ← 修复：累加已释放的CPU
+                mem_rel += mem_used   # ← 修复：累加已释放的MEM
 
         # 释放链路资源
         tree = resources.get('tree', {})
@@ -461,7 +463,7 @@ class RequestLifecycleManager:
         info['actual_lifetime'] = current_time - info['arrival_time']
         self.expired_requests[req_id] = info
         del self.active_requests[req_id]
-        logger.info(f"[Lifecycle] 释放请求 {req_id}: CPU={cpu_rel:.1f}, MEM={mem_rel:.1f}, BW={bw_rel:.1f}")
+        logger.debug(f"[Lifecycle] 释放请求 {req_id}: CPU={cpu_rel:.1f}, MEM={mem_rel:.1f}, BW={bw_rel:.1f}")
 
     def force_release(self, req_id: str, current_time: float) -> bool:
         """
@@ -483,7 +485,7 @@ class RequestLifecycleManager:
             req_ids = list(self.active_requests.keys())
             for req_id in req_ids:
                 self._release_request(req_id, current_time)
-            logger.info(f"[Lifecycle] 清理所有请求，共 {len(req_ids)} 个")
+            logger.debug(f"[Lifecycle] 清理所有请求，共 {len(req_ids)} 个")
 
     def get_stats(self) -> dict:
         with self.lock:
@@ -542,7 +544,7 @@ class RequestHandler:
             'cpu_used': cpu_need,
             'mem_used': mem_need
         }
-        logger.info(f"[_try_deploy] 节点{node}部署VNF[{idx}]成功")
+        logger.debug(f"[_try_deploy] 节点{node}部署VNF[{idx}]成功")
         return True
 
     def _archive_request(self, success=False, already_rolled_back=False):
@@ -559,10 +561,10 @@ class RequestHandler:
             self.rm.total_requests_accepted += 1
             if hasattr(self.rm, 'served_dest_count'):
                 self.rm.served_dest_count += len(self.rm.current_request.get('dest', []))
-            logger.info(f"[Archive] 请求 {req_id} 成功归档")
+            logger.debug(f"[Archive] 请求 {req_id} 成功归档")
         else:
             if not already_rolled_back:
-                logger.info(f"[Archive] 请求 {req_id} 失败，回滚资源")
+                logger.debug(f"[Archive] 请求 {req_id} 失败，回滚资源")
                 placement = self.rm.current_tree.get('placement', {})
                 tree = self.rm.current_tree.get('tree', {})
                 bw = self.rm.current_request.get('bw_origin', 1.0)
@@ -577,7 +579,7 @@ class RequestHandler:
                     if isinstance(edge_key, tuple) and len(edge_key) == 2:
                         u, v = edge_key
                         self.rm.release_link_resource(u, v, bw * flow)
-            logger.info(f"[Archive] 请求 {req_id} 失败归档")
+            logger.debug(f"[Archive] 请求 {req_id} 失败归档")
 
     def complete_current_request(self):
         """完成并清理当前请求（由外部调用）"""
@@ -733,7 +735,7 @@ class FusedResourceManager:
         self.total_requests_accepted = 0
         self.served_dest_count = 0
 
-        logger.info(f"[FusedRM] 初始化完成: {self.n}节点, {self.pool.L}链路 (外观版)")
+        logger.debug(f"[FusedRM] 初始化完成: {self.n}节点, {self.pool.L}链路 (外观版)")
 
     def _build_edge_index(self):
         rows, cols = np.where(self.topo > 0)
@@ -903,4 +905,4 @@ class FusedResourceManager:
             else:
                 ct = current_time
             self.request_manager.cleanup_all(current_time=ct)
-            logger.info(f"[FusedRM] 完整重置完成 (hard={hard})")
+            logger.debug(f"[FusedRM] 完整重置完成 (hard={hard})")

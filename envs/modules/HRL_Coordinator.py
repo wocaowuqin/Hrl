@@ -784,4 +784,4 @@ def visualize_sfc_tree_publication(data, save_path="sfc_tree_pub.png"):
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✓ 论文级图已保存: {save_path}")
+    # print(f"✓ 论文级图已保存: {save_path}")

@@ -49,7 +49,7 @@ class LowLevelController:
         self._hop_dist_cache = None
         self._build_hop_distance_cache()
 
-        logger.info("✅ [LowLevelController] 初始化完成（强制SFC状态机优化版）")
+        logger.debug("✅ [LowLevelController] 初始化完成（强制SFC状态机优化版）")
 
     # ==================================================================
     # 分叉点选择
@@ -85,9 +85,9 @@ class LowLevelController:
                 for v in neighbors:
                     G.add_edge(u, v)
             self._hop_dist_cache = dict(nx.all_pairs_shortest_path_length(G))
-            logger.info(f"✅ [HopDist] 预计算完成: {n}节点, {G.number_of_edges()}边")
+            logger.debug(f"✅ [HopDist] 预计算完成: {n}节点, {G.number_of_edges()}边")
         except Exception as e:
-            logger.warning(f"⚠️ [HopDist] 预计算失败: {e}")
+            logger.debug(f"⚠️ [HopDist] 预计算失败: {e}")
             self._hop_dist_cache = None
 
     def _get_hop_distance(self, u, v):
@@ -206,7 +206,7 @@ class LowLevelController:
             _conn = len(self.env.current_tree.get('connected_dests', set())) if self.env.current_tree else 0
             _alld = len(self.env.current_request.get('dest', [])) if self.env.current_request else 0
             _max_steps = getattr(self.env, 'max_subgoal_steps', 25)
-            logger.warning(
+            logger.debug(
                 f"⏰ [Low] 超时 at Node {current_node} "
                 f"(连续超时: {self.env._consecutive_timeout_count}次) | "
                 f"phase={_ph} target={_tgt} hop_dist={_dist} "
@@ -238,7 +238,7 @@ class LowLevelController:
                         }
                 except Exception:
                     _bw_tensions = {}
-                logger.warning(
+                logger.debug(
                     f"❌ [Low] 连续超时{self.env._consecutive_timeout_count}次，Episode失败 | "
                     f"VNF={_vd}/{_vt} Dest={_dc_conn}/{_dt} | "
                     f"phase={_ph} cur={current_node} target={_tgt} hop_dist={_dist} | "
@@ -309,7 +309,7 @@ class LowLevelController:
                         _sfc['chain_nodes'].append(current_node)
                         logger.debug(f"[SFC-DAG] spine段: {_prev}→{current_node} = {_seg}")
                 except Exception as _e:
-                    logger.warning(f"[SFC-DAG] spine记录失败: {_e}")
+                    logger.debug(f"[SFC-DAG] spine记录失败: {_e}")
                 # ─────────────────────────────────────────────────────────────
 
                 self.env.next_vnf_idx += 1
@@ -336,7 +336,7 @@ class LowLevelController:
                 except Exception:
                     avail_cpu, avail_mem = 0.0, 0.0
                 self.env._consecutive_timeout_count = getattr(self.env, '_consecutive_timeout_count', 0) + 1
-                logger.warning(
+                logger.debug(
                     f"❌ [Low] VNF部署失败 节点{target_goal}: "
                     f"CPU可用={avail_cpu:.1f} MEM可用={avail_mem:.1f} "
                     f"(连续失败:{self.env._consecutive_timeout_count}次)"
@@ -392,7 +392,7 @@ class LowLevelController:
                             if _ek not in self.env.current_tree['tree']:
                                 self.env.current_tree['tree'][_ek] = _bw
                 except Exception as _e:
-                    logger.warning(f"[SFC-DAG] branch记录失败: {_e}")
+                    logger.debug(f"[SFC-DAG] branch记录失败: {_e}")
                 # ─────────────────────────────────────────────────────────────
 
             steps_used = getattr(self.env, 'subgoal_step_count', 50)
@@ -413,7 +413,7 @@ class LowLevelController:
                 all_dests, connected = set(), set()
 
             if all_dests.issubset(connected) and len(all_dests) > 0:
-                logger.info(
+                logger.debug(
                     f"✅ [Episode完成] 所有目的地已连接，生成合法多播树！"
                     f" connected={len(connected)}/{len(all_dests)} steps_used={steps_used}"
                 )
@@ -449,10 +449,10 @@ class LowLevelController:
                             _all_present = _spine_ok and _branch_ok
                             _in_order = True  # 结构拼接方式天然有序
                             if _all_present and _in_order:
-                                logger.info(f"✅ [SFC-DAG] src={_src}→dst={_d} "
+                                logger.debug(f"✅ [SFC-DAG] src={_src}→dst={_d} "
                                             f"VNF={_sfc['chain_nodes']} ✓")
                             else:
-                                logger.warning(f"⚠️ [SFC-DAG违规] src={_src}→dst={_d} "
+                                logger.debug(f"⚠️ [SFC-DAG违规] src={_src}→dst={_d} "
                                                f"spine_ok={_spine_ok} branch_ok={_branch_ok} "
                                                f"spine_ends={[s[-1] if s else None for s in _sfc['spine_paths']]} "
                                                f"chain={_sfc['chain_nodes']} "
@@ -460,7 +460,7 @@ class LowLevelController:
                                                f"branch_end={_branch[-1] if _branch else None}")
                                 _sfc_ok = False
                     if _sfc_ok:
-                        logger.info(f"✅ [SFC-DAG验证通过] chain={_sfc['chain_nodes'] if _sfc else _chain} src={_src}")
+                        logger.debug(f"✅ [SFC-DAG验证通过] chain={_sfc['chain_nodes'] if _sfc else _chain} src={_src}")
                 except Exception as _e:
                     logger.debug(f"[SFC-DAG验证] 跳过: {_e}")
                 # ─────────────────────────────────────────────────────────────
@@ -528,7 +528,7 @@ class LowLevelController:
                 )
                 # ─────────────────────────────────────────────────────────
                 if self.env._bw_fail_count >= 10:
-                    logger.warning(
+                    logger.debug(
                         f"❌ [Low] 带宽连续失败{self.env._bw_fail_count}次，Episode失败 | "
                         f"cur={current_node} target={target_goal} bw_req={bw_req:.1f}"
                     )
@@ -692,6 +692,7 @@ class LowLevelController:
     # ==================================================================
     def get_state(self):
         current_vnf_demand = 0.0
+        vnf_list = []
         if self.env.current_request:
             vnf_list = self.env.current_request.get('vnf', [])
             idx = getattr(self.env, 'next_vnf_idx', 0)
@@ -699,8 +700,18 @@ class LowLevelController:
                 cpu_reqs = self.env.current_request.get('cpu_origin', [10.0])
                 current_vnf_demand = cpu_reqs[idx] if idx < len(cpu_reqs) else 10.0
 
+        # ── [SDG-HRL] 维度定义 ──────────────────────────────────────────────
+        # 静态维度 (dim 0-13): 资源特征 + padding
+        # 动态维度 (dim 14-19): 树状态 + SFC结构感知特征
+        #   dim 14: tree_mask          - 节点是否在当前多播树中
+        #   dim 15: connected_mask     - 节点是否是已连接的dest
+        #   dim 16: is_target          - 节点是否是当前子目标
+        #   dim 17: vnf_depth          - [新增] SFC链路位置编码 ∈ [0,1]
+        #   dim 18: is_dc              - [新增] 是否是DC节点（可部署VNF）
+        #   dim 19: progress_ratio     - [新增] 全局SFC完成进度 ∈ [0,1]
+        # ──────────────────────────────────────────────────────────────────
         BASE_FEATURE_DIM = 5
-        DYNAMIC_FEATURE_DIM = 3
+        DYNAMIC_FEATURE_DIM = 6  # 原3维 → 新6维
 
         base_features = []
         for node in range(self.env.n):
@@ -714,7 +725,7 @@ class LowLevelController:
 
         base_x = np.array(base_features, dtype=np.float32)
 
-        dynamic_features = []
+        # ── 预计算动态特征所需的上下文 ──────────────────────────────────────
         nodes_on_tree = getattr(self.env, 'nodes_on_tree', set())
         connected_dests = self.env.current_tree.get('connected_dests', set()) if self.env.current_tree else set()
 
@@ -731,20 +742,67 @@ class LowLevelController:
             except:
                 pass
 
+        # ── [新增] SFC链路位置编码：chain_nodes[k] → vnf_depth = (k+1)/M ──
+        # 语义：节点是第k个VNF时，depth=(k+1)/M；未部署VNF的节点depth=0
+        chain_nodes = getattr(self.env, 'chain_nodes', [])
+        total_vnf = max(len(vnf_list), 1)
+        chain_pos_map = {
+            node: (i + 1) / total_vnf
+            for i, node in enumerate(chain_nodes)
+        }
+
+        # ── [新增] 全局SFC完成进度 ─────────────────────────────────────────
+        # vnf阶段: next_vnf_idx/total_vnf; dest阶段: 1.0
+        next_vnf_idx = getattr(self.env, 'next_vnf_idx', 0)
+        progress_ratio = float(next_vnf_idx) / total_vnf  # ∈ [0, 1]
+
+        # ── [新增] DC节点集合 ──────────────────────────────────────────────
+        dc_nodes_set = set(getattr(self.env, 'dc_nodes', []))
+
+        dynamic_features = []
         for node in range(self.env.n):
-            t_m = 1.0 if node in nodes_on_tree else 0.0
-            c_m = 1.0 if node in connected_dests else 0.0
-            is_target = 1.0 if node == target_node_int else 0.0
-            dynamic_features.append([t_m, c_m, is_target])
+            t_m       = 1.0 if node in nodes_on_tree else 0.0   # dim 14
+            c_m       = 1.0 if node in connected_dests else 0.0 # dim 15
+            is_target = 1.0 if node == target_node_int else 0.0 # dim 16
+            vnf_depth = chain_pos_map.get(node, 0.0)             # dim 17 [新增]
+            is_dc     = 1.0 if node in dc_nodes_set else 0.0    # dim 18 [新增]
+            prog      = progress_ratio                           # dim 19 [新增]
+            dynamic_features.append([t_m, c_m, is_target, vnf_depth, is_dc, prog])
 
         full_x = np.concatenate([base_x, np.array(dynamic_features)], axis=1)
+        # full_x.shape = [N, 20]，其中静态14维 + 动态6维
+
+        # ── [SDG-HRL Day2] 每step更新 edge_attr（带宽状态 + is_tree_edge）──
+        # 在构建 Data 对象前调用，确保 edge_attr 反映当前树状态和带宽状态
+        if hasattr(self.env, 'resource_mgr') and hasattr(self.env.resource_mgr, 'update_edge_attr'):
+            _tree_edges = self.env.current_tree.get('tree', {}) if self.env.current_tree else {}
+            self.env.resource_mgr.update_edge_attr(tree_edges=_tree_edges)
+            # ── [关键] 立即同步回 env.edge_attr，get_state() 下方才能读到 ──
+            if hasattr(self.env.resource_mgr, 'edge_attr'):
+                self.env.edge_attr = self.env.resource_mgr.edge_attr
+
         x_tensor = torch.from_numpy(full_x).float()
         low_mask = self.get_low_level_action_mask()
+
+        # ── [SDG-HRL Day3预留] 构建树子图 edge_index ────────────────────────
+        # 此处预先构建 tree_edge_index，供 Tree-aware Attention Bias 使用
+        # 当前 Day1/Day2 阶段直接存入 Data 对象但 SharedEncoder 暂不使用
+        tree_edges = self.env.current_tree.get('tree', {}) if self.env.current_tree else {}
+        if tree_edges:
+            _t_src, _t_dst = [], []
+            for (u, v) in tree_edges.keys():
+                _t_src += [u, v]  # 无向 → 双向
+                _t_dst += [v, u]
+            tree_edge_index = torch.tensor([_t_src, _t_dst], dtype=torch.long)
+        else:
+            # 空树：用自环占位，避免 GATv2 空图报错
+            tree_edge_index = torch.zeros((2, 1), dtype=torch.long)
 
         return Data(
             x=x_tensor,
             edge_index=self.env.edge_index if hasattr(self.env, 'edge_index') else None,
             edge_attr=self.env.edge_attr if hasattr(self.env, 'edge_attr') else None,
+            tree_edge_index=tree_edge_index,  # [新增] 树子图，Day3使用
             action_mask=torch.from_numpy(low_mask).bool().unsqueeze(0)
         )
 

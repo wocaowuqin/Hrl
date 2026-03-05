@@ -431,7 +431,7 @@ if __name__ == "__main__":
 
     # 创建模型
     model = MulticastGATWrapperVectorized(
-        node_feat_dim=17,
+        node_feat_dim=20,
         edge_feat_dim=5,
         request_dim=24,
         n_actions=28,
@@ -445,7 +445,7 @@ if __name__ == "__main__":
     num_nodes = 50  # 更大的图
     num_edges = 200
 
-    x = torch.randn(num_nodes, 17).to(device)
+    x = torch.randn(num_nodes, 20).to(device)
     edge_index = torch.randint(0, num_nodes, (2, num_edges)).to(device)
     edge_attr = torch.randn(num_edges, 5).to(device)
     req = torch.randn(24).to(device)
@@ -515,7 +515,7 @@ if __name__ == "__main__":
         from multicast_gat_wrapper_production import MulticastGATWrapperProduction
 
         model_old = MulticastGATWrapperProduction(
-            node_feat_dim=17,
+            node_feat_dim=20,
             edge_feat_dim=5,
             request_dim=24,
             n_actions=28,

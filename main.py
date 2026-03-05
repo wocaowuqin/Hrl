@@ -329,9 +329,20 @@ def inject_dynamic_dimensions(config, env):
     if 'gnn' not in config:
         config['gnn'] = {}
 
-    config['gnn']['node_feat_dim'] = env.resource_mgr.node_feat_dim
-    config['gnn']['edge_feat_dim'] = env.resource_mgr.edge_feat_dim
-    config['gnn']['request_feat_dim'] = env.resource_mgr.request_dim
+    # ── [SDG-HRL] node_feat_dim 由 model.yaml 决定（20维），不再从 resource_mgr 覆盖
+    # resource_mgr.node_feat_dim = 6+K_vnf+3 = 17（旧计算公式，已过时）
+    # 只在 yaml 里没有配置时才用 resource_mgr 的值作为 fallback
+    if 'node_feat_dim' not in config['gnn']:
+        config['gnn']['node_feat_dim'] = env.resource_mgr.node_feat_dim
+        logger.info(f"  node_feat_dim (from env): {config['gnn']['node_feat_dim']}")
+    else:
+        logger.info(f"  node_feat_dim (from yaml): {config['gnn']['node_feat_dim']} ✓")
+
+    # edge_feat_dim 和 request_feat_dim 同样只作 fallback
+    if 'edge_feat_dim' not in config['gnn']:
+        config['gnn']['edge_feat_dim'] = env.resource_mgr.edge_feat_dim
+    if 'request_feat_dim' not in config['gnn']:
+        config['gnn']['request_feat_dim'] = env.resource_mgr.request_dim
 
     # 🔥 新增：注入 HRL 配置
     if 'hrl' not in config:
@@ -734,6 +745,47 @@ def main():
             )
 
             logger.info("✅ Agent 初始化成功")
+
+            # ── [SDG-HRL] 实例化 GNN Wrapper 并注入 agent.encoder ──────────
+            # MulticastGATWrapperVectorized.gat.encoder = SharedEncoder(含 tree_bias)
+            # 注入后 _get_graph_embedding() 将使用真实 GNN 特征而非 zeros
+            try:
+                from core.gnn.multicast_gat_wrapper_vectorized import MulticastGATWrapperVectorized
+                _gnn_cfg = config.get('gnn', {})
+                _gnn_wrapper = MulticastGATWrapperVectorized(
+                    node_feat_dim  = _gnn_cfg.get('node_feat_dim',  20),
+                    edge_feat_dim  = _gnn_cfg.get('edge_feat_dim',   5),
+                    request_dim    = _gnn_cfg.get('request_feat_dim', 24),
+                    n_actions      = _gnn_cfg.get('num_actions',     28),
+                    hidden_dim     = _gnn_cfg.get('hidden_dim',     128),
+                    num_gat_layers = _gnn_cfg.get('num_gat_layers',   2),
+                    num_heads      = _gnn_cfg.get('num_heads',        4),
+                ).to(agent.device)
+
+                # 注入：agent.encoder 指向 wrapper 内部的 SharedEncoder
+                # _get_graph_embedding 会调用 encoder(x, edge_index, batch)
+                agent.encoder = _gnn_wrapper.gat.encoder
+                agent.encoder.train()  # 允许梯度更新（随 low_policy 一起训练）
+                for param in agent.encoder.parameters():
+                    param.requires_grad = True
+
+                # 同时把 wrapper 保存到 agent，方便后续访问
+                agent.gnn_wrapper = _gnn_wrapper
+
+                logger.info(f"✅ [SDG-HRL] GNN Wrapper 注入成功")
+                logger.info(f"   node_feat_dim={_gnn_cfg.get('node_feat_dim',20)}, "
+                            f"tree_bias={agent.encoder.tree_bias.item():.3f}")
+
+                # ── [关键] 将 encoder 参数加入 optimizer_low ────────────────
+                # 不调用此方法，tree_bias 有梯度但不会被 step() 更新（永远=0.5）
+                if hasattr(agent, 'register_encoder_to_optimizer'):
+                    agent.register_encoder_to_optimizer(
+                        lr=config.get('training', {}).get('lr_low', 1e-4) * 0.1
+                    )
+            except Exception as _e:
+                logger.warning(f"⚠️ [SDG-HRL] GNN Wrapper 注入失败（不影响训练）: {_e}")
+                import traceback; traceback.print_exc()
+            # ──────────────────────────────────────────────────────────────
 
         except Exception as e:
             logger.error(f"❌ Agent 初始化失败: {e}")

@@ -667,8 +667,8 @@ class HRLAgent:
 
     def _select_low_action(self, state: Dict, action_mask: Optional[np.ndarray]) -> int:
         """Low-Level策略选择动作"""
-        # 获取图嵌入
-        graph_emb = self._get_graph_embedding(state)
+        # [SDG-HRL] 用局部嵌入（当前节点+目标节点）替代全图均值
+        graph_emb = self._get_local_embedding(state)
 
         # Goal embedding
         if self.current_goal_emb is None:
@@ -691,6 +691,51 @@ class HRLAgent:
 
         return action.item()
 
+    def _get_local_embedding(self, state):
+        """
+        [SDG-HRL] 局部嵌入：当前节点 + 目标节点的嵌入拼接后压缩到 hidden_dim。
+        比全图均值更适合低层"选下一跳"任务。
+        """
+        if self.encoder is None:
+            return self._get_graph_embedding(state)
+
+        real_state = state[0] if isinstance(state, tuple) else state
+        if not hasattr(real_state, 'x'):
+            return self._get_graph_embedding(state)
+
+        try:
+            with torch.no_grad():
+                _x  = real_state.x.to(self.device)
+                _ei = real_state.edge_index.to(self.device)                       if real_state.edge_index is not None                       else (self.env.edge_index.to(self.device)
+                            if hasattr(self, 'env') and self.env is not None
+                               and hasattr(self.env, 'edge_index')
+                               and self.env.edge_index is not None
+                            else torch.zeros((2, 1), dtype=torch.long, device=self.device))
+                _ea = real_state.edge_attr.to(self.device)                       if hasattr(real_state, 'edge_attr') and real_state.edge_attr is not None                       else None
+                _b  = torch.zeros(_x.size(0), dtype=torch.long, device=self.device)
+                node_out = self.encoder(_x, _ei, _ea, batch=_b)  # [N, H]
+
+            N = node_out.size(0)
+
+            # 当前节点嵌入
+            cur = getattr(self.env, 'current_node_location', None)                   if hasattr(self, 'env') and self.env is not None else None
+            cur_emb = node_out[cur] if cur is not None and cur < N                       else node_out.mean(dim=0)
+
+            # 目标节点嵌入（根据 phase 决定）
+            phase = getattr(self.env, 'current_phase', None)                     if hasattr(self, 'env') and self.env is not None else None
+            if phase == 'vnf_deployment':
+                tgt = getattr(self.env, 'current_deployment_target', None)
+            else:
+                tgt = getattr(self.env, 'current_target_node', None)
+            tgt_emb = node_out[tgt] if tgt is not None and tgt < N                       else node_out.mean(dim=0)
+
+            # 差值向量：让 low_policy 感知方向和距离
+            local_emb = cur_emb - tgt_emb  # [H] 方向向量
+            return local_emb.unsqueeze(0)
+
+        except Exception as e:
+            return self._get_graph_embedding(state)
+
     def _get_graph_embedding(self, state):
         """
         🔥 [V41.2 修复版] 获取图嵌入 (自动处理 Tuple 和 Batch)
@@ -706,17 +751,18 @@ class HRLAgent:
             return torch.zeros(1, self.hidden_dim, device=self.device)
 
         # 3. 计算 Embedding
+        # SharedEncoder 返回节点级 [N, H]，需要 mean pooling → 图级 [1, H]
         try:
             # 情况 A: PyG Batch 对象 (训练时)
             if hasattr(real_state, 'batch') and real_state.batch is not None:
-                return self.encoder(real_state.x, real_state.edge_index, real_state.batch)
+                node_out = self.encoder(real_state.x, real_state.edge_index, real_state.batch)
+                return node_out.mean(dim=0, keepdim=True)
 
             # 情况 B: 单个 Data 对象 (推理时)
             if hasattr(real_state, 'x'):
-                # 构造一个全0的 batch 向量
                 batch = torch.zeros(real_state.x.size(0), dtype=torch.long, device=self.device)
-                return self.encoder(real_state.x, real_state.edge_index, batch)
-
+                node_out = self.encoder(real_state.x, real_state.edge_index, batch)
+                return node_out.mean(dim=0, keepdim=True)
         except Exception as e:
             # logger.warning(f"Encoder forward failed: {e}")
             pass
@@ -1031,12 +1077,81 @@ class HRLAgent:
             batch = random.sample(self.low_memory, self.batch_size)
 
             # 3. 准备数据
-            # 使用新添加的 _extract_state_embedding 方法
-            state_embs = [self._extract_state_embedding(x['state']) for x in batch]
-            next_state_embs = [self._extract_state_embedding(x['next_state']) for x in batch]
+            # [SDG-HRL] encoder 参数组已加入 optimizer_low，
+            # state_embs 必须保留计算图（不能 detach），才能让 tree_bias 收到梯度
+            if self.encoder is not None:
+                # [SDG-HRL] 缓存固定拓扑 edge_index（经验里可能为 None，用 env 兜底）
+                _topo_ei = None
+                if self.env is not None and hasattr(self.env, 'edge_index') and \
+                        self.env.edge_index is not None:
+                    _topo_ei = self.env.edge_index.to(self.device)
 
-            state_tensor = torch.cat(state_embs, dim=0).to(self.device)
-            next_state_tensor = torch.cat(next_state_embs, dim=0).to(self.device)
+                _state_xs, _state_eis = [], []
+                _next_xs, _next_eis = [], []
+                for x in batch:
+                    _s = x['state'][0] if isinstance(x['state'], tuple) else x['state']
+                    _n = x['next_state'][0] if isinstance(x['next_state'], tuple) else x['next_state']
+                    if hasattr(_s, 'x') and hasattr(_n, 'x'):
+                        _s_ei = (_s.edge_index.to(self.device)
+                                 if _s.edge_index is not None else _topo_ei)
+                        _n_ei = (_n.edge_index.to(self.device)
+                                 if _n.edge_index is not None else _topo_ei)
+                        if _s_ei is None or _n_ei is None:
+                            continue
+                        _state_xs.append(_s.x.to(self.device))
+                        _state_eis.append(_s_ei)
+                        _next_xs.append(_n.x.to(self.device))
+                        _next_eis.append(_n_ei)
+
+                def _fix_ea(ei, state_obj, dev, fdim=5):
+                    n_edges = ei.shape[1]
+                    ea = getattr(state_obj, 'edge_attr', None)
+                    if ea is None:
+                        return torch.zeros(n_edges, fdim, device=dev)
+                    ea = ea.to(dev)
+                    if ea.dim() == 1:
+                        ea = ea.unsqueeze(1)
+                    if ea.shape[0] != n_edges:
+                        return torch.zeros(n_edges, fdim, device=dev)
+                    if ea.shape[1] < fdim:
+                        pad = torch.zeros(n_edges, fdim - ea.shape[1], device=dev)
+                        ea = torch.cat([ea, pad], dim=1)
+                    return ea
+
+                if _state_xs:
+                    _s_states = [x['state'][0] if isinstance(x['state'], tuple)
+                                 else x['state'] for x in batch]
+                    _n_states = [x['next_state'][0] if isinstance(x['next_state'], tuple)
+                                 else x['next_state'] for x in batch]
+                    _s_embs, _n_embs = [], []
+                    for _x, _ei, _so in zip(_state_xs, _state_eis, _s_states):
+                        _b = torch.zeros(_x.size(0), dtype=torch.long, device=self.device)
+                        _ea = _fix_ea(_ei, _so, self.device)
+                        _node_emb = self.encoder(_x, _ei, _ea, batch=_b)
+                        _s_embs.append(_node_emb.mean(dim=0, keepdim=True))
+                    for _x, _ei, _no in zip(_next_xs, _next_eis, _n_states):
+                        _b = torch.zeros(_x.size(0), dtype=torch.long, device=self.device)
+                        _ea = _fix_ea(_ei, _no, self.device)
+                        _node_emb = self.encoder(_x, _ei, _ea, batch=_b).detach()
+                        _n_embs.append(_node_emb.mean(dim=0, keepdim=True))
+                    if _s_embs and _n_embs:
+                        state_tensor = torch.cat(_s_embs, dim=0)
+                        next_state_tensor = torch.cat(_n_embs, dim=0)
+                    else:
+                        state_embs = [self._extract_state_embedding(x['state']) for x in batch]
+                        next_state_embs = [self._extract_state_embedding(x['next_state']) for x in batch]
+                        state_tensor = torch.cat(state_embs, dim=0).to(self.device)
+                        next_state_tensor = torch.cat(next_state_embs, dim=0).to(self.device)
+                else:
+                    state_embs = [self._extract_state_embedding(x['state']) for x in batch]
+                    next_state_embs = [self._extract_state_embedding(x['next_state']) for x in batch]
+                    state_tensor      = torch.cat(state_embs, dim=0).to(self.device)
+                    next_state_tensor = torch.cat(next_state_embs, dim=0).to(self.device)
+            else:
+                state_embs = [self._extract_state_embedding(x['state']) for x in batch]
+                next_state_embs = [self._extract_state_embedding(x['next_state']) for x in batch]
+                state_tensor      = torch.cat(state_embs, dim=0).to(self.device)
+                next_state_tensor = torch.cat(next_state_embs, dim=0).to(self.device)
 
             actions = torch.tensor([x['action'] for x in batch], device=self.device).long().unsqueeze(1)
             rewards = torch.tensor([x['reward'] for x in batch], device=self.device).float().unsqueeze(1)
@@ -1127,6 +1242,26 @@ class HRLAgent:
             self.optimizer_low.zero_grad()
             loss.backward()
 
+            # ── [SDG-HRL DEBUG] ──────────────────────────────────────────
+            try:
+                _enc = self.encoder
+                if _enc is not None and hasattr(_enc, 'tree_bias'):
+                    _tb = _enc.tree_bias
+                    # 检查 _state_xs 是否有数据
+                    _sample = self.low_memory[0] if self.low_memory else None
+                    _s_type = type(_sample.get('state', None)) if _sample else None
+                    _s_obj = _sample['state'][0] if isinstance(_sample.get('state'), tuple) else _sample.get(
+                        'state') if _sample else None
+                    _has_x = hasattr(_s_obj, 'x') if _s_obj else False
+                    _has_ei = hasattr(_s_obj, 'edge_index') if _s_obj else False
+                    _ei_val = _s_obj.edge_index if _has_ei else None
+                    print(f"[DEBUG] tree_bias.grad={_tb.grad} | "
+                          f"state type={_s_type} | has_x={_has_x} | "
+                          f"has_edge_index={_has_ei} | edge_index={'None' if _ei_val is None else _ei_val.shape} | "
+                          f"topo_ei_avail={hasattr(self, 'env') and self.env is not None and hasattr(self.env, 'edge_index') and self.env.edge_index is not None}")
+            except Exception as _e:
+                print(f"[DEBUG] error: {_e}")
+            # ──────────────────────────────────────────────────────────────
             # 🔥 [修复] 梯度监控与裁剪
             total_grad_norm = 0.0
             for param in self.low_policy.parameters():
@@ -1156,6 +1291,33 @@ class HRLAgent:
             import traceback
             traceback.print_exc()
             return 0.0
+
+    def register_encoder_to_optimizer(self, lr=None):
+        """
+        [SDG-HRL] 将 encoder 参数加入 optimizer_low 的参数组。
+        在 main.py 注入 agent.encoder 之후 调用一次。
+        这样 loss.backward() 产生的 tree_bias 梯度才会被 optimizer.step() 更新。
+        """
+        if self.encoder is None:
+            logger.warning("[SDG-HRL] encoder=None，无法注册到optimizer")
+            return False
+
+        # 确保所有参数都开启梯度
+        for param in self.encoder.parameters():
+            param.requires_grad = True
+        self.encoder.train()
+
+        # 用独立学习率（默认比 policy 小10倍，避免GNN更新破坏已有表示）
+        _lr = lr or (self.optimizer_low.param_groups[0]['lr'])
+        self.optimizer_low.add_param_group({
+            'params': list(self.encoder.parameters()),
+            'lr': _lr,
+            'name': 'sdg_hrl_encoder'  # 便于调试识别
+        })
+        n_params = sum(p.numel() for p in self.encoder.parameters())
+        logger.info(f"✅ [SDG-HRL] encoder 已注册到 optimizer_low "
+                    f"(lr={_lr:.2e}, params={n_params:,})")
+        return True
 
     def _soft_update_target_networks(self):
         """软更新target networks（更稳定）"""
@@ -1272,8 +1434,8 @@ class HRLAgent:
         4. 🔥 新增：最终验证（三重保险）
         """
         try:
-            # 1. 获取状态嵌入
-            state_emb = self._extract_state_embedding(state)
+            # 1. 获取状态嵌入 [SDG-HRL] 用局部嵌入
+            state_emb = self._get_local_embedding(state)
             if self.current_goal_emb is None:
                 self._generate_goal_embedding(state)
 
