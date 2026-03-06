@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Low-Level Policy (重构版)
-职责：给定subgoal，选择下一跳节点执行路径规划
+Low-Level Policy (TA-HRL v4 重构版)
+职责：给定 subgoal (destination / target)，结合 Tree-Aware Encoder 输出的全图节点特征，
+使用 Goal-Conditioned Attention 机制选择最优下一跳节点。
 """
 
 import torch
 import torch.nn as nn
 import logging
+import random
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -15,16 +17,11 @@ logger = logging.getLogger(__name__)
 
 class GoalConditionedLowLevelPolicy(nn.Module):
     """
-    Goal-Conditioned Low-Level Policy (重构版)
+    Goal-Conditioned Low-Level Policy (TA-HRL v4)
 
-    职责：
-    1. 接收当前状态 + subgoal embedding
-    2. 输出下一跳节点的Q值
-
-    关键特点：
-    - Goal-Conditioned（目标条件化）
-    - 学习如何到达subgoal
-    - 接收内在奖励（接近/远离subgoal）
+    核心机制：
+    用目标 (Goal) 作为 Query，全图所有节点的特征作为 Key 和 Value，
+    计算注意力权重，从而使得策略网络全局感知“去往目标的最优方向”。
     """
 
     def __init__(self, config):
@@ -37,58 +34,38 @@ class GoalConditionedLowLevelPolicy(nn.Module):
         )
 
         # 维度配置
-        self.state_dim = config.get('state_dim', 128)  # GNN encoder输出
+        self.state_dim = config.get('state_dim', 128)  # GNN encoder输出的维度
         self.goal_dim = config.get('goal_dim', 64)  # Goal embedding维度
         self.hidden_dim = config.get('hidden_dim', 128)
 
-        # 从环境配置读取动作数量
-        env_cfg = config.get('environment', {})
-        self.action_dim = env_cfg.get('nb_low_level_actions', 28)
-
+        # 从环境配置读取动作空间维度 (全网节点数)
+        env_cfg = config.get('environment', config.get('env', {}))
+        self.action_dim = env_cfg.get('nb_low_level_actions', 50)
         dropout = config.get('dropout', 0.1)
 
-        logger.info(f"GoalConditionedLowLevelPolicy配置:")
-        logger.info(f"  State dim: {self.state_dim}")
-        logger.info(f"  Goal dim: {self.goal_dim}")
-        logger.info(f"  Action dim: {self.action_dim}")
-
-        # ============================================
-        # 1. State Projection（状态投影）
-        # ============================================
+        # 状态投影层
         self.state_projection = nn.Sequential(
             nn.Linear(self.state_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.ReLU()
         )
 
-        # ============================================
-        # 2. Goal Projection（目标投影）
-        # ============================================
+        # 目标投影层
         self.goal_projection = nn.Sequential(
             nn.Linear(self.goal_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.ReLU()
         )
 
-        # ============================================
-        # 3. [TA-HGRL] Goal-Conditioned Attention
-        #    Goal(Query) × Nodes(Key,Value) → 目标制导注意力
-        #    让subgoal主动"审视"全网节点，聚焦最优下一跳
-        # ============================================
+        # 🎯 目标条件交叉注意力 (Destination-Conditioned Cross-Attention)
         self.goal_attention = nn.MultiheadAttention(
             embed_dim=self.hidden_dim,
             num_heads=4,
-            dropout=dropout,
             batch_first=True
         )
         self.attn_norm = nn.LayerNorm(self.hidden_dim)
 
-        # ============================================
-        # 4. Actor（Q Network）
-        #    输入: cat[attn_context, goal_proj] → hidden*2
-        # ============================================
+        # Actor: 输出各个节点的动作 Q 值 (DQN) 或 Logits
         self.actor = nn.Sequential(
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
             nn.ReLU(),
@@ -96,9 +73,7 @@ class GoalConditionedLowLevelPolicy(nn.Module):
             nn.Linear(self.hidden_dim, self.action_dim)
         )
 
-        # ============================================
-        # 5. Critic（Value Network）
-        # ============================================
+        # Critic: 评估当前状态-目标对的 Value
         self.critic = nn.Sequential(
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
             nn.ReLU(),
@@ -106,156 +81,102 @@ class GoalConditionedLowLevelPolicy(nn.Module):
             nn.Linear(self.hidden_dim, 1)
         )
 
-        self.to(self.device)
-
-        logger.info(f"✅ GoalConditionedLowLevelPolicy初始化完成，设备: {self.device}")
-
-    def forward(
-            self,
-            state_emb: torch.Tensor,
-            goal_emb: Optional[torch.Tensor] = None,
-            action_mask: Optional[torch.Tensor] = None
-    ) -> tuple:
+    def forward(self, state_emb: torch.Tensor, goal_emb: Optional[torch.Tensor] = None,
+                action_mask: Optional[torch.Tensor] = None) -> tuple:
         """
-        [TA-HGRL] Goal-Conditioned Attention Forward
-
-        Args:
-            state_emb: 状态嵌入 [batch, state_dim]  (全图均值或节点序列)
-            goal_emb:  Goal embedding [batch, goal_dim]
-            action_mask: [batch, action_dim]  1=可选 0=禁止
-
-        Returns:
-            logits: [batch, action_dim]
-            value:  [batch, 1]
+        前向传播
+        :param state_emb: 全局节点特征序列 [Batch, Num_nodes, State_dim]
+        :param goal_emb: 当前子目标特征 [Batch, Goal_dim]
+        :param action_mask: 动作合法性掩码 [Batch, Num_nodes]
+        :return: (logits/q_values, state_value)
         """
         B = state_emb.size(0)
 
-        # 1. 投影: Linear作用于最后维度，兼容 [B,H] 和 [B,N,H]
-        state_proj = self.state_projection(state_emb)   # [B,H] 或 [B,N,H]
-        goal_proj  = (self.goal_projection(goal_emb)
-                      if goal_emb is not None
-                      else torch.zeros(B, self.hidden_dim, device=state_emb.device))  # [B,H]
+        # 1. 投影到统一的隐藏维度
+        state_proj = self.state_projection(state_emb)  # [B, N, H]
+        goal_proj = self.goal_projection(goal_emb) if goal_emb is not None else torch.zeros(B, self.hidden_dim,
+                                                                                            device=state_emb.device)  # [B, H]
 
-        # 2. [TA-HGRL Fix] Goal-Conditioned Cross-Attention
-        #    Query = goal [B,1,H]
-        #    Key/Value = 全网N个节点特征序列 [B,N,H]（或退化为[B,1,H]）
-        query = goal_proj.unsqueeze(1)                           # [B, 1, H]
-        kv    = (state_proj if state_proj.dim() == 3            # [B, N, H] ✓
-                 else state_proj.unsqueeze(1))                   # [B, 1, H] 兜底
-        attn_out, _ = self.goal_attention(query=query, key=kv, value=kv)
-        attn_context = self.attn_norm(attn_out.squeeze(1) + goal_proj)  # 残差 [B,H]
+        # 2. 🎯 注意力机制融合 (Goal 去审视 Nodes)
+        query = goal_proj.unsqueeze(1)  # [B, 1, H]
+        attn_out, _ = self.goal_attention(query=query, key=state_proj, value=state_proj)
 
-        # 3. 拼接 → Actor/Critic
-        fused  = torch.cat([attn_context, goal_proj], dim=-1)   # [B, H*2]
+        # 残差连接与归一化
+        attn_context = self.attn_norm(attn_out.squeeze(1) + goal_proj)  # [B, H]
+
+        # 3. 拼接上下文和原始目标特征
+        fused = torch.cat([attn_context, goal_proj], dim=-1)  # [B, H*2]
+
+        # 4. 计算各动作的得分 (Q-values)
         logits = self.actor(fused)
 
-        # 4. Mask
+        # 5. 应用严格的动作掩码 (Masking)
         if action_mask is not None:
             logits = logits.masked_fill(action_mask == 0, float('-inf'))
 
+        # 6. 计算状态价值
         value = self.critic(fused)
+
         return logits, value
 
-    def select_action(self, state_emb, goal_emb, action_mask=None, epsilon=0.1):
+    def select_action(self, state_emb: torch.Tensor, goal_emb: Optional[torch.Tensor] = None,
+                      action_mask: Optional[torch.Tensor] = None, epsilon: float = 0.0, **kwargs):
         """
-        🔥 [修复版] 选择动作（低层动作）
-
-        Args:
-            state_emb: (batch, state_dim) 状态嵌入
-            goal_emb: (batch, goal_dim) 目标嵌入
-            action_mask: (batch, n_actions) 动作mask，1=可选，0=禁止
-            epsilon: 探索率
-
-        Returns:
-            action: int, 选择的动作
-            q_value: float, 对应的Q值
+        为 agent_action.py 提供兼容的动作选择接口
+        在推断 (Inference) 阶段直接输出具有最高 Q 值 / Logits 的合法动作
+        支持 Epsilon-Greedy 探索
+        返回的 action 必须是一个 torch.Tensor 以兼容外部的 .item() 调用
         """
-        import torch
-        import numpy as np
-
-        # 1. 前向传播获取Q值
         with torch.no_grad():
-            policy_output = self.forward(state_emb, goal_emb)
+            logits, value = self.forward(state_emb, goal_emb, action_mask)
 
-            # 兼容返回tuple的情况
-            if isinstance(policy_output, tuple):
-                q_values = policy_output[0]  # (batch, n_actions)
-            else:
-                q_values = policy_output
-
-        # 2. 🔥 关键修复：应用Mask（在argmax之前）
-        if action_mask is not None:
-            # 确保mask在正确设备上
-            if isinstance(action_mask, np.ndarray):
-                action_mask = torch.FloatTensor(action_mask).to(q_values.device)
-
-            # 确保mask维度匹配
-            if action_mask.dim() == 1:
-                action_mask = action_mask.unsqueeze(0)
-
-            if action_mask.size(1) != q_values.size(1):
-                # 维度不匹配，截断或填充
-                if action_mask.size(1) < q_values.size(1):
-                    padding = torch.zeros(
-                        action_mask.size(0),
-                        q_values.size(1) - action_mask.size(1),
-                        device=action_mask.device
-                    )
-                    action_mask = torch.cat([action_mask, padding], dim=1)
+            # 引入 epsilon-greedy 探索机制
+            if epsilon > 0.0 and random.random() < epsilon:
+                # 随机探索
+                if action_mask is not None:
+                    valid_actions = (action_mask.squeeze() > 0).nonzero(as_tuple=True)[0]
+                    if len(valid_actions) > 0:
+                        idx = random.randint(0, len(valid_actions) - 1)
+                        action = valid_actions[idx]  # 这里直接提取是 0-dim tensor
+                    else:
+                        # 兜底机制：如果没有合法动作，只能走最高分
+                        action = torch.argmax(logits, dim=-1).squeeze()
                 else:
-                    action_mask = action_mask[:, :q_values.size(1)]
-
-            # 🔥 Q值屏蔽法：mask==0的位置设为-1e9
-            masked_q_values = q_values.clone()
-            masked_q_values[action_mask == 0] = -1e9
-        else:
-            masked_q_values = q_values
-
-        # 3. 动作选择（epsilon-greedy）
-        if np.random.rand() < epsilon:
-            # 探索：从有效动作中随机选择
-            if action_mask is not None:
-                valid_indices = torch.nonzero(action_mask[0] > 0, as_tuple=False).squeeze()
-                if valid_indices.numel() == 0:
-                    action = torch.tensor(0)
-                elif valid_indices.numel() == 1:
-                    action = valid_indices
-                else:
-                    action = valid_indices[torch.randint(len(valid_indices), (1,))]
+                    action = torch.tensor(random.randint(0, logits.size(-1) - 1), device=logits.device)
             else:
-                action = torch.randint(0, q_values.size(1), (1,))
-        else:
-            # 利用：选择Q值最大的
-            action = torch.argmax(masked_q_values[0])
+                # 贪心选择最高分的动作索引，squeeze() 后是一个 0-dim tensor
+                action = torch.argmax(logits, dim=-1).squeeze()
 
-        # 获取对应的Q值
-        q_value = masked_q_values[0, action].item()
+            return action, value
 
-        return action, q_value
+    def reset_parameters(self):
+        """重置网络参数（用于异常自愈）"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0)
 
 
 # ============================================
-# 向后兼容：保留旧接口
+# 向后兼容：保留旧接口以防其它模块报错
 # ============================================
 
 class LowLevelPolicy(nn.Module):
     """
     低层策略网络 (向后兼容版)
-
-    这是为了不破坏现有代码而保留的接口
-    实际上会调用重构后的GoalConditionedLowLevelPolicy
-    但可以在不提供goal的情况下使用
     """
 
     def __init__(self, input_dim, action_dim, hidden_dim=128):
         super().__init__()
+        logger.warning("⚠️ 正在使用向后兼容的 LowLevelPolicy 接口，底层已映射为 GoalConditionedLowLevelPolicy")
 
-        logger.warning("⚠️ LowLevelPolicy使用旧接口，建议迁移到GoalConditionedLowLevelPolicy")
-
-        # 创建配置
         config = {
             'state_dim': input_dim,
-            'goal_dim': 64,  # 默认goal维度
+            'goal_dim': 64,
             'hidden_dim': hidden_dim,
             'environment': {
                 'nb_low_level_actions': action_dim
@@ -263,25 +184,19 @@ class LowLevelPolicy(nn.Module):
             'use_cuda': False,
             'dropout': 0.1
         }
-
-        # 使用新的GoalConditionedLowLevelPolicy
         self.policy = GoalConditionedLowLevelPolicy(config)
-
-        # 简单的Actor和Critic接口（向后兼容）
-        # 这些实际上会调用policy的对应部分
         self.actor = self.policy.actor
         self.critic = self.policy.critic
 
-    def forward(self, state_emb):
-        """
-        兼容旧接口（不使用goal）
+    def forward(self, state, action_mask=None):
+        # 兼容旧的前向传播 (没有传入 goal_emb 的情况)
+        if state.dim() == 2:
+            state = state.unsqueeze(1)
+        logits, value = self.policy(state, None, action_mask)
+        return logits, value, value
 
-        Args:
-            state_emb: 状态嵌入 [batch, input_dim]
-
-        Returns:
-            logits: 动作logits [batch, action_dim]
-            value: 状态价值 [batch, 1]
-        """
-        # 调用新接口，但不提供goal
-        return self.policy.forward(state_emb, goal_emb=None, action_mask=None)
+    def select_action(self, state, action_mask=None, epsilon=0.0, **kwargs):
+        # 向后兼容接口的推断，支持 epsilon 参数传入
+        if state.dim() == 2:
+            state = state.unsqueeze(1)
+        return self.policy.select_action(state, None, action_mask, epsilon=epsilon, **kwargs)
