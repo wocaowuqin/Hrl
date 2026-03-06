@@ -36,86 +36,90 @@ class HRLAgentBase:
         # ── 环境参数 ──────────────────────────────────────────────────────
         env_cfg = config.get('environment', config.get('env', {}))
         self.n_actions = kwargs.get('low_action_dim', env_cfg.get('nb_low_level_actions', 50))
-        self.n_goals   = kwargs.get('high_action_dim', env_cfg.get('nb_high_level_goals', 28))  # [SDG-HRL] goal=节点ID
+        self.n_goals = kwargs.get('high_action_dim', env_cfg.get('nb_high_level_goals', 28))  # [SDG-HRL] goal=节点ID
 
         # ── HRL参数 ───────────────────────────────────────────────────────
         hrl_cfg = config.get('hrl', {})
-        self.state_dim  = hrl_cfg.get('state_dim', 128)
-        self.goal_dim   = hrl_cfg.get('goal_dim', 64)
+        self.state_dim = hrl_cfg.get('state_dim', 128)
+        self.goal_dim = hrl_cfg.get('goal_dim', 64)
         self.hidden_dim = hrl_cfg.get('hidden_dim', 128)
 
-        self.subgoal_horizon        = hrl_cfg.get('subgoal_horizon', 40)  # [SDG-HRL]
+        self.subgoal_horizon = hrl_cfg.get('subgoal_horizon', 40)  # [SDG-HRL]
         self.intrinsic_reward_weight = hrl_cfg.get('intrinsic_reward_weight', 0.3)
-        self.adaptive_epsilon        = hrl_cfg.get('adaptive_epsilon', True)
-        self.min_epsilon_low         = 0.01
+        self.adaptive_epsilon = hrl_cfg.get('adaptive_epsilon', True)
+        self.min_epsilon_low = 0.01
 
-        # ── Encoder ───────────────────────────────────────────────────────
-        if encoder is not None:
-            self.encoder = encoder.to(self.device)
-            self.encoder.eval()
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            logger.info("✅ 使用预训练Encoder")
-        else:
-            self.encoder = None
-            logger.info("⚠️ 未提供Encoder")
+        # ── Encoder (重构为 TreeTransformerEncoder) ──────────────────────
+        from core.gnn.tree_transformer_encoder import TreeTransformerEncoder
+        self.encoder = TreeTransformerEncoder(
+            node_dim=21,
+            edge_dim=5,
+            hidden_dim=self.hidden_dim
+        ).to(self.device)
+
+        for param in self.encoder.parameters():
+            param.requires_grad = True
+        logger.info("✅ 已挂载 Tree-Aware Dual GNN Encoder")
 
         # ── High-Level Policy ─────────────────────────────────────────────
         from core.hrl.high_policy import HighLevelPolicy
         high_config = {
-            'use_cuda':       config.get('use_cuda', False),
-            'hidden_dim':     self.hidden_dim,
-            'goal_dim':       self.goal_dim,
+            'use_cuda': config.get('use_cuda', False),
+            'hidden_dim': self.hidden_dim,
+            'goal_dim': self.goal_dim,
             'gnn_output_dim': self.state_dim,
-            'environment':    {'nb_high_level_goals': self.n_goals},
-            'dropout':        config.get('dropout', 0.1),
+            'environment': {'nb_high_level_goals': self.n_goals},
+            'dropout': config.get('dropout', 0.1),
         }
-        self.high_policy        = HighLevelPolicy(high_config).to(self.device)
+        self.high_policy = HighLevelPolicy(high_config).to(self.device)
         self.target_high_policy = HighLevelPolicy(high_config).to(self.device)
         self.target_high_policy.load_state_dict(self.high_policy.state_dict())
 
         # ── Low-Level Policy ──────────────────────────────────────────────
         from core.hrl.low_policy import GoalConditionedLowLevelPolicy
         low_config = {
-            'use_cuda':   config.get('use_cuda', False),
-            'state_dim':  self.state_dim,
-            'goal_dim':   self.goal_dim,
+            'use_cuda': config.get('use_cuda', False),
+            'state_dim': self.state_dim,
+            'goal_dim': self.goal_dim,
             'hidden_dim': self.hidden_dim,
             'environment': {'nb_low_level_actions': self.n_actions},
-            'dropout':    config.get('dropout', 0.1),
+            'dropout': config.get('dropout', 0.1),
         }
-        self.low_policy        = GoalConditionedLowLevelPolicy(low_config).to(self.device)
+        self.low_policy = GoalConditionedLowLevelPolicy(low_config).to(self.device)
         self.target_low_policy = GoalConditionedLowLevelPolicy(low_config).to(self.device)
         self.target_low_policy.load_state_dict(self.low_policy.state_dict())
 
         # ── Optimizers ────────────────────────────────────────────────────
         training_cfg = config.get('training', {})
         lr_high = training_cfg.get('lr_high', training_cfg.get('learning_rate', 1e-4))
-        lr_low  = training_cfg.get('lr_low',  training_cfg.get('learning_rate', 1e-4))
+        lr_low = training_cfg.get('lr_low', training_cfg.get('learning_rate', 1e-4))
+
         self.optimizer_high = optim.Adam(self.high_policy.parameters(), lr=lr_high)
-        self.optimizer_low  = optim.Adam(self.low_policy.parameters(),  lr=lr_low)
+        # 直接将 Encoder 的参数与 Low-Level Policy 绑定联合优化
+        self.optimizer_low = optim.Adam(
+            list(self.low_policy.parameters()) + list(self.encoder.parameters()),
+            lr=lr_low
+        )
 
         # ── 训练超参 ──────────────────────────────────────────────────────
-        self.batch_size        = int(training_cfg.get('batch_size', 32))
-        self.gamma             = float(training_cfg.get('gamma', 0.99))
+        self.batch_size = int(training_cfg.get('batch_size', 32))
+        self.gamma = float(training_cfg.get('gamma', 0.99))
         self.target_update_freq = int(training_cfg.get('target_update_freq', 1000))
-        self.clip_grad_norm    = training_cfg.get('clip_grad_norm', 1.0)
-        self.tau               = training_cfg.get('tau', 0.005)
-        self.huber_delta       = training_cfg.get('huber_delta', 1.0)
+        self.clip_grad_norm = training_cfg.get('clip_grad_norm', 1.0)
+        self.tau = training_cfg.get('tau', 0.005)
+        self.huber_delta = training_cfg.get('huber_delta', 1.0)
 
         # ── Epsilon ───────────────────────────────────────────────────────
         epsilon_cfg = training_cfg.get('epsilon', {})
         self.epsilon_high_start = float(epsilon_cfg.get('initial_high', epsilon_cfg.get('initial', 0.3)))
-        self.epsilon_high_end   = float(epsilon_cfg.get('final_high',   epsilon_cfg.get('final',   0.10)))
-        self.epsilon_high       = self.epsilon_high_start
-        self.epsilon_low_start  = float(epsilon_cfg.get('initial_low',  epsilon_cfg.get('initial', 0.3)))
-        self.epsilon_low_end    = float(epsilon_cfg.get('final_low',    epsilon_cfg.get('final',   0.10)))
-        self.epsilon_low        = self.epsilon_low_start
-        self.epsilon_decay      = float(epsilon_cfg.get('decay_steps', 50000))  # 保留兼容
-        # [Fix] episode-based衰减：在N个episode内从initial线性衰减到final
-        # 默认200ep，与path_guide窗口（ep<200）对齐，确保探索覆盖学习期
-        self.epsilon_decay_episodes = int(epsilon_cfg.get('decay_episodes', 200))
-        self.total_episodes     = 0
+        self.epsilon_high_end = float(epsilon_cfg.get('final_high', epsilon_cfg.get('final', 0.05)))
+        self.epsilon_high = self.epsilon_high_start
+        self.epsilon_low_start = float(epsilon_cfg.get('initial_low', epsilon_cfg.get('initial', 0.3)))
+        self.epsilon_low_end = float(epsilon_cfg.get('final_low', epsilon_cfg.get('final', 0.05)))
+        self.epsilon_low = self.epsilon_low_start
+        self.epsilon_decay = float(epsilon_cfg.get('decay_steps', 50000))
+        self.epsilon_decay_episodes = int(epsilon_cfg.get('decay_episodes', 300))
+        self.total_episodes = 0
 
         # ── Replay Buffer ─────────────────────────────────────────────────
         buffer_size = int(training_cfg.get('buffer_size', 50000))
@@ -124,33 +128,33 @@ class HRLAgentBase:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             from prioritized_buffer import PrioritizedReplayBuffer
             from elite_buffer import EliteBuffer
-            self.high_memory    = PrioritizedReplayBuffer(buffer_size // 2)
-            self.low_memory     = PrioritizedReplayBuffer(buffer_size)
-            self.elite_buffer   = EliteBuffer(capacity=5000)
-            self._use_per       = True
-            self._best_reward   = -1e9
+            self.high_memory = PrioritizedReplayBuffer(buffer_size // 2)
+            self.low_memory = PrioritizedReplayBuffer(buffer_size)
+            self.elite_buffer = EliteBuffer(capacity=5000)
+            self._use_per = True
+            self._best_reward = -1e9
             self._ep_transitions = []
             logger.info("✅ [SDG-HRL] PER + EliteBuffer 已启用")
         except ImportError as _e:
             logger.warning(f"⚠️ PER未找到，回退到deque: {_e}")
-            self.high_memory    = deque(maxlen=buffer_size // 2)
-            self.low_memory     = deque(maxlen=buffer_size)
-            self.elite_buffer   = None
-            self._use_per       = False
-            self._best_reward   = -1e9
+            self.high_memory = deque(maxlen=buffer_size // 2)
+            self.low_memory = deque(maxlen=buffer_size)
+            self.elite_buffer = None
+            self._use_per = False
+            self._best_reward = -1e9
             self._ep_transitions = []
         self.success_memory = deque(maxlen=20000)  # [SDG-HRL] 成功经验池
 
         # ── 状态变量 ──────────────────────────────────────────────────────
-        self.current_subgoal     = None
+        self.current_subgoal = None
         self.current_subgoal_emb = None
-        self.current_goal_emb    = None
-        self.subgoal_steps       = 0
-        self.subgoal_step_count  = 0   # 向后兼容
-        self.current_start_node  = None
-        self.steps_done          = 0
-        self.update_count        = 0
-        self._training           = True
+        self.current_goal_emb = None
+        self.subgoal_steps = 0
+        self.subgoal_step_count = 0
+        self.current_start_node = None
+        self.steps_done = 0
+        self.update_count = 0
+        self._training = True
 
         # ── Goal Embedding 模块 ───────────────────────────────────────────
         from core.hrl.goal_embedding import (
@@ -170,8 +174,8 @@ class HRLAgentBase:
 
         # ── 统计 ──────────────────────────────────────────────────────────
         self.high_loss_history = deque(maxlen=100)
-        self.low_loss_history  = deque(maxlen=100)
-        self.gradient_norms    = deque(maxlen=100)
+        self.low_loss_history = deque(maxlen=100)
+        self.gradient_norms = deque(maxlen=100)
 
     # ── 训练/评估模式 ──────────────────────────────────────────────────────
 
@@ -189,14 +193,15 @@ class HRLAgentBase:
 
     def save(self, path: str):
         torch.save({
-            'high_policy':    self.high_policy.state_dict(),
-            'low_policy':     self.low_policy.state_dict(),
+            'high_policy': self.high_policy.state_dict(),
+            'low_policy': self.low_policy.state_dict(),
+            'encoder': self.encoder.state_dict(),
             'optimizer_high': self.optimizer_high.state_dict(),
-            'optimizer_low':  self.optimizer_low.state_dict(),
-            'epsilon_high':   self.epsilon_high,
-            'epsilon_low':    self.epsilon_low,
-            'steps_done':     self.steps_done,
-            'config':         self.config,
+            'optimizer_low': self.optimizer_low.state_dict(),
+            'epsilon_high': self.epsilon_high,
+            'epsilon_low': self.epsilon_low,
+            'steps_done': self.steps_done,
+            'config': self.config,
         }, path)
         logger.info(f"✅ 模型已保存: {path}")
 
@@ -212,21 +217,22 @@ class HRLAgentBase:
         if 'low_policy' in ckpt:
             self.low_policy.load_state_dict(ckpt['low_policy'])
             self.target_low_policy.load_state_dict(ckpt['low_policy'])
+        if 'encoder' in ckpt:
+            self.encoder.load_state_dict(ckpt['encoder'])
         if 'optimizer_high' in ckpt:
             self.optimizer_high.load_state_dict(ckpt['optimizer_high'])
         if 'optimizer_low' in ckpt:
             self.optimizer_low.load_state_dict(ckpt['optimizer_low'])
         self.epsilon_high = ckpt.get('epsilon_high', self.epsilon_high)
-        self.epsilon_low  = ckpt.get('epsilon_low',  self.epsilon_low)
-        self.steps_done   = ckpt.get('steps_done',   self.steps_done)
+        self.epsilon_low = ckpt.get('epsilon_low', self.epsilon_low)
+        self.steps_done = ckpt.get('steps_done', self.steps_done)
         logger.info(f"✅ 模型已加载: {path}")
 
     # ── 工具 ──────────────────────────────────────────────────────────────
 
     def register_encoder_to_optimizer(self, lr=None):
-        """将encoder参数加入optimizer_low，使tree_bias可训练"""
+        """兼容保留，已在 __init__ 中直接联合绑定"""
         if self.encoder is None:
-            logger.warning("[SDG-HRL] encoder=None，无法注册到optimizer")
             return False
         for param in self.encoder.parameters():
             param.requires_grad = True
@@ -250,9 +256,14 @@ class HRLAgentBase:
         if hasattr(self.low_policy, 'reset_parameters'):
             self.low_policy.reset_parameters()
         self.target_low_policy.load_state_dict(self.low_policy.state_dict())
+
         training_cfg = self.config.get('training', {})
-        self.optimizer_high = optim.Adam(self.high_policy.parameters(),
-                                         lr=training_cfg.get('lr_high', 1e-4))
-        self.optimizer_low  = optim.Adam(self.low_policy.parameters(),
-                                         lr=training_cfg.get('lr_low',  1e-4))
+        self.optimizer_high = optim.Adam(
+            self.high_policy.parameters(),
+            lr=training_cfg.get('lr_high', 1e-4)
+        )
+        self.optimizer_low = optim.Adam(
+            list(self.low_policy.parameters()) + list(self.encoder.parameters()),
+            lr=training_cfg.get('lr_low', 1e-4)
+        )
         logger.info("✅ 网络参数重置完成")
