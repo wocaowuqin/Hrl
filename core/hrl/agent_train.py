@@ -35,29 +35,42 @@ class HRLAgentTrain:
         losses = {}
         self.update_count += 1
 
-        if len(self.high_memory) >= self.batch_size // 4:
-            hl = self._update_high_level()
-            losses['high_loss'] = hl
-            if hl > 0:
-                self.high_loss_history.append(hl)
-
+        # 1. 优先训练底层路由，只要经验够了每步都更新
+        ll_updated = False
         if len(self.low_memory) >= self.batch_size // 2:
             ll = self._update_low_level()
             losses['low_loss'] = ll
             if ll > 0:
                 self.low_loss_history.append(ll)
+                ll_updated = True
+
+        # 2. 延迟训练高层策略（减缓非平稳性灾难）
+        # 设定：只在 update_count 是 3 的倍数时，才更新一次高层
+        hl_updated = False
+        if self.update_count % 3 == 0 and len(self.high_memory) >= self.batch_size // 4:
+            hl = self._update_high_level()
+            losses['high_loss'] = hl
+            if hl > 0:
+                self.high_loss_history.append(hl)
+                hl_updated = True
 
         losses['total_loss'] = losses.get('high_loss', 0) + losses.get('low_loss', 0)
 
-        # [SDG-HRL] 只用soft update，删除hard update防止Q值震荡
-        self._soft_update_target_networks()
+        # 3. 分离 Target 网络的 Soft Update
+        # 只有在各自的网络发生了有效更新后，才同步给对应的 Target
+        if hl_updated:
+            for tp, p in zip(self.target_high_policy.parameters(), self.high_policy.parameters()):
+                tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+        if ll_updated:
+            for tp, p in zip(self.target_low_policy.parameters(), self.low_policy.parameters()):
+                tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+
         self._update_epsilon()
 
         if self.update_count % 100 == 0:
             self._log_training_stats()
 
         return losses
-
     # ── High-Level ────────────────────────────────────────────────────────
 
     def _update_high_level(self) -> float:
@@ -86,7 +99,8 @@ class HRLAgentTrain:
                 next_q_target, _, _ = self.target_high_policy(next_state_tensor, return_subgoal=False)
                 next_q   = next_q_target.gather(1, next_actions)
                 target_q = rewards + (1 - dones) * self.gamma * next_q
-                target_q = torch.clamp(target_q, -30.0, 150.0)  # [SDG-HRL]
+                # 取消 clamp，让期望奖励自然发散
+                # target_q = torch.clamp(target_q, -30.0, 150.0)
 
             # [Loss Fix] reward归一化后loss应在0~3，scale=30让reward范围≈[-1,5]
             _reward_scale = 30.0
@@ -248,9 +262,10 @@ class HRLAgentTrain:
 
                 next_out_tg = self.target_low_policy(next_state_tensor, goal_tensor)
                 next_q_tg   = next_out_tg[0] if isinstance(next_out_tg, tuple) else next_out_tg
-                next_q      = torch.clamp(next_q_tg.gather(1, next_acts), -20.0, 100.0)
 
-                target_q = torch.clamp(rewards + (1 - dones) * self.gamma * next_q, -30.0, 150.0)
+                # 去除强制 clamp 限制，让 DQN 自行拟合上限
+                next_q      = next_q_tg.gather(1, next_acts)
+                target_q    = rewards + (1 - dones) * self.gamma * next_q
 
             # [Loss Fix] reward归一化 + PER importance sampling weights
             _reward_scale = 30.0
@@ -311,16 +326,7 @@ class HRLAgentTrain:
                         f"AllQ_max={curr_q_values.max():.2f} | Loss={loss.item():.4f}"
                     )
 
-            # 自适应学习率
-            lv = loss.item()
-            # [Loss Fix] 阈值与归一化后的loss量级对齐（期望0.1~2.0）
-            for pg in self.optimizer_low.param_groups:
-                if lv < 0.01:
-                    pg['lr'] = min(pg['lr'] * 1.02, 1e-3)
-                elif lv > 0.5:
-                    pg['lr'] = max(pg['lr'] * 0.98, 1e-5)
-            return lv
-
+            return loss.item()
         except Exception as e:
             logger.error(f"[Update Low Level] Error: {e}")
             import traceback; traceback.print_exc()

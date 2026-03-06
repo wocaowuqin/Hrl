@@ -114,7 +114,7 @@ class HRLAgentBase:
         self.epsilon_decay      = float(epsilon_cfg.get('decay_steps', 50000))  # 保留兼容
         # [Fix] episode-based衰减：在N个episode内从initial线性衰减到final
         # 默认200ep，与path_guide窗口（ep<200）对齐，确保探索覆盖学习期
-        self.epsilon_decay_episodes = int(epsilon_cfg.get('decay_episodes', 200))
+        self.epsilon_decay_episodes = int(epsilon_cfg.get('decay_episodes', 300))
         self.total_episodes     = 0
 
         # ── Replay Buffer ─────────────────────────────────────────────────

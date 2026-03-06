@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import numpy as np
 import logging
 from typing import Dict
-
+import copy
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +39,7 @@ class HRLAgentMemory:
         else:
             self.high_memory.append(transition_high)
 
+
     def store_transition_low(
             self, state: Dict, action: int, reward: float, next_state: Dict, done: bool
     ):
@@ -50,33 +51,44 @@ class HRLAgentMemory:
         if self.config.get('hrl', {}).get('use_intrinsic_reward', False):
             try:
                 with torch.no_grad():
-                    se  = self._extract_state_embedding(state)
+                    se = self._extract_state_embedding(state)
                     nse = self._extract_state_embedding(next_state)
                     err = F.mse_loss(se, nse).item()
                     scaled_reward += min(0.3, err * 0.3)  # [SDG-HRL]
             except Exception:
                 pass
 
+        # 🔥 核心修复 1：深度拷贝状态，防止环境突变污染 Buffer
+        safe_state = copy.deepcopy(state)
+        safe_next_state = copy.deepcopy(next_state)
+
         transition = {
-            'state':      state,
-            'action':     action,
-            'reward':     scaled_reward,
-            'next_state': next_state,
-            'done':       done,
-            'goal_emb':   self.current_goal_emb,
+            'state': safe_state,
+            'action': action,
+            'reward': scaled_reward,
+            'next_state': safe_next_state,
+            'done': done,
+            'goal_emb': self.current_goal_emb,
         }
+
         # [SDG-HRL] PER: 新transition用最高优先级入队
         if getattr(self, '_use_per', False):
             self.low_memory.add(transition)
         else:
             self.low_memory.append(transition)
 
-        # 成功经验保留池
-        if done and scaled_reward > 50.0:
+        # 必须先将 transition 放入 _ep_transitions 列表中，以准确计算当前 episode 的总步数
+        self._ep_transitions.append(transition)
+
+        # 🔥 核心修复 2：要求极高质量的成功（奖励 > 80 且 步数小于一定阈值）
+        # 提取当前 episode 走过的总步数
+        ep_steps = len(self._ep_transitions)
+
+        # 增加 ep_steps < 40 的条件（具体阈值可根据你的网络直径微调，通常20-40）
+        if done and scaled_reward > 80.0 and ep_steps < 40:
             self.success_memory.append(transition)
 
         # EliteBuffer: 记录episode transitions
-        self._ep_transitions.append(transition)
         if done and getattr(self, 'elite_buffer', None) is not None:
             ep_reward = sum(t['reward'] for t in self._ep_transitions)
             self._best_reward = max(self._best_reward, ep_reward)
