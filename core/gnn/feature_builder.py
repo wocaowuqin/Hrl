@@ -17,7 +17,11 @@ class GNNFeatureBuilder:
         return 32
 
     def _try_assemble_tuple(self, obj):
-        """处理 (x, edge_index, edge_attr, req_vec) 元组"""
+        """处理 (x, edge_index, edge_attr, req_vec) 元组。
+        注意：此路径产生的 Data 对象无法携带 tree_edge_index/dest_mask（
+        元组格式不含这些字段）。调用方应优先存储完整 Data 对象到 buffer，
+        而非裸元组，以保证树流正常工作。
+        """
         if isinstance(obj, (tuple, list)) and len(obj) == 4:
             t0, t1, t2, t3 = obj[0], obj[1], obj[2], obj[3]
             if (torch.is_tensor(t0) and torch.is_tensor(t1) and
@@ -28,11 +32,21 @@ class GNNFeatureBuilder:
                     if req_v.dim() == 1:
                         req_v = req_v.unsqueeze(0)
 
+                    # tree_edge_index 缺失 → 下游 encoder 会退化到 self-loop
+                    # 此处记录警告，方便排查（生产环境中 buffer 里不应存裸元组）
+                    logger.warning(
+                        "[_try_assemble_tuple] 从4元组组装Data，"
+                        "tree_edge_index/dest_mask 将缺失，树流退化为self-loop。"
+                        "请确保 buffer 存储完整 PyG Data 对象。"
+                    )
                     return Data(
                         x=t0.cpu(),
                         edge_index=t1.cpu().long(),
                         edge_attr=t2.cpu(),
-                        req_vec=req_v
+                        req_vec=req_v,
+                        # 占位 None：下游 getattr(s, 'tree_edge_index', None) 返回 None
+                        tree_edge_index=None,
+                        dest_mask=None,
                     )
         return None
 
@@ -81,7 +95,8 @@ class GNNFeatureBuilder:
     def collate_fn(self, transitions):
         batch = {
             'state': [], 'next_state': [], 'action': [],
-            'reward': [], 'done': [], 'goal_emb': []
+            'reward': [], 'done': [], 'goal_emb': [],
+            'req': [],   # ← 补充：req 字段供 agent_train._encode 重建 req_vec
         }
 
         for i, t in enumerate(transitions):
@@ -98,6 +113,9 @@ class GNNFeatureBuilder:
             batch['reward'].append(t['reward'])
             batch['done'].append(t['done'])
 
+            # req 字段：直接透传原始 dict（None 也保留，下游 _build_req_vec_from_transition 会处理）
+            batch['req'].append(t.get('req', None))
+
             if 'goal_emb' in t:
                 g = t['goal_emb']
                 if isinstance(g, torch.Tensor) and g.dim() == 1:
@@ -112,6 +130,9 @@ class GNNFeatureBuilder:
             batch['action'] = torch.tensor(batch['action'], dtype=torch.long, device=self.device)
             batch['reward'] = torch.tensor(batch['reward'], dtype=torch.float32, device=self.device).unsqueeze(1)
             batch['done'] = torch.tensor(batch['done'], dtype=torch.float32, device=self.device).unsqueeze(1)
+
+            # req 保持为 list[dict|None]，agent_train 逐元素取用
+            # batch['req'] 已经是 list，不需要额外转换
 
             raw_goals = batch.get('goal_emb', [])
             valid_goals = [g for g in raw_goals if g is not None]

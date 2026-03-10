@@ -98,13 +98,13 @@ class HRLAgentTrain:
                 next_actions = next_q_online.argmax(dim=1, keepdim=True)
                 next_q_target, _, _ = self.target_high_policy(next_state_tensor, return_subgoal=False)
                 next_q   = next_q_target.gather(1, next_actions)
-                rewards_norm = rewards / 20.0  # 归一化到[-1,5]，消除尺度爆炸
-                target_q = rewards_norm + (1 - dones) * self.gamma * next_q
-                # target_q = torch.clamp(target_q, -30.0, 150.0)
+                # [Fix] 只做一次归一化：用 reward_scale 统一 Q 值量纲
+                # 去掉原来的 rewards/20.0，避免 curr_q/30 vs target_q/600 的双重缩放
+                target_q = rewards + (1 - dones) * self.gamma * next_q * 30.0
+                # curr_q 和 target_q 都除以 30，Bellman 两端量纲一致
 
-            # [Loss Fix] reward归一化后loss应在0~3，scale=30让reward范围≈[-1,5]
             _reward_scale = 30.0
-            curr_q_scaled  = curr_q  / _reward_scale
+            curr_q_scaled   = curr_q   / _reward_scale
             target_q_scaled = target_q / _reward_scale
             loss = F.smooth_l1_loss(curr_q_scaled, target_q_scaled)
             if torch.isnan(loss) or torch.isinf(loss):
@@ -310,10 +310,10 @@ class HRLAgentTrain:
                 next_out_tg = self.target_low_policy(next_state_tensor, goal_tensor)
                 next_q_tg   = next_out_tg[0] if isinstance(next_out_tg, tuple) else next_out_tg
 
-                # 去除强制 clamp 限制，让 DQN 自行拟合上限
                 next_q      = next_q_tg.gather(1, next_acts)
-                rewards_norm = rewards / 20.0  # 归一化到[-1, 5]范围
-                target_q    = rewards_norm + (1 - dones) * self.gamma * next_q
+                # [Fix] 只做一次归一化：与 High-Level 保持一致的 scale 统一方式
+                # 去掉原来的 rewards/20.0，避免 curr_q/30 vs target_q/600 的双重缩放
+                target_q    = rewards + (1 - dones) * self.gamma * next_q * 30.0
 
             # [Loss Fix] reward归一化 + PER importance sampling weights
             _reward_scale = 30.0

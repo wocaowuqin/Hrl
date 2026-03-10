@@ -112,11 +112,40 @@ class TreeTransformerEncoder(nn.Module):
             )
 
         if dest_mask is not None and dest_mask.any():
-            dest_pool = node_emb[dest_mask].mean(dim=0, keepdim=True).unsqueeze(0)
-            query = node_emb.unsqueeze(0)
-
-            attn_out, _ = self.dest_cross_attn(query=query, key=dest_pool, value=dest_pool)
-            node_emb = node_emb + attn_out.squeeze(0)
+            # ── Batch安全的dest_cross_attn ────────────────────────────────
+            # 训练时 B>1：Batch.from_data_list 把所有图节点拼成大图，
+            # dest_mask 是 [N_total] 的全局 bool。
+            # 若直接 node_emb[dest_mask].mean() 会把所有图的dest节点混在一起，
+            # 导致图i的query被图j的dest污染。
+            # 修复：按 batch 向量分图分别计算 dest_pool，再广播回各图节点。
+            if batch is not None and batch.max().item() > 0:
+                # 多图batch：逐图计算 dest_pool，拼接后做 cross-attn
+                num_graphs = batch.max().item() + 1
+                attn_deltas = []
+                for g_id in range(num_graphs):
+                    g_mask = (batch == g_id)                     # [N_total] 本图节点mask
+                    g_dest = g_mask & dest_mask                  # 本图内的dest节点
+                    g_node_emb = node_emb[g_mask]                # [N_g, H]
+                    if g_dest.any():
+                        dest_pool_g = node_emb[g_dest].mean(dim=0, keepdim=True).unsqueeze(0)  # [1,1,H]
+                        query_g = g_node_emb.unsqueeze(0)                                       # [1,N_g,H]
+                        attn_out_g, _ = self.dest_cross_attn(
+                            query=query_g, key=dest_pool_g, value=dest_pool_g)
+                        attn_deltas.append(attn_out_g.squeeze(0))   # [N_g, H]
+                    else:
+                        attn_deltas.append(torch.zeros_like(g_node_emb))
+                # 将各图的 delta 按原始节点顺序写回
+                delta_full = torch.zeros_like(node_emb)
+                for g_id in range(num_graphs):
+                    g_mask = (batch == g_id)
+                    delta_full[g_mask] = attn_deltas[g_id]
+                node_emb = node_emb + delta_full
+            else:
+                # 单图（推断）：原始逻辑，无跨图污染风险
+                dest_pool = node_emb[dest_mask].mean(dim=0, keepdim=True).unsqueeze(0)  # [1,1,H]
+                query = node_emb.unsqueeze(0)                                            # [1,N,H]
+                attn_out, _ = self.dest_cross_attn(query=query, key=dest_pool, value=dest_pool)
+                node_emb = node_emb + attn_out.squeeze(0)
 
         return node_emb
 

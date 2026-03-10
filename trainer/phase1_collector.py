@@ -238,7 +238,8 @@ class Phase1ExpertCollector:
 
     def _build_graph_state(self, request, nodes_on_tree, current_tree, served_dest_count):
         """
-        复用 env.get_state() 获取状态，保证与 Phase3 特征完全一致（21维节点特征）
+        复用 env.get_state() 获取状态，保证与 Phase3 特征完全一致（21维节点特征）。
+        同时携带 tree_edge_index 和 dest_mask，确保 IL 预训练时树流和目标感知正常工作。
         """
         # ← 就加在这里，第一行
         self.env.current_node_location = request.get('source', 0)
@@ -256,13 +257,43 @@ class Phase1ExpertCollector:
 
         state_data = self.env.get_state()
 
-        x = state_data.x
+        x          = state_data.x
         edge_index = state_data.edge_index
-        edge_attr = state_data.edge_attr
+        edge_attr  = state_data.edge_attr
 
-        req_vec = torch.zeros(24, dtype=torch.float)
+        # ── tree_edge_index ──────────────────────────────────────────────
+        # get_state() 已经构建好，直接取出；若为 None（空树）则保持 None，
+        # 下游 encoder 会退化为 self-loop（与 Phase3 推断时的行为一致）
+        tree_edge_index = getattr(state_data, 'tree_edge_index', None)
 
-        return x, edge_index, edge_attr, req_vec
+        # ── dest_mask ────────────────────────────────────────────────────
+        # 从 request.dest 中取剩余未连接的目的地，构建 bool 掩码 [N]
+        dest_mask = getattr(state_data, 'dest_mask', None)
+        if dest_mask is None:
+            # 兜底：手动构建（get_state 返回的 Data 结构不含 dest_mask 字段时）
+            n = x.size(0)
+            all_dests  = set(int(d) for d in request.get('dest', []))
+            conn_dests = self.env.current_tree.get('connected_dests', set())
+            remaining  = all_dests - conn_dests
+            dest_mask  = torch.zeros(n, dtype=torch.bool)
+            for d in remaining:
+                if 0 <= d < n:
+                    dest_mask[d] = True
+
+        # ── req_vec ──────────────────────────────────────────────────────
+        # 与 agent_action._build_req_vec 保持一致：[bw, avg_cpu, avg_mem]（3维）
+        # 原来是 torch.zeros(24) 硬编码，Phase2 和 Phase3 语义完全不同，现已修正
+        try:
+            bw      = float(request.get('bw_origin', request.get('bandwidth', 0.0)))
+            cpu_lst = request.get('cpu_origin', request.get('cpu', []))
+            mem_lst = request.get('memory_origin', request.get('memory', []))
+            avg_cpu = float(np.mean(cpu_lst)) if len(cpu_lst) > 0 else 0.0
+            avg_mem = float(np.mean(mem_lst)) if len(mem_lst) > 0 else 0.0
+            req_vec = torch.tensor([[bw, avg_cpu, avg_mem]], dtype=torch.float32)
+        except Exception:
+            req_vec = torch.zeros(1, 3, dtype=torch.float32)
+
+        return x, edge_index, edge_attr, req_vec, tree_edge_index, dest_mask
 
 
     def _process_single_request(self, raw_req, pbar):
@@ -448,16 +479,22 @@ class Phase1ExpertCollector:
 
                     for path_idx, (path_0, high_label, subgoal_node) in enumerate(traj_paths):
                         try:
-                            x, edge_index, edge_attr, req_vec = self._build_graph_state(
-                                request=req,
-                                nodes_on_tree=nodes_on_tree_so_far,
-                                current_tree=current_tree_for_state,
-                                served_dest_count=served_dest_count
-                            )
+                            x, edge_index, edge_attr, req_vec, tree_edge_index, dest_mask = \
+                                self._build_graph_state(
+                                    request=req,
+                                    nodes_on_tree=nodes_on_tree_so_far,
+                                    current_tree=current_tree_for_state,
+                                    served_dest_count=served_dest_count
+                                )
                             print(f"[DEBUG] path {path_idx}: _build_graph_state 成功")
+                            # 携带 tree_edge_index 和 dest_mask，Phase2 训练时树流和目标感知正常工作
                             state_to_save = Data(
-                                x=x.cpu(), edge_index=edge_index.cpu(),
-                                edge_attr=edge_attr.cpu(), req_vec=req_vec.cpu()
+                                x=x.cpu(),
+                                edge_index=edge_index.cpu(),
+                                edge_attr=edge_attr.cpu(),
+                                req_vec=req_vec.cpu(),
+                                tree_edge_index=tree_edge_index.cpu() if tree_edge_index is not None else None,
+                                dest_mask=dest_mask.cpu() if dest_mask is not None else None,
                             )
                         except Exception as e:
                             print(f"[ERROR] path {path_idx}: 构建图状态失败: {e}")

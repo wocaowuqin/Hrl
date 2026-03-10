@@ -132,9 +132,6 @@ class ExpertDataset(Dataset):
         sample = self.samples[index]
         state = sample['state']
 
-        if not hasattr(state, 'action_mask'):
-            state.action_mask = torch.ones((1, 28), dtype=torch.float32)
-
         return {
             'state': state,
             'high_label': torch.tensor(sample['high_label'], dtype=torch.long),
@@ -311,6 +308,20 @@ class Phase2ILTrainer:
 
         if not states: return None
 
+        # ── tree_edge_index / dest_mask 无条件补齐 ────────────────────────
+        # 当 batch 内所有样本的同一字段都是 None 时，PyG 的 Batch.from_data_list
+        # 不会合并成 Tensor，而是留成 list[None]。encoder 收到 list[None] 后
+        # 执行 tree_edge_index.size(1) 会抛 AttributeError。
+        # 修复：无条件补齐，彻底消除 list[None] 的可能。
+        #   - tree_edge_index 缺失 → self-loop（与 encoder 空树退化行为一致）
+        #   - dest_mask 缺失 → 全 False（无目标感知，退化为普通节点特征）
+        for s in states:
+            if getattr(s, 'tree_edge_index', None) is None:
+                nodes = torch.arange(s.x.size(0))
+                s.tree_edge_index = torch.stack([nodes, nodes], dim=0)
+            if getattr(s, 'dest_mask', None) is None:
+                s.dest_mask = torch.zeros(s.x.size(0), dtype=torch.bool)
+
         graph_batch = Batch.from_data_list(states)
         high_labels = torch.tensor(high_labels, dtype=torch.long)
         low_labels  = torch.tensor(low_labels,  dtype=torch.long)
@@ -403,24 +414,44 @@ class Phase2ILTrainer:
             graph_emb, node_emb_3d = self._phase2_graph_embedding(states, req_vec=req_vec)
 
             high_logits, subgoal_emb, _ = self.model_high(graph_emb, return_subgoal=True)
-            low_logits, _ = self.model_low(node_emb_3d, subgoal_emb)
 
+            # ── action_mask：从 Batch 里取出，对齐到 low_logits 维度 ─────
+            # action_mask 在 Batch 后形状 [B, 28]（各图 [1,28] cat 而成）
+            # low_logits 维度 [B, action_dim]（action_dim 可能≠28）
+            # 若维度不匹配：截断/右侧补0对齐，保证传入 model_low 的 mask 有效
             if hasattr(states, 'action_mask'):
-                action_masks = states.action_mask.float()
+                action_masks = states.action_mask.float().to(self.device)   # [B, 28]
+                B_cur = node_emb_3d.size(0)
+                action_dim = self.model_low.action_dim
+                if action_masks.size(0) != B_cur:
+                    action_masks = torch.ones(B_cur, action_dim, device=self.device)
+                elif action_masks.size(1) != action_dim:
+                    if action_masks.size(1) > action_dim:
+                        action_masks = action_masks[:, :action_dim]
+                    else:
+                        pad = torch.zeros(B_cur, action_dim - action_masks.size(1), device=self.device)
+                        action_masks = torch.cat([action_masks, pad], dim=1)
             else:
-                action_masks = torch.ones((states.num_graphs, low_logits.size(-1)), device=self.device)
+                action_masks = torch.ones(node_emb_3d.size(0), self.model_low.action_dim, device=self.device)
+
+            # ── 传入 action_mask，非法节点被 -inf mask 后再算 loss ────────
+            low_logits, _ = self.model_low(node_emb_3d, subgoal_emb, action_mask=action_masks)
 
             loss_high = self.criterion(high_logits, high_labels)
             loss_low_bc = self.criterion_low(low_logits, low_labels)
 
-            low_probs = torch.softmax(low_logits, dim=-1)
-            illegal_penalty = (low_probs * (1.0 - action_masks)).sum(dim=-1).mean()
-
-            loss = loss_high * 0.5 + loss_low_bc + 15.0 * illegal_penalty
+            # illegal_penalty 依赖运行时 action_mask，Phase2专家数据里
+            # action_mask 全为1（静态离线数据无法知道哪些动作非法），
+            # 惩罚项永远为0，已移除。非法节点惩罚由 criterion_low 的频率加权和
+            # model_low.forward 里的 -inf masking 共同实现。
+            loss = loss_high * 0.5 + loss_low_bc
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model_high.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(self.model_low.parameters(), 1.0)
+            # encoder 梯度也需裁剪，防止 TransformerConv 注意力权重在早期爆炸
+            if hasattr(self.agent, 'encoder') and self.agent.encoder is not None:
+                torch.nn.utils.clip_grad_norm_(self.agent.encoder.parameters(), 1.0)
             self.optimizer_high.step()
             self.optimizer_low.step()
 
@@ -429,7 +460,7 @@ class Phase2ILTrainer:
             self._loss_count += 1
             total_loss += loss.item()
 
-            pbar.set_postfix({'L': f"{loss.item():.3f}", 'P': f"{illegal_penalty.item():.3f}"})
+            pbar.set_postfix({'L': f"{loss.item():.3f}", 'H': f"{loss_high.item():.3f}", 'Low': f"{loss_low_bc.item():.3f}"})
 
         return total_loss / max(1, len(self.train_loader))
 
@@ -440,6 +471,8 @@ class Phase2ILTrainer:
         if self.is_hrl:
             self.model_high.eval()
             self.model_low.eval()
+            if hasattr(self.agent, 'encoder') and self.agent.encoder is not None:
+                self.agent.encoder.eval()
 
         with torch.no_grad():
             for batch in self.val_loader:
@@ -454,7 +487,13 @@ class Phase2ILTrainer:
                     graph_emb, node_emb_3d = self._phase2_graph_embedding(states, req_vec=req_vec)
 
                     high_logits, subgoal_emb, _ = self.model_high(graph_emb, return_subgoal=True)
-                    low_logits, _ = self.model_low(node_emb_3d, subgoal_emb)
+
+                    if hasattr(states, 'action_mask'):
+                        val_action_masks = states.action_mask.float().to(self.device)
+                    else:
+                        val_action_masks = torch.ones(
+                            node_emb_3d.size(0), self.model_low.action_dim, device=self.device)
+                    low_logits, _ = self.model_low(node_emb_3d, subgoal_emb, action_mask=val_action_masks)
 
                     loss = self.criterion(high_logits, high_labels) * 0.5 + \
                            self.criterion_low(low_logits, low_labels)
@@ -467,6 +506,8 @@ class Phase2ILTrainer:
         if self.is_hrl:
             self.model_high.train()
             self.model_low.train()
+            if hasattr(self.agent, 'encoder') and self.agent.encoder is not None:
+                self.agent.encoder.train()
 
         return total_loss / max(1, count)
 

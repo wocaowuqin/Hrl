@@ -69,6 +69,16 @@ class Phase3RLTrainer:
         logger.info("✅ Trainer初始化完成 (TA-HRL v4 极简版)")
         self.analyzer = TrainingAnalyzer(output_dir=str(self.output_dir))
 
+        # ── 加载 Phase2 IL 预训练权重 ──────────────────────────────────────
+        # 只加载网络权重，不加载 optimizer state：
+        # Phase2 用 IL lr(3e-4)，Phase3 用 RL lr，optimizer state 不兼容。
+        il_ckpt_path = (
+            config.get('phase3', {}).get('il_checkpoint') or
+            config.get('il_checkpoint') or
+            str(Path(output_dir).parent / 'il_output' / 'il_model_best.pth')
+        )
+        self._load_il_checkpoint(il_ckpt_path)
+
     def run(self):
         """🚀 训练主循环"""
         # 诊断：检查encoder是否在optimizer_low里
@@ -317,6 +327,57 @@ class Phase3RLTrainer:
         print("=" * 40)
 
         self.analyzer.report()
+
+    def _load_il_checkpoint(self, ckpt_path: str):
+        """加载 Phase2 IL 预训练权重到 agent，跳过 optimizer state。
+        加载成功后立即同步 target 网络，避免 Q 值估计初期震荡。
+        """
+        if not ckpt_path or not Path(ckpt_path).exists():
+            logger.warning(
+                f"⚠️  Phase2 checkpoint 未找到: {ckpt_path}\n"
+                "   Phase3 将从随机初始化开始训练（模仿学习收益丢失）。\n"
+                "   请在 config['phase3']['il_checkpoint'] 或 "
+                "config['il_checkpoint'] 中指定正确路径。"
+            )
+            return
+
+        try:
+            ckpt = torch.load(ckpt_path, map_location=self.agent.device)
+            loaded = []
+
+            # high_policy
+            if 'high_policy' in ckpt and hasattr(self.agent, 'high_policy'):
+                missing, unexpected = self.agent.high_policy.load_state_dict(
+                    ckpt['high_policy'], strict=False)
+                loaded.append(f"high_policy(missing={len(missing)}, unexpected={len(unexpected)})")
+                # 同步 target
+                if hasattr(self.agent, 'target_high_policy'):
+                    self.agent.target_high_policy.load_state_dict(
+                        self.agent.high_policy.state_dict())
+                    loaded.append("target_high_policy←synced")
+
+            # low_policy
+            if 'low_policy' in ckpt and hasattr(self.agent, 'low_policy'):
+                missing, unexpected = self.agent.low_policy.load_state_dict(
+                    ckpt['low_policy'], strict=False)
+                loaded.append(f"low_policy(missing={len(missing)}, unexpected={len(unexpected)})")
+                # 同步 target
+                if hasattr(self.agent, 'target_low_policy'):
+                    self.agent.target_low_policy.load_state_dict(
+                        self.agent.low_policy.state_dict())
+                    loaded.append("target_low_policy←synced")
+
+            # encoder
+            if 'encoder' in ckpt and hasattr(self.agent, 'encoder') and self.agent.encoder is not None:
+                missing, unexpected = self.agent.encoder.load_state_dict(
+                    ckpt['encoder'], strict=False)
+                loaded.append(f"encoder(missing={len(missing)}, unexpected={len(unexpected)})")
+
+            logger.info(f"✅ Phase2 IL 权重加载成功: {ckpt_path}")
+            logger.info(f"   加载项: {', '.join(loaded)}")
+
+        except Exception as e:
+            logger.error(f"❌ Phase2 checkpoint 加载失败: {e}，Phase3 从随机初始化开始。")
 
     def _get_agent_state(self):
         """手动提取HRLAgent权重（HRLAgent不继承nn.Module，无state_dict()）"""
