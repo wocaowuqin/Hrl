@@ -24,7 +24,7 @@ class Phase1ExpertCollector:
     5. **构造准确的资源分配记录**：从 vnf_instances 中提取 CPU/MEM 用量，确保节点资源被正确释放
     """
 
-    def __init__(self, env, expert_solver, output_dir: str, max_episodes: int = 5000,
+    def __init__(self, env, expert_solver, output_dir: str, max_episodes: int = 15000,
                  save_every: int = 500, use_timeslot: bool = True):
         self.env = env
         self.expert = expert_solver
@@ -237,71 +237,33 @@ class Phase1ExpertCollector:
         return self.stats
 
     def _build_graph_state(self, request, nodes_on_tree, current_tree, served_dest_count):
-        rm = self.env.resource_mgr
-        n = rm.n
-        K = rm.K_vnf
-        node_feat_dim = getattr(rm, 'node_feat_dim', 17)
-        edge_feat_dim = getattr(rm, 'edge_feat_dim', 5)
-        request_dim = getattr(rm, 'request_dim', 24)
+        """
+        复用 env.get_state() 获取状态，保证与 Phase3 特征完全一致（21维节点特征）
+        """
+        # ← 就加在这里，第一行
+        self.env.current_node_location = request.get('source', 0)
 
-        # 节点特征
-        node_feats = []
-        for i in range(n):
-            cpu_avail = rm.pool.get_available_cpu(i) / max(rm.C_cap, 1.0)
-            mem_avail = rm.pool.get_available_memory(i) / max(rm.M_cap, 1.0)
-            on_tree = 1.0 if i in nodes_on_tree else 0.0
-            is_dest = 1.0 if i in request.get('dest', []) else 0.0
-            served = 1.0 if (i in request.get('dest', []) and i in nodes_on_tree) else 0.0
+        # 临时设置环境状态，让 low_level_controller.get_state() 能感知当前树和请求
+        self.env.current_request = request
+        self.env.current_tree = {
+            'tree': current_tree.get('tree', {}),
+            'hvt': current_tree.get('hvt', np.zeros((self.env.n, self.env.K_vnf))),
+            'connected_dests': set(
+                n for n in nodes_on_tree if n in request.get('dest', [])
+            ),
+            'nodes': nodes_on_tree.copy(),
+        }
 
-            hvt_row = rm.hvt_all[i].copy()
-            if hvt_row.max() > 0:
-                hvt_row = hvt_row / hvt_row.max()
-            hvt_list = hvt_row.tolist()
+        state_data = self.env.get_state()
 
-            degree = len(rm.get_neighbors(i)) / (n - 1) if n > 1 else 0.0
-            is_dc = 1.0 if i in rm.dc_nodes else 0.0
+        x = state_data.x
+        edge_index = state_data.edge_index
+        edge_attr = state_data.edge_attr
 
-            feat = [cpu_avail, mem_avail, on_tree, is_dest, served] + hvt_list + [degree, is_dc]
-            if len(feat) < node_feat_dim:
-                feat.extend([0.0] * (node_feat_dim - len(feat)))
-            else:
-                feat = feat[:node_feat_dim]
-            node_feats.append(feat)
-
-        x = torch.tensor(node_feats, dtype=torch.float)
-
-        # 边特征
-        edge_index = torch.tensor(rm.edge_index, dtype=torch.long)
-        edge_attr = []
-        for u, v in zip(rm.edge_index[0], rm.edge_index[1]):
-            bw_avail = rm.pool.get_available_bandwidth(u, v) / max(rm.B_cap, 1.0)
-            edge_attr.append([bw_avail, 0.0, 0.0, 0.0, 0.0])
-        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
-
-        # 请求特征
-        dest_list = request.get('dest', [])
-        vnf_list = request.get('vnf', [])
-        req_vec = [
-            request.get('source', 0) / n,
-            len(dest_list) / n,
-            len(vnf_list) / K,
-            served_dest_count / max(1, len(dest_list)),
-            request.get('bandwidth', 1.0) / rm.B_cap,
-        ]
-        vnf_hist = [0.0] * K
-        for v in vnf_list:
-            if 0 <= v < K:
-                vnf_hist[v] += 1.0
-        if vnf_list:
-            vnf_hist = [cnt / len(vnf_list) for cnt in vnf_hist]
-        req_vec.extend(vnf_hist)
-
-        while len(req_vec) < request_dim:
-            req_vec.append(0.0)
-        req_vec = req_vec[:request_dim]
-        req_vec = torch.tensor(req_vec, dtype=torch.float)
+        req_vec = torch.zeros(24, dtype=torch.float)
 
         return x, edge_index, edge_attr, req_vec
+
 
     def _process_single_request(self, raw_req, pbar):
         self.stats["requests"] += 1
@@ -321,16 +283,42 @@ class Phase1ExpertCollector:
             print(f"带宽: {req.get('bandwidth')}")
 
         # 时间槽驱动释放
+        current_slot = req.get('time_slot', 0)
         if self.use_timeslot:
-            current_slot = req.get('time_slot', 0)
             if current_slot != self.timeslot_stats['current_time_slot']:
                 self.timeslot_stats['current_time_slot'] = current_slot
                 self.timeslot_stats['total_time_slots'] += 1
                 try:
                     if hasattr(self.env.resource_mgr, 'request_manager'):
                         self.env.resource_mgr.request_manager.check_and_release_expired(current_slot)
+                        logger.debug(f"[Phase1] 时间槽切换到 {current_slot}，释放过期请求")
                 except Exception as e:
                     logger.debug(f"生命周期释放失败: {e}")
+
+        # 兜底释放：按 leave_time_slot 精确释放已到期的请求，避免资源耗尽
+        try:
+            if hasattr(self.env.resource_mgr, 'request_manager'):
+                rm = self.env.resource_mgr.request_manager
+                # 找出所有已到期的请求（leave_time_slot <= current_slot）
+                expired_ids = []
+                if hasattr(rm, 'active_requests'):
+                    for rid, rinfo in list(rm.active_requests.items()):
+                        leave_slot = rinfo.get('leave_time_slot',
+                                    rinfo.get('req', {}).get('leave_time_slot', None))
+                        if leave_slot is not None and leave_slot <= current_slot:
+                            expired_ids.append(rid)
+                for rid in expired_ids:
+                    self.env.resource_mgr.remove_request(rid)
+                    logger.debug(f"[Phase1] 精确释放过期请求 {rid}")
+
+                # 终极兜底：若活跃请求数超过20，强制释放最早的一半
+                if hasattr(rm, 'active_requests') and len(rm.active_requests) > 20:
+                    all_ids = list(rm.active_requests.keys())
+                    for rid in all_ids[:len(all_ids) // 2]:
+                        self.env.resource_mgr.remove_request(rid)
+                    logger.debug(f"[Phase1] 活跃请求过多，强制释放一半")
+        except Exception as e:
+            logger.debug(f"兜底精确释放失败: {e}")
 
         # 专家求解
         req_for_solver = req.copy()
@@ -437,24 +425,10 @@ class Phase1ExpertCollector:
                         if len(path_nodes) < 2:
                             continue
                         path_0based = [int(n - 1 if n > 0 else 0) for n in path_nodes]
-                        subgoal_0   = path_0based[-1]
+                        subgoal_0 = path_0based[-1]
 
-                        # paths_map 的 key 是 solver 内部 1-based 目的地节点ID，转为 0-based
-                        dest_node_0 = int(dest_key) - 1
-
-                        if dest_node_0 in dest_list:
-                            # 正常情况：该路径对应一个 dest，high_label = 其在链中的顺序
-                            hl = dest_list.index(dest_node_0)
-                        else:
-                            # dest_key 已经是 0-based（env 传进来的情况）
-                            if dest_node_0 + 1 in dest_list:
-                                hl = dest_list.index(dest_node_0 + 1)
-                            elif int(dest_key) in dest_list:
-                                hl = dest_list.index(int(dest_key))
-                            else:
-                                # 真正的非目的地路径（VNF 部署路径）
-                                # 用路径终点 subgoal 再查一次
-                                hl = dest_list.index(subgoal_0) if subgoal_0 in dest_list else 0
+                        # high_label = 路径终点节点ID（0~27），与 high_policy 输出维度28对齐
+                        hl = subgoal_0
 
                         traj_paths.append((path_0based, hl, subgoal_0))
 
@@ -464,12 +438,11 @@ class Phase1ExpertCollector:
                             path_1based = action_data.get('path', [])
                             if len(path_1based) >= 2:
                                 path_0based = [int(n - 1 if n > 0 else 0) for n in path_1based]
-                                subgoal_0   = path_0based[-1]
+                                subgoal_0 = path_0based[-1]
                                 if subgoal_0 not in existing_sg:
-                                    hl = dest_list.index(subgoal_0) if subgoal_0 in dest_list else 0
+                                    hl = subgoal_0  # high_label = 节点ID
                                     traj_paths.append((path_0based, hl, subgoal_0))
                                     existing_sg.add(subgoal_0)
-
                     print(f"[DEBUG] req {req.get('id')}: paths_map keys = {list(paths_map.keys())}")
                     print(f"[DEBUG] req {req.get('id')}: traj_paths 数量 = {len(traj_paths)}")
 

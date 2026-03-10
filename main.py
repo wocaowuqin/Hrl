@@ -488,7 +488,13 @@ def main():
         phase='phase3',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
         gpu=0,  # GPU ID, 设为 -1 则强制使用 CPU
         seed=100,  # 随机种子
-        goal_strategy='adaptive'  # Phase 3 的目标策略: 'relative', 'adaptive', 'hybrid'
+        goal_strategy='adaptive',  # Phase 3 的目标策略: 'relative', 'adaptive', 'hybrid'
+        # ── 消融实验开关 ──────────────────────────────────────────────────
+        # encoder_variant: 'full' / 'no_tree' / 'no_dest_mask' / 'single_stream'
+        ablation_variant='full',
+        # ablation_hop: True = 去掉 hop_to_tree 第20维特征
+        ablation_hop=False,
+        ablation_no_hrl=False,
     )
     # =========================================================================
 
@@ -636,7 +642,7 @@ def main():
             return
 
         output_dir = get_config_path(config, 'expert_data_dir')
-        max_episodes = config.get("phase1", {}).get("max_episodes", 5000)
+        max_episodes = config.get("phase1", {}).get("max_episodes", 15000)
         save_every = config.get("phase1", {}).get("save_every", 500)
 
         collector = Phase1ExpertCollector(
@@ -734,12 +740,22 @@ def main():
         try:
             logger.info("🔧 初始化 Goal-Conditioned Agent...")
 
+            # 注入 hop 消融标记到环境
+            env._ablation_hop = args.ablation_hop
+
             agent = create_goal_conditioned_agent(
                 config=config,
                 phase=3,
                 goal_strategy=args.goal_strategy,
-                env=env
+                env=env,
+                ablation_variant=args.ablation_variant,
             )
+
+            # ── 消融：w/o HRL 时冻结高层策略 ────────────────────────
+            if getattr(args, 'ablation_no_hrl', False):
+                for param in agent.high_policy.parameters():
+                    param.requires_grad = False
+                logger.info("🔬 [Ablation] 高层策略已冻结（w/o HRL 模式）")
 
             logger.info("✅ Agent 初始化成功")
 
@@ -753,56 +769,53 @@ def main():
             traceback.print_exc()
             return
 
-        # 2. 加载预训练模型 (智能适配版)
+        # 2. 加载预训练模型（Phase2 IL 热启动）
         ckpt_dir = get_config_path(config, 'ckpt_dir')
-        # 优先加载验证集最优模型（早停保存），回退到 final
         pretrained_path = os.path.join(ckpt_dir, "il_model_best.pth")
         if not os.path.exists(pretrained_path):
             pretrained_path = os.path.join(ckpt_dir, "il_model_final.pth")
 
         if os.path.exists(pretrained_path):
-            logger.info(f"📥 正在加载预训练模型: {pretrained_path}")
+            logger.info(f"📥 正在加载 Phase2 预训练权重: {pretrained_path}")
             try:
-                checkpoint = torch.load(pretrained_path, map_location=agent.device)
-                source_state = None
-                if isinstance(checkpoint, dict):
-                    if 'policy_net' in checkpoint:
-                        source_state = checkpoint['policy_net']
-                    elif 'model_state_dict' in checkpoint:
-                        source_state = checkpoint['model_state_dict']
-                    else:
-                        source_state = checkpoint
+                # 只加载网络权重，不加载optimizer状态（Phase2/3的optimizer结构可能不同）
+                ckpt = torch.load(pretrained_path, map_location=agent.device)
+                if 'high_policy' in ckpt:
+                    agent.high_policy.load_state_dict(ckpt['high_policy'])
+                    agent.target_high_policy.load_state_dict(ckpt['high_policy'])
+                if 'low_policy' in ckpt:
+                    agent.low_policy.load_state_dict(ckpt['low_policy'])
+                    agent.target_low_policy.load_state_dict(ckpt['low_policy'])
+                if 'encoder' in ckpt:
+                    encoder_ckpt = ckpt['encoder']
+                    current_shapes = {k: v.shape for k, v in agent.encoder.state_dict().items()}
+                    # 自动过滤shape不匹配的层（门控融合改动导致fusion层形状变化）
+                    filtered = {k: v for k, v in encoder_ckpt.items()
+                                if k in current_shapes and v.shape == current_shapes[k]}
+                    skipped = [k for k in encoder_ckpt if k not in filtered]
+                    missing, _ = agent.encoder.load_state_dict(filtered, strict=False)
+                    reinit = sorted(set(missing) | set(skipped))
+                    logger.info(f"   encoder加载: {len(filtered)}层继承, {len(reinit)}层重新初始化")
+                    if reinit:
+                        logger.info(f"   重新初始化的层: {reinit}")
+                    # 强制重置tree_bias为0（门控融合初始值，旧版本训练值不适用）
+                    if hasattr(agent.encoder, 'tree_bias'):
+                        with torch.no_grad():
+                            agent.encoder.tree_bias.fill_(0.0)
+                        logger.info(f"   tree_bias已重置为0.0 (sigmoid=0.5，均等融合)")
 
-                if source_state:
-                    new_state_dict = {}
-                    target_model = agent.q_network
-                    target_keys = set(target_model.state_dict().keys())
-
-                    for k, v in source_state.items():
-                        if k in target_keys:
-                            new_state_dict[k] = v
-                            continue
-                        if k.startswith('gnn.'):
-                            new_key = k.replace('gnn.', '', 1)
-                            if new_key in target_keys:
-                                new_state_dict[new_key] = v
-                                continue
-
-                    if len(new_state_dict) > 0:
-                        missing, unexpected = target_model.load_state_dict(new_state_dict, strict=False)
-                        match_count = len(new_state_dict)
-                        total_params = len(target_keys)
-                        logger.info(f"✅ 智能加载成功: 迁移了 {match_count}/{total_params} 层权重")
-                    else:
-                        logger.warning("⚠️ 智能适配后仍未找到匹配层")
-                else:
-                    logger.warning("⚠️ Checkpoint 格式异常")
-
+                # 重建optimizer_low，确保encoder参数绑定正确
+                lr_low = config.get('training', {}).get('lr_low', 1e-5)
+                agent.optimizer_low = torch.optim.Adam(
+                    list(agent.low_policy.parameters()) + list(agent.encoder.parameters()),
+                    lr=lr_low
+                )
+                logger.info("✅ 热启动成功: 权重已加载，optimizer_low已重建")
+                logger.info(f"   tree_bias初始值: {agent.encoder.tree_bias.item():.6f}")
             except Exception as e:
-                logger.error(f"❌ 模型加载错误: {e}")
-        else:
-            logger.warning(f"⚠️ 未找到预训练模型: {pretrained_path}")
-
+                logger.error(f"❌ 热启动加载失败: {e}")
+                import traceback;
+                traceback.print_exc()
         # ── Phase3 开始前重置 optimizer lr（IL 训练后 lr 可能被 scheduler 降低）──
         # 使用 config 里设置的小 lr（1e-5），确保 RL 微调阶段不破坏 IL 权重
         rl_lr_high = config.get('training', {}).get('lr_high', 1e-5)

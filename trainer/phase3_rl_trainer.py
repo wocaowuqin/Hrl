@@ -71,6 +71,24 @@ class Phase3RLTrainer:
 
     def run(self):
         """🚀 训练主循环"""
+        # 诊断：检查encoder是否在optimizer_low里
+        logger.info("=== Encoder诊断 ===")
+        logger.info(f"encoder is None: {self.agent.encoder is None}")
+        if self.agent.encoder is not None:
+            enc_params = list(self.agent.encoder.parameters())
+            logger.info(f"encoder参数数量: {len(enc_params)}")
+            logger.info(f"tree_bias requires_grad: {self.agent.encoder.tree_bias.requires_grad}")
+            logger.info(f"tree_bias初始值: {self.agent.encoder.tree_bias.item():.6f}")
+
+            # 检查optimizer_low里有没有encoder参数
+            opt_param_ids = set()
+            for pg in self.agent.optimizer_low.param_groups:
+                for p in pg['params']:
+                    opt_param_ids.add(id(p))
+            enc_in_opt = sum(1 for p in enc_params if id(p) in opt_param_ids)
+            logger.info(f"encoder参数在optimizer_low中: {enc_in_opt}/{len(enc_params)}")
+            logger.info(f"optimizer_low参数组数量: {len(self.agent.optimizer_low.param_groups)}")
+
 
         logger.info("\n" + "=" * 40)
         logger.info(f"🎬 开始训练 ({self.max_episodes} eps)")
@@ -221,9 +239,12 @@ class Phase3RLTrainer:
             try:
                 _enc = getattr(self.agent, 'encoder', None)
                 if _enc is not None and hasattr(_enc, 'tree_bias'):
-                    _tb_val = _enc.tree_bias.item()
-                    self.stats['tree_bias_vals'].append(_tb_val)
-                    self.writer.add_scalar('TA_HRL/tree_bias', _tb_val, episode)
+                    _tb_raw = _enc.tree_bias.item()
+                    # 换算为有效权重 (Sigmoid)
+                    _tb_eff = torch.sigmoid(torch.tensor(_tb_raw)).item()
+                    self.stats['tree_bias_vals'].append(_tb_eff)
+                    self.writer.add_scalar('TA_HRL/tree_bias_effective', _tb_eff, episode)
+                    self.writer.add_scalar('TA_HRL/tree_bias_raw', _tb_raw, episode)
             except Exception:
                 pass
 
@@ -241,8 +262,8 @@ class Phase3RLTrainer:
                 recent_sharing = [s for s in self.stats['sharing_ratios'][-10:] if s > 0]
                 avg_sharing = np.mean(recent_sharing) if recent_sharing else 0.0
 
-                _tb_str = f" | tree_bias={self.stats['tree_bias_vals'][-1]:.6f}" if self.stats['tree_bias_vals'] else ""
-
+                _tb_str = f" | tree_bias(eff)={self.stats['tree_bias_vals'][-1]:.4f}" if self.stats[
+                    'tree_bias_vals'] else ""
                 logger.info(
                     f"Ep {episode}: Rate={success_rate:.2%} | "
                     f"Rwd={total_reward:.1f} | Util={res_util:.2f} | "
@@ -292,17 +313,42 @@ class Phase3RLTrainer:
         print(f"   🔋 平均资源利用率:  {np.mean(self.stats['resource_utilization']):.2f}")
         print(f"   🌳 平均树长 (成功): {avg_tree_final:.2f}")
         print(f"   🔗 平均边共享率:    {avg_sharing_final:.3f}")
-        print(f"   🎯 tree_bias 轨迹:  {tb_start:.6f} → {tb_end:.6f} ")
+        print(f"   🎯 tree_bias(有效权重) 轨迹:  {tb_start:.4f} → {tb_end:.4f}  (>0.5说明模型主动利用了多播树结构)")
         print("=" * 40)
 
         self.analyzer.report()
+
+    def _get_agent_state(self):
+        """手动提取HRLAgent权重（HRLAgent不继承nn.Module，无state_dict()）"""
+        state = {}
+        if hasattr(self.agent, 'high_policy') and hasattr(self.agent.high_policy, 'state_dict'):
+            state['high_policy'] = self.agent.high_policy.state_dict()
+        if hasattr(self.agent, 'target_high_policy') and hasattr(self.agent.target_high_policy, 'state_dict'):
+            state['target_high_policy'] = self.agent.target_high_policy.state_dict()
+        if hasattr(self.agent, 'low_policy') and hasattr(self.agent.low_policy, 'state_dict'):
+            state['low_policy'] = self.agent.low_policy.state_dict()
+        if hasattr(self.agent, 'target_low_policy') and hasattr(self.agent.target_low_policy, 'state_dict'):
+            state['target_low_policy'] = self.agent.target_low_policy.state_dict()
+        if hasattr(self.agent, 'encoder') and hasattr(self.agent.encoder, 'state_dict'):
+            state['encoder'] = self.agent.encoder.state_dict()
+        if hasattr(self.agent, 'optimizer_high'):
+            try:
+                state['optimizer_high'] = self.agent.optimizer_high.state_dict()
+            except Exception:
+                pass
+        if hasattr(self.agent, 'optimizer_low'):
+            try:
+                state['optimizer_low'] = self.agent.optimizer_low.state_dict()
+            except Exception:
+                pass
+        return state if state else None
 
     def _save_checkpoint(self, episode):
         save_path = self.output_dir / f"checkpoint_ep{episode}.pth"
         try:
             torch.save({
                 'episode': episode,
-                'agent_state': self.agent.state_dict() if hasattr(self.agent, 'state_dict') else None,
+                'agent_state': self._get_agent_state(),
                 'config': self.cfg,
                 'stats': self.stats
             }, save_path)
@@ -314,7 +360,7 @@ class Phase3RLTrainer:
         try:
             torch.save({
                 'episode': episode,
-                'agent_state': self.agent.state_dict() if hasattr(self.agent, 'state_dict') else None,
+                'agent_state': self._get_agent_state(),
                 'config': self.cfg,
                 'stats': self.stats
             }, final_path)

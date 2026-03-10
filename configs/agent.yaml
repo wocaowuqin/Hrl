@@ -11,18 +11,19 @@ agent:
   # 训练配置
   training:
     learning_rate: 0.001
-    gamma: 0.93           # 折扣因子
+    gamma: 0.85          # 折扣因子
     buffer_size: 100000   # 经验回放池大小
     batch_size: 32
-    target_update_freq: 1000  # Target Network 更新频率
+    target_update_freq: 200  # Target Network 更新频率
     grad_clip: 1.0        # 梯度裁剪阈值
 
   # 探索配置
   epsilon:
     initial: 0.3
     final: 0.05
-    decay_steps: 10000
-    strategy: 'exponential'  # 'exponential' 或 'linear'
+    decay_steps: 160000
+    decay_episodes: 3500    # agent_base.py读此字段，4000ep训练用3500ep衰减
+    strategy: 'linear'
 
   # 评估配置
   eval:

@@ -347,19 +347,7 @@ class SFC_HIRL_Env(gym.Env):
             logger.error(f"❌ 无法导入专家模块: {e}")
             self.expert = None
 
-        # --- 初始化 BackupPolicy ---
-        try:
-            from envs.modules.sfc_backup_system.backup_policy import BackupPolicy
-            self.backup_policy = BackupPolicy(
-                expert=self.expert,
-                n=self.n,
-                L=self.L,
-                K_vnf=self.K_vnf,
-                dc_nodes=self.dc_nodes
-            )
-        except ImportError:
-            logger.warning("⚠️ 未能加载 BackupPolicy")
-            self.backup_policy = None
+
     def _init_rl_components(self):
         """初始化数据加载、奖励计算、策略助手等"""
         self.data_loader = DataLoader(self.config)

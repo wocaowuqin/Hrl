@@ -194,11 +194,27 @@ class HighLevelController:
                 _llc = getattr(self.env, 'low_level_controller', None)
                 # 前进约束：第k个VNF离source的距离 必须 > 第k-1个VNF离source的距离
                 # 保证spine沿 source→dest 方向单调推进，不回绕
+                # ── [方案B修复] SFC顺序约束 ──────────────────────────────────────
+                # 旧约束：dist(source→candidate) > dist(source→prev_vnf)  ← 有缺陷
+                #   问题：仅保证candidate比prev_vnf离source更远，但不保证
+                #         物理路径上 prev_vnf→candidate→dest 方向正确，
+                #         导致 V3比V2更靠近source，链顺序在物理路径上倒置。
+                #
+                # 新约束：dist(candidate→nearest_dest) < dist(prev_vnf→nearest_dest)
+                #   语义：candidate必须比prev_vnf更靠近dest（在前进方向上），
+                #         保证 prev_vnf → candidate → dest 的物理拓扑顺序正确。
+                # ──────────────────────────────────────────────────────────────────
                 _prev_vnf = (list(_already)[-1] if _already
                              else (_source if _source != -1 else None))
-                _dist_prev_from_src = (_llc._get_hop_distance(_source, _prev_vnf)
-                                       if _llc and _prev_vnf is not None and _source != -1
-                                       else 0)
+
+                # 计算prev_vnf到最近dest的距离（"起点距离"基准）
+                _nearest_dest_dist_prev = 9999
+                if _llc and _prev_vnf is not None and _dests:
+                    for _d in _dests:
+                        _dd = _llc._get_hop_distance(_prev_vnf, _d)
+                        if _dd < _nearest_dest_dist_prev:
+                            _nearest_dest_dist_prev = _dd
+
                 _strict_mask = np.zeros(n, dtype=np.float32)
                 _loose_mask  = np.zeros(n, dtype=np.float32)
                 for node in self.env.dc_nodes:
@@ -209,21 +225,41 @@ class HighLevelController:
                         avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
                         avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
                         if avail_cpu >= req_cpu and avail_mem >= req_mem:
-                            _dist_node = (_llc._get_hop_distance(_source, node)
-                                          if _llc and _source != -1 else 0)
-                            # 严格前进：离source更远
-                            if _dist_node > _dist_prev_from_src:
+                            # 计算candidate到最近dest的距离
+                            _nearest_dest_dist_node = 9999
+                            _prev_to_node = _llc._get_hop_distance(_prev_vnf, node) if _llc and _prev_vnf is not None else 9999
+
+                            if _llc and _dests:
+                                for _d in _dests:
+                                    _dd = _llc._get_hop_distance(node, _d)
+                                    if _dd < _nearest_dest_dist_node:
+                                        _nearest_dest_dist_node = _dd
+
+                            # 严格约束：candidate必须在prev_vnf→某dest的最短路径上
+                            # 即: dist(prev_vnf→node) + dist(node→dest) == dist(prev_vnf→dest)
+                            # 这样保证物理路径严格按 prev_vnf→node→dest 顺序，不出现兄弟节点
+                            _on_shortest_path = False
+                            if _llc and _prev_vnf is not None and _dests:
+                                for _d in _dests:
+                                    _d_prev = _llc._get_hop_distance(_prev_vnf, _d)
+                                    _d_node = _llc._get_hop_distance(node, _d)
+                                    if _prev_to_node + _d_node == _d_prev:
+                                        _on_shortest_path = True
+                                        break
+
+                            if _on_shortest_path:
                                 _strict_mask[node] = 1.0
-                            # 宽松：至少一样远（fallback用）
-                            if _dist_node >= _dist_prev_from_src:
+                            # 宽松fallback：至少比prev_vnf更靠近dest
+                            if _nearest_dest_dist_node < _nearest_dest_dist_prev:
                                 _loose_mask[node] = 1.0
+
                 # 优先严格前进；若无节点满足则退回宽松；再无则不限制
                 if np.sum(_strict_mask) > 0:
                     mask = _strict_mask
                 elif np.sum(_loose_mask) > 0:
                     mask = _loose_mask
                 else:
-                    # 极端情况：全部DC都在source附近，放开限制
+                    # 极端情况：放开限制，只保留资源约束
                     for node in self.env.dc_nodes:
                         if 0 <= node < n and node != _source and node not in _dests and node not in _already:
                             avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)

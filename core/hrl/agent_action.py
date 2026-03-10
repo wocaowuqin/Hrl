@@ -266,6 +266,46 @@ class HRLAgentAction:
 
     # ── 嵌入计算 ─────────────────────────────────────────────────────────
 
+    def _build_req_vec(self):
+        """从 env.current_request 构建请求特征向量 [1, 3]（bw, avg_cpu, avg_mem）。
+        若 encoder 未启用 req_fc（req_dim=0）则返回 None，避免无谓计算。"""
+        if self.encoder is None or not getattr(self.encoder, 'req_fc', None):
+            return None
+        try:
+            req = (self.env.current_request
+                   if self.env is not None and hasattr(self.env, 'current_request')
+                   else None)
+            if req is None:
+                return None
+            bw  = float(req.get('bw_origin', req.get('bw', 0.0)))
+            cpu_list = req.get('cpu_origin', req.get('cpu', []))
+            mem_list = req.get('memory_origin', req.get('memory', []))
+            avg_cpu = float(np.mean(cpu_list)) if len(cpu_list) > 0 else 0.0
+            avg_mem = float(np.mean(mem_list)) if len(mem_list) > 0 else 0.0
+            return torch.tensor([[bw, avg_cpu, avg_mem]], dtype=torch.float32,
+                                 device=self.device)
+        except Exception:
+            return None
+
+    def _build_dest_mask(self, state, n_nodes: int):
+        """从 env.unconnected_dests 构建目标节点掩码 [N]（bool Tensor）。"""
+        try:
+            dests = None
+            if self.env is not None and hasattr(self.env, 'unconnected_dests'):
+                dests = self.env.unconnected_dests
+            if not dests:
+                real_state = state[0] if isinstance(state, tuple) else state
+                dests = getattr(real_state, 'unconnected_dests', None)
+            if dests:
+                mask = torch.zeros(n_nodes, dtype=torch.bool, device=self.device)
+                for d in dests:
+                    if isinstance(d, int) and 0 <= d < n_nodes:
+                        mask[d] = True
+                return mask if mask.any() else None
+        except Exception:
+            pass
+        return None
+
     def _get_local_embedding(self, state):
         """[TA-HGRL Fix] 返回完整节点序列 [1, N, H]，保留N维供Attention审视"""
         if self.encoder is None:
@@ -287,11 +327,15 @@ class HRLAgentAction:
                 _ea = getattr(real_state, 'edge_attr', None)
                 _ea = (_ea.to(self.device) if _ea is not None
                        else torch.zeros(_ei.shape[1], 5, device=self.device))
-                _b  = torch.zeros(_x.size(0), dtype=torch.long, device=self.device)
-                _tei = getattr(real_state, 'tree_edge_index', None)
+                _b    = torch.zeros(_x.size(0), dtype=torch.long, device=self.device)
+                _tei  = getattr(real_state, 'tree_edge_index', None)
                 if _tei is not None: _tei = _tei.to(self.device)
+                _req  = self._build_req_vec()
+                _dest = self._build_dest_mask(state, _x.size(0))
                 node_out = self.encoder(_x, _ei, _ea, batch=_b,
-                                        tree_edge_index=_tei)  # [N, H]
+                                        tree_edge_index=_tei,
+                                        dest_mask=_dest,
+                                        req_vec=_req)            # [N, H]
 
             # [TA-HGRL Fix] 保留N维：返回 [1, N, H]，让Goal-Attention看到全网节点
             return node_out.unsqueeze(0)
@@ -306,14 +350,19 @@ class HRLAgentAction:
         try:
             _tei = getattr(real_state, 'tree_edge_index', None)
             if _tei is not None: _tei = _tei.to(self.device)
+            _req  = self._build_req_vec()
+            _dest = (self._build_dest_mask(state, real_state.x.size(0))
+                     if hasattr(real_state, 'x') else None)
             if hasattr(real_state, 'batch') and real_state.batch is not None:
                 out = self.encoder(real_state.x, real_state.edge_index,
-                                   tree_edge_index=_tei)
+                                   tree_edge_index=_tei,
+                                   dest_mask=_dest, req_vec=_req)
                 return out.mean(dim=0, keepdim=True)
             if hasattr(real_state, 'x'):
                 b = torch.zeros(real_state.x.size(0), dtype=torch.long, device=self.device)
                 out = self.encoder(real_state.x, real_state.edge_index,
-                                   batch=b, tree_edge_index=_tei)
+                                   batch=b, tree_edge_index=_tei,
+                                   dest_mask=_dest, req_vec=_req)
                 return out.mean(dim=0, keepdim=True)
         except Exception:
             pass

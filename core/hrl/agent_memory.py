@@ -62,13 +62,22 @@ class HRLAgentMemory:
         safe_state = copy.deepcopy(state)
         safe_next_state = copy.deepcopy(next_state)
 
+        # 保存当前请求特征，供训练时 _encode 还原 req_vec 用（训练推断一致性）
+        _req = None
+        try:
+            if self.env is not None and hasattr(self.env, 'current_request'):
+                _req = copy.deepcopy(self.env.current_request)
+        except Exception:
+            pass
+
         transition = {
-            'state': safe_state,
-            'action': action,
-            'reward': scaled_reward,
+            'state':      safe_state,
+            'action':     action,
+            'reward':     scaled_reward,
             'next_state': safe_next_state,
-            'done': done,
-            'goal_emb': self.current_goal_emb,
+            'done':       done,
+            'goal_emb':   self.current_goal_emb,
+            'req':        _req,   # 请求特征：bw/cpu/mem，训练时重建 req_vec 用
         }
 
         # [SDG-HRL] PER: 新transition用最高优先级入队
