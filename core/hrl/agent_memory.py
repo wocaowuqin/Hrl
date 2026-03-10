@@ -27,12 +27,21 @@ class HRLAgentMemory:
         """存储High-Level经验，goal用clamp防止越界"""
         goal_idx = max(0, min(int(goal), self.n_goals - 1)) if isinstance(goal, (int, np.integer)) else 0
         scaled_reward = max(-20.0, min(150.0, float(reward)))  # [SDG-HRL] 不缩放
+        # 保存历史req，供训练时 _get_graph_embedding 用（鲁棒current_request污染）
+        _req = None
+        try:
+            if self.env is not None and hasattr(self.env, 'current_request'):
+                import copy
+                _req = copy.deepcopy(self.env.current_request)
+        except Exception:
+            pass
         transition_high = {
             'state':      state,
             'goal':       goal_idx,
             'reward':     scaled_reward,
             'next_state': next_state,
             'done':       done,
+            'req':        _req,
         }
         if getattr(self, '_use_per', False):
             self.high_memory.add(transition_high)

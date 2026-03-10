@@ -329,13 +329,14 @@ def inject_dynamic_dimensions(config, env):
     if 'gnn' not in config:
         config['gnn'] = {}
 
-    # 🚀 TA-HRL v4: 强制将节点特征维度设为 21 维 (新增 hop_to_tree)
-    if 'node_feat_dim' not in config['gnn']:
-        config['gnn']['node_feat_dim'] = 21
-        logger.info(f"  node_feat_dim (forced for TA-HRL v4): {config['gnn']['node_feat_dim']}")
-    else:
-        config['gnn']['node_feat_dim'] = 21
-        logger.info(f"  node_feat_dim (forced override): {config['gnn']['node_feat_dim']} ✓")
+    # 🚀 从环境实际状态读取节点特征维度，避免硬编码导致维度不匹配
+    try:
+        _sample_state = env.get_state()
+        _actual_node_dim = _sample_state.x.shape[1]
+    except Exception:
+        _actual_node_dim = 24  # fallback
+    config['gnn']['node_feat_dim'] = _actual_node_dim
+    logger.info(f"  node_feat_dim (auto from env.get_state()): {_actual_node_dim}")
 
     # edge_feat_dim 和 request_feat_dim 同样只作 fallback
     if 'edge_feat_dim' not in config['gnn']:

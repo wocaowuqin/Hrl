@@ -53,10 +53,11 @@ class HRLAgentBase:
         _ablation_variant = kwargs.get('ablation_variant', 'full')
         # req_dim：请求特征维度 [bw, avg_cpu, avg_mem]，默认3；配置为0可关闭
         _req_dim = config.get('gnn', {}).get('req_dim', 3)
+        _node_dim = config.get('gnn', {}).get('node_feat_dim', 24)
         if _ablation_variant == 'full':
             from core.gnn.tree_transformer_encoder import TreeTransformerEncoder
             self.encoder = TreeTransformerEncoder(
-                node_dim=21,
+                node_dim=_node_dim,
                 edge_dim=5,
                 hidden_dim=self.hidden_dim,
                 req_dim=_req_dim,
@@ -64,7 +65,7 @@ class HRLAgentBase:
         else:
             from core.gnn.ablation_encoder import AblationEncoder
             self.encoder = AblationEncoder(
-                node_dim=21,
+                node_dim=_node_dim,
                 edge_dim=5,
                 hidden_dim=self.hidden_dim,
                 variant=_ablation_variant,
@@ -156,7 +157,7 @@ class HRLAgentBase:
             self._ep_transitions = []
             logger.info("✅ [SDG-HRL] PER + EliteBuffer 已启用")
         except ImportError as _e:
-            logger.warning(f"⚠️ PER未找到，回退到deque: {_e}")
+
             self.high_memory = deque(maxlen=buffer_size // 2)
             self.low_memory = deque(maxlen=buffer_size)
             self.elite_buffer = None

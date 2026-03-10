@@ -841,21 +841,13 @@ class FusedResourceManager:
                                cpu_need: float, mem_need: float = 0.0) -> bool:
         if node < 0 or node >= self.n:
             return False
-        # 🚀 VNF复用：该节点已有此类型VNF实例，免费复用，不扣物理资源
-        if vnf_type >= 0 and self.hvt_all[node, vnf_type] > 0:
-            self.hvt_all[node, vnf_type] += 1
-            return True
-        # 首次实例化，真正扣除物理资源
+        # 每次都真实扣除物理CPU/MEM（未启用VNF复用）
         if not self.pool.allocate_cpu(node, cpu_need):
             return False
         if mem_need > 0 and not self.pool.allocate_memory(node, mem_need):
             self.pool.release_cpu(node, cpu_need)
             return False
-        self.hvt_all[node, vnf_type] += 1
-        # 记录首次实际扣除的CPU/MEM，释放时用此值而非当前请求值
-        if not hasattr(self, 'vnf_instance_cost'):
-            self.vnf_instance_cost = {}
-        self.vnf_instance_cost[(node, vnf_type)] = (cpu_need, mem_need)
+        self.hvt_all[node, vnf_type] += 1  # 仍更新hvt_all，供状态特征使用
         return True
 
     def allocate_link_resource(self, u: int, v: int, bw_need: float) -> bool:
@@ -867,29 +859,13 @@ class FusedResourceManager:
     def release_node_resource(self, node: int, vnf_type: int, cpu_val: float, mem_val: float):
         if node < 0 or node >= self.n:
             return
+        # 直接归还物理资源（未启用VNF复用）
         if vnf_type >= 0 and self.hvt_all[node, vnf_type] > 0:
-            if self.hvt_all[node, vnf_type] > 1:
-                # 还有其他请求在用此VNF实例，只减计数，不归还物理资源
-                self.hvt_all[node, vnf_type] -= 1
-                return
-            else:
-                # 最后一个请求离开，归还首次分配时实际扣除的资源
-                self.hvt_all[node, vnf_type] = 0
-                if hasattr(self, 'vnf_instance_cost'):
-                    actual_cpu, actual_mem = self.vnf_instance_cost.pop(
-                        (node, vnf_type), (cpu_val, mem_val))
-                else:
-                    actual_cpu, actual_mem = cpu_val, mem_val
-                if actual_cpu > 0:
-                    self.pool.release_cpu(node, actual_cpu)
-                if actual_mem > 0:
-                    self.pool.release_memory(node, actual_mem)
-        else:
-            # hvt_all为0但仍被调用释放（兜底）
-            if cpu_val > 0:
-                self.pool.release_cpu(node, cpu_val)
-            if mem_val > 0:
-                self.pool.release_memory(node, mem_val)
+            self.hvt_all[node, vnf_type] = max(0, self.hvt_all[node, vnf_type] - 1)
+        if cpu_val > 0:
+            self.pool.release_cpu(node, cpu_val)
+        if mem_val > 0:
+            self.pool.release_memory(node, mem_val)
 
     def release_link_resource(self, u: int, v: int, bw_val: float):
         self.pool.release_bandwidth(u, v, bw_val)
@@ -902,9 +878,7 @@ class FusedResourceManager:
 
     def check_node_resource(self, node: int, vnf_type: int = 0,
                             cpu_need: float = 0.0, mem_need: float = 0.0) -> bool:
-        # 🚀 VNF复用：实例已存在则免费，直接返回True
-        if vnf_type >= 0 and self.hvt_all[node, vnf_type] > 0:
-            return True
+        # 每次都检查物理资源（未启用VNF复用）
         cpu_ok = self.pool.get_available_cpu(node) >= cpu_need - 1e-5
         mem_ok = self.pool.get_available_memory(node) >= mem_need - 1e-5
         return cpu_ok and mem_ok
@@ -996,8 +970,6 @@ class FusedResourceManager:
         else:
             self.pool.reset(hard)
             self.hvt_all.fill(0)
-            if hasattr(self, 'vnf_instance_cost'):
-                self.vnf_instance_cost.clear()
             self.vnf_instances.clear()
             if hasattr(self, 'env') and hasattr(self.env, 'current_time'):
                 ct = self.env.current_time

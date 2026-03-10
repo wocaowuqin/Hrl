@@ -38,8 +38,10 @@ class HighLevelPolicy(nn.Module):
 
         self.hidden_dim = deep_get(config, ["hidden_dim"], 128)
         self.goal_dim = deep_get(config, ["goal_dim"], 64)
-        # 修复点：读取 num_nodes 确保输出维度为 28，而不是默认的 10
-        self.num_goals = config.get('environment', {}).get('num_nodes', 28)
+        # 读取目标节点数：优先读 nb_high_level_goals（agent_base传入），兼容 num_nodes 兜底
+        env_cfg = config.get('environment', {})
+        self.num_goals = env_cfg.get('nb_high_level_goals',
+                         env_cfg.get('num_nodes', 28))
         self.gnn_output_dim = deep_get(config, ["gnn_output_dim"], self.hidden_dim)
         dropout = deep_get(config, ["dropout"], 0.1)
 

@@ -342,15 +342,31 @@ class HRLAgentAction:
         except Exception:
             return self._get_graph_embedding(state)
 
-    def _get_graph_embedding(self, state):
-        """全图均值嵌入（兜底用）"""
+    def _get_graph_embedding(self, state, req=None):
+        """全图均值嵌入（兜底用）
+        req: 可选，传入历史请求字典（high-level训练时传入），
+        鲁棒以免用当前 env.current_request 污染历史 embedding
+        """
         real_state = state[0] if isinstance(state, tuple) else state
         if self.encoder is None:
             return torch.zeros(1, self.hidden_dim, device=self.device)
         try:
             _tei = getattr(real_state, 'tree_edge_index', None)
             if _tei is not None: _tei = _tei.to(self.device)
-            _req  = self._build_req_vec()
+            # 优先用传入的历史req，其次才读 env.current_request
+            if req is not None and (self.encoder is not None and getattr(self.encoder, 'req_fc', None)):
+                try:
+                    bw      = float(req.get('bw_origin', req.get('bw', 0.0)))
+                    cpu_lst = req.get('cpu_origin', req.get('cpu', []))
+                    mem_lst = req.get('memory_origin', req.get('memory', []))
+                    avg_cpu = float(np.mean(cpu_lst)) if len(cpu_lst) > 0 else 0.0
+                    avg_mem = float(np.mean(mem_lst)) if len(mem_lst) > 0 else 0.0
+                    _req = torch.tensor([[bw, avg_cpu, avg_mem]],
+                                        dtype=torch.float32, device=self.device)
+                except Exception:
+                    _req = self._build_req_vec()
+            else:
+                _req = self._build_req_vec()
             _dest = (self._build_dest_mask(state, real_state.x.size(0))
                      if hasattr(real_state, 'x') else None)
             if hasattr(real_state, 'batch') and real_state.batch is not None:

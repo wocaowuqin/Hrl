@@ -183,9 +183,15 @@ class LowLevelController:
         if not hasattr(self.env, 'subgoal_step_count'):
             self.env.subgoal_step_count = 0
 
-        # 全局失败计数：连续低层超时/无进展次数
-        if not hasattr(self.env, '_consecutive_timeout_count'):
-            self.env._consecutive_timeout_count = 0
+        # 全局失败计数：拆成两个独立计数器，各自语义/阈值不同
+        # _timeout_count : 步数超时 + VNF资源不足，阈值=3
+        # _island_count  : 带宽孤岛（目标所有接入链路已满），阈值=5
+        if not hasattr(self.env, '_timeout_count'):
+            self.env._timeout_count = 0
+        if not hasattr(self.env, '_island_count'):
+            self.env._island_count = 0
+        # 向后兼容：_consecutive_timeout_count 指向 _timeout_count
+        self.env._consecutive_timeout_count = self.env._timeout_count
         if not hasattr(self.env, '_bw_fail_count'):
             self.env._bw_fail_count = 0
 
@@ -217,7 +223,8 @@ class LowLevelController:
         if not at_target and self.env.subgoal_step_count > getattr(self.env, 'max_subgoal_steps', 25):
             self.env.subgoal_step_count = 0
             self.env._need_reset_to_last_vnf = False
-            self.env._consecutive_timeout_count += 1
+            self.env._timeout_count += 1
+            self.env._consecutive_timeout_count = self.env._timeout_count  # 同步别名
 
             _ph = getattr(self.env, 'current_phase', '?')
             _tgt = (getattr(self.env, 'current_deployment_target', None)
@@ -312,17 +319,18 @@ class LowLevelController:
                 f"tabu_free={_mask} nbr_detail={_nbr_detail}"
             )
 
-            if self.env._consecutive_timeout_count >= 3:
+            if self.env._timeout_count >= 3:
                 _vt = len(self.env.current_request.get('vnf', [])) if self.env.current_request else 0
                 _vd = getattr(self.env, 'next_vnf_idx', 0)
                 _dt = len(self.env.current_request.get('dest', [])) if self.env.current_request else 0
                 _dc_conn = len(self.env.current_tree.get('connected_dests', set())) if self.env.current_tree else 0
 
                 logger.warning(
-                    f"❌ [Low] 连续超时{self.env._consecutive_timeout_count}次，Episode失败 | "
+                    f"❌ [Low] 连续超时{self.env._timeout_count}次，Episode失败 | "
                     f"VNF={_vd}/{_vt} Dest={_dc_conn}/{_dt} | "
                     f"phase={_ph} cur={current_node} target={_tgt} hop_dist={_dist}"
                 )
+                self.env._timeout_count = 0
                 self.env._consecutive_timeout_count = 0
                 self._archive_episode_fail()  # 🆕 回滚BW
                 return self.get_state(), -20.0, True, False, {
@@ -360,6 +368,8 @@ class LowLevelController:
                     deploy_success = self.env._try_deploy(target_goal)
 
                 if deploy_success:
+                    self.env._timeout_count = 0
+                    self.env._island_count = 0
                     self.env._consecutive_timeout_count = 0
                     if not hasattr(self.env, 'chain_nodes'):
                         self.env.chain_nodes = []
@@ -415,20 +425,22 @@ class LowLevelController:
                         if vnf_idx < len(cpu_reqs): req_cpu = cpu_reqs[vnf_idx]
                         if vnf_idx < len(mem_reqs): req_mem = mem_reqs[vnf_idx]
 
-                    self.env._consecutive_timeout_count = getattr(self.env, '_consecutive_timeout_count', 0) + 1
+                    self.env._timeout_count = getattr(self.env, '_timeout_count', 0) + 1
+                    self.env._consecutive_timeout_count = self.env._timeout_count  # 同步别名
 
                     logger.warning(
                         f"❌ [VNF-FAIL] 节点={target_goal} | "
                         f"可用CPU={avail_cpu:.1f} 需要={req_cpu:.1f} | "
                         f"可用MEM={avail_mem:.1f} 需要={req_mem:.1f} | "
-                        f"连续失败={self.env._consecutive_timeout_count}"
+                        f"连续失败={self.env._timeout_count}"
                     )
 
                     info = {'deploy_fail': True, 'vnf_idx': self.env.next_vnf_idx,
                             'reason': 'resource_insufficient',
                             'avail_cpu': avail_cpu, 'avail_mem': avail_mem}
                     self._reset_vnf_phase_only()
-                    if self.env._consecutive_timeout_count >= 3:
+                    if self.env._timeout_count >= 3:
+                        self.env._timeout_count = 0
                         self.env._consecutive_timeout_count = 0
                         self._archive_episode_fail()  # 🆕 回滚BW
                         return self.get_state(), -20.0, True, False, {**info, 'fail': True}
@@ -466,10 +478,11 @@ class LowLevelController:
                 else:
                     logger.warning(f"🏝️ [Low] 带宽孤岛: target={target_goal} 所有接入链路已满，快速失败")
                     # 🆕 不直接让整个Episode失败，改为跳过当前目标让高层重新调度
-                    self.env._consecutive_timeout_count += 1
-                    if self.env._consecutive_timeout_count >= 5:
+                    # ⚠️ [计数器拆分] 孤岛用独立的_island_count，阈值5，不与超时混用
+                    self.env._island_count += 1
+                    if self.env._island_count >= 5:
                         # 连续5次孤岛无法解决，才真正失败
-                        self.env._consecutive_timeout_count = 0
+                        self.env._island_count = 0
                         self._archive_episode_fail()  # 🆕 回滚BW
                         return self.get_state(), -20.0, True, False, {
                             'fail': True, 'reason': 'bandwidth_exhausted'
@@ -554,6 +567,8 @@ class LowLevelController:
             if all_dests.issubset(connected) and len(all_dests) > 0:
                 logger.debug(f"✅ [Episode完成] 多播树建树成功！ connected={len(connected)}/{len(all_dests)}")
                 self.env._consecutive_timeout_count = 0
+                self.env._timeout_count = 0
+                self.env._island_count = 0
                 self.env._bw_fail_count = 0
                 self._archive_episode_success_only()
                 self._add_request_to_lifecycle_manager()
@@ -562,12 +577,15 @@ class LowLevelController:
                 try:
                     _bw_req = self.env.current_request.get('bw_origin', 0.0)
                     _tree_edges = self.env.current_tree.get('tree', {})
-                    _n_edges = len(_tree_edges)
-                    _total_bw_consumed = _bw_req * _n_edges  # 每条新树边消耗 bw_req
+                    # ⚠️ [统计修复] branch_path边写入tree时flow=0.0（仅记录路径，未实际分配BW）
+                    # 只统计flow>0的边，避免高估带宽消耗
+                    _active_edges = {e: f for e, f in _tree_edges.items() if f > 0.0}
+                    _n_edges = len(_active_edges)
+                    _total_bw_consumed = _bw_req * _n_edges
 
-                    # 统计每条边的剩余带宽
+                    # 统计每条边的剩余带宽（仅实际分配的边）
                     _edge_details = []
-                    for (_u, _v), _ratio in _tree_edges.items():
+                    for (_u, _v), _ratio in _active_edges.items():
                         try:
                             _avail = self.env.resource_mgr.pool.get_available_bandwidth(_u, _v)
                             _edge_details.append(f"({_u}-{_v}: 剩余{_avail:.1f})")
@@ -582,7 +600,11 @@ class LowLevelController:
                             if _u < _v:
                                 try:
                                     _avail = self.env.resource_mgr.pool.get_available_bandwidth(_u, _v)
-                                    _cap = getattr(self.env.resource_mgr.pool, 'B_cap', 100.0)
+                                    _cap = self.env.resource_mgr.pool.bw_cap.get(
+                                        tuple(sorted((_u, _v))),
+                                        getattr(self.env.resource_mgr, 'BW_cap',
+                                                getattr(self.env.resource_mgr, 'bw_cap_default', 100.0))
+                                    )
                                     _total_avail += _avail
                                     _total_cap += _cap
                                 except Exception:
@@ -952,8 +974,8 @@ class LowLevelController:
         elif phase == 'destination_connection': phase_flag = 1.0
         else: phase_flag = 0.5
 
-        # 🚀 21 维状态特征矩阵 (20维原有 + 1维距离多播树)
-        features = np.zeros((n, 21), dtype=np.float32)
+        # 🚀 24 维状态特征矩阵 (21维原有 + 3维邻边BW感知)
+        features = np.zeros((n, 24), dtype=np.float32)
         for node in range(n):
             avail_cpu  = rm.pool.get_available_cpu(node)
             avail_mem  = rm.pool.get_available_memory(node)
@@ -983,6 +1005,22 @@ class LowLevelController:
                 else:
                     features[node, 20] = 1.0
             # else: 保持 0.0（np.zeros 已初始化）
+
+            # 🚀 新增特征 dim21-23：邻边BW感知（让agent能看到下游链路拥塞情况）
+            _nbr_bws = [
+                rm.pool.get_available_bandwidth(node, nbr)
+                for nbr in rm.get_neighbors(node)
+            ]
+            if _nbr_bws:
+                _bw_cap = max(1.0, getattr(rm, 'BW_cap', 100.0))
+                _bw_need = (self.env.current_request.get('bw', 0.0)
+                            if self.env.current_request else 0.0)
+                _min_bw = min(_nbr_bws)
+                _avg_bw = sum(_nbr_bws) / len(_nbr_bws)
+                features[node, 21] = _min_bw / _bw_cap          # 最差BW邻边（瓶颈）
+                features[node, 22] = _avg_bw / _bw_cap          # 均债BW邻边
+                features[node, 23] = 1.0 if _min_bw >= _bw_need else -1.0  # 是否能通过
+            # else: 孤立节点保持 0.0
 
         x_tensor = torch.from_numpy(features).float()
         low_mask  = self.get_low_level_action_mask()
@@ -1155,4 +1193,8 @@ class LowLevelController:
     def _reset_vnf_phase_only(self):
         self.env.current_deployment_target = None
         self.env.subgoal_step_count = 0
-        self.env._consecutive_timeout_count = 0
+        # ⚠️ [问题2修复] subgoal切换时必须清零两个独立计数器
+        # 否则跨subgoal的失败会累加，导致不同目标上的失败触发误判
+        self.env._timeout_count = 0
+        self.env._island_count = 0
+        self.env._consecutive_timeout_count = 0  # 别名同步

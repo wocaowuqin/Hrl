@@ -25,6 +25,67 @@ class HRL_Coordinator:
 
         self._permanent_unreachable = set()
 
+    def _select_bw_feasible_target(self, target_node, start_node, bw_need, valid_indices, high_mask):
+        """
+        BW感知目标选择 v2：
+        - 只在瓶颈BW < bw_need * 0.5（严重不足）时才揢索别的目标
+        - score = bottleneck_bw / hop_count，鲁棒换到跳数多的远目标
+        - 这样可鲁棒树赘变大导致BW消耗总量上升
+        """
+        import networkx as nx
+        rm = self.resource_mgr
+
+        # 构建图（只构建一次，多个调用复用）
+        G = nx.Graph()
+        for u in range(rm.n):
+            for v in rm.get_neighbors(u):
+                if u < v:
+                    avail = rm.pool.get_available_bandwidth(u, v)
+                    G.add_edge(u, v, bw=avail)
+
+        def path_stats(src, dst):
+            """Return (bottleneck_bw, hop_count)"""
+            if src == dst:
+                return float('inf'), 0
+            try:
+                path = nx.shortest_path(G, src, dst)
+                hops = len(path) - 1
+                bottleneck = min(G[path[i]][path[i+1]]['bw'] for i in range(hops))
+                return bottleneck, hops
+            except Exception:
+                return 0.0, 999
+
+        cur_bw, cur_hops = path_stats(start_node, target_node)
+
+        # BW足够，直接返回
+        if cur_bw >= bw_need:
+            return target_node
+
+        # BW不足但不严重（>= 50%），坚持原目标，鲁棒换到更远节点导致树更大
+        if cur_bw >= bw_need * 0.5:
+            return target_node
+
+        # 严重BW不足，搜索替代目标， score = bottleneck / hops 平衡BW与路径长度
+        cur_score = cur_bw / max(1, cur_hops)
+        best_node  = target_node
+        best_score = cur_score
+        for idx in valid_indices:
+            node = int(idx)
+            if node == target_node:
+                continue
+            bw, hops = path_stats(start_node, node)
+            score = bw / max(1, hops)
+            if score > best_score:
+                best_score = score
+                best_node  = node
+
+        if best_node != target_node:
+            logger.debug(
+                f"[Coord][BW过滤v2] target {target_node} BW={cur_bw:.1f}<{bw_need*0.5:.1f}, "
+                f"换为 {best_node} (score={best_score:.2f})"
+            )
+        return best_node
+
     def run_high_low_cycle(self, high_obs, training=True):
         if hasattr(self, 'resources_released'):
             self.resources_released = False
@@ -90,6 +151,15 @@ class HRL_Coordinator:
             else:
                 start_node = self.env.current_node_location
             # ──────────────────────────────────────────────────────────────────
+
+        # —— BW感知目标过滤：若当前节点到目标节点的最短路径 BW不足，尝试換一个目标 --------
+        if self.resource_mgr is not None and self.env.current_request:
+            bw_need = self.env.current_request.get('bw_origin', 0.0)
+            if bw_need > 0:
+                target_node = self._select_bw_feasible_target(
+                    target_node, start_node, bw_need, valid_indices, high_mask
+                )
+        # -----------------------------------------------------------------------
 
         self.env.set_high_level_goal(high_action_idx, target_node, start_node)
 

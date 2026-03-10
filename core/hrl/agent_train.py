@@ -355,10 +355,21 @@ class HRLAgentTrain:
             except Exception as _e:
                 logger.debug(f"[tree_bias] error: {_e}")
 
-            # 梯度监控+裁剪
+            # 梯度监控+裁剪（encoder 必须与 low_policy 一起裁剪，否则梯度爆炸被optimizer动量抹平）
+            _all_low_params = list(self.low_policy.parameters())
+            if self.encoder is not None:
+                _all_low_params += list(self.encoder.parameters())
             self.gradient_norms.append(
-                sum(p.grad.norm().item() for p in self.low_policy.parameters() if p.grad is not None))
-            nn.utils.clip_grad_norm_(self.low_policy.parameters(), self.clip_grad_norm)
+                sum(p.grad.norm().item() for p in _all_low_params if p.grad is not None))
+            nn.utils.clip_grad_norm_(_all_low_params, self.clip_grad_norm)
+            # encoder tree_bias 梯度监控
+            if self.encoder is not None and hasattr(self.encoder, 'tree_bias'):
+                _tb_grad = self.encoder.tree_bias.grad
+                if _tb_grad is not None:
+                    logger.debug(f"[tree_bias] after_clip grad={_tb_grad.item():.6f} "
+                                 f"val={self.encoder.tree_bias.item():.6f}")
+                else:
+                    logger.debug("[tree_bias] grad=None (no contribution to loss this step)")
             self.optimizer_low.step()
 
             # Q监控

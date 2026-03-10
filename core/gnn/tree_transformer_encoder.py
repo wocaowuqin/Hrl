@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch_geometric.nn import TransformerConv, global_mean_pool
 
 class TreeTransformerEncoder(nn.Module):
-    def __init__(self, node_dim=21, edge_dim=5, hidden_dim=128, num_heads=4, req_dim=0):
+    def __init__(self, node_dim=24, edge_dim=5, hidden_dim=128, num_heads=4, req_dim=0):
         """
         Args:
             req_dim: 请求特征维度。>0 时启用请求融合（推荐传入 bw+cpu+mem 等请求信息）。
