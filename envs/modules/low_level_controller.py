@@ -782,7 +782,16 @@ class LowLevelController:
                 self.env.nodes_on_tree.add(current_node)
                 self.env.nodes_on_tree.add(next_node)
             else:
-                logger.debug(f"[SFC修复] spine边({current_node},{next_node})经过dest节点，跳过加入树")
+                # [Bug修复] _skip_edge=True时：BW已扣除但原代码不写入tree，
+                # 导致下次经过同一条边 is_new_edge 仍为 True → BW被无限重复扣除。
+                # 修复：写入 flow=0.0 标记"已扣BW但不计入多播树结构"。
+                # flow=0.0 在 _archive_request/_active_edges/_manual_rollback 中
+                # 均已有 `if flow == 0.0: continue` 保护，回滚时不会重复释放。
+                # compute_bw_aware_path 里 flow=0.0 边按 weight=0.1 共享边处理，
+                # 下次经过不重复扣BW（is_new_edge=False）。
+                self.env.current_tree['tree'][edge_key] = 0.0
+                logger.debug(f"[SFC修复] spine边({current_node},{next_node})经过dest节点，"
+                             f"flow=0.0写入tree防重复扣BW（不计入多播树结构）")
 
         if 'tree_usage' not in self.env.current_tree:
             self.env.current_tree['tree_usage'] = {}
@@ -1056,7 +1065,10 @@ class LowLevelController:
     # 辅助方法
     # ==================================================================
     def _calculate_tree_metrics(self):
-        tree_edges = self.env.current_tree.get('tree', {})
+        tree_edges_raw = self.env.current_tree.get('tree', {})
+        # [Bug修复联动] flow=0.0 的边是 _skip_edge 边（已扣BW但不计入多播树结构），
+        # 不应计入 n_edges/redundancy，与 _active_edges 过滤逻辑保持一致
+        tree_edges = {k: v for k, v in tree_edges_raw.items() if v > 0.0}
         active_nodes = set()
         for u, v in tree_edges.keys():
             active_nodes.add(u); active_nodes.add(v)
@@ -1089,6 +1101,8 @@ class LowLevelController:
         之前失败路径直接return，从不调用_archive_request(success=False)，
         导致已分配的BW永远不归还，造成BW虚高（CPU=3.9% BW=36%的根本原因）
         """
+        # [A4] 设置防重入标志，高层 run_episode 检查此标志避免双重回滚
+        self.env._bw_already_rolled_back = True
         if hasattr(self.env, 'resource_mgr') and hasattr(self.env.resource_mgr, '_archive_request'):
             try:
                 self.env.resource_mgr._archive_request(success=False, already_rolled_back=False)
@@ -1102,9 +1116,11 @@ class LowLevelController:
             tree = self.env.current_tree.get('tree', {})
             released = 0
             for (u, v), flow in tree.items():
-                if flow > 0.0:
+                # [BW泄漏修复] flow=0.0 的 _skip_edge 边也扣了 BW，必须归还
+                release_amount = bw if flow == 0.0 else bw * flow
+                if release_amount > 0.0:
                     try:
-                        self.env.resource_mgr.pool.release_bandwidth(u, v, bw * flow)
+                        self.env.resource_mgr.pool.release_bandwidth(u, v, release_amount)
                         released += 1
                     except Exception:
                         pass

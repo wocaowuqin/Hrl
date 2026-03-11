@@ -23,7 +23,10 @@ class HRL_Coordinator:
         self.current_episode = 0
         self.resources_released = False
 
-        self._permanent_unreachable = set()
+        # [A8] _episode_deploy_failed: episode内VNF资源部署失败的节点集合
+        # 语义：本episode内因资源不足(deploy_fail)而封禁，不跨episode；
+        # 与_unreachable_targets区别：后者每个subgoal结束后清空，前者episode内持久封禁
+        self._episode_deploy_failed = set()
 
     def _select_bw_feasible_target(self, target_node, start_node, bw_need, valid_indices, high_mask):
         """
@@ -97,10 +100,10 @@ class HRL_Coordinator:
                 if idx < len(high_mask):
                     high_mask[idx] = 0
 
-        if hasattr(self, '_permanent_unreachable') and self._permanent_unreachable:
-            for idx in self._permanent_unreachable:
+        if hasattr(self, '_episode_deploy_failed') and self._episode_deploy_failed:
+            for idx in self._episode_deploy_failed:
                 if idx < len(high_mask):
-                    high_mask[idx] = 0
+                    high_mask[idx] = 0  # 本episode内资源不足的节点持续封禁
 
         if sum(high_mask) == 0:
             return 0.0, True, {'error': 'no_high_actions'}
@@ -331,9 +334,10 @@ class HRL_Coordinator:
                 episode_done = True
             if truncated_low:
                 if info.get('deploy_fail'):
-                    if not hasattr(self, '_permanent_unreachable'):
-                        self._permanent_unreachable = set()
-                    self._permanent_unreachable.add(target_node)
+                    # [A8] deploy_fail时记入episode级封禁集合，避免高层反复选此节点浪费步数
+                    if not hasattr(self, '_episode_deploy_failed'):
+                        self._episode_deploy_failed = set()
+                    self._episode_deploy_failed.add(target_node)
                 break
 
         actual_end_pos = self.env.current_node_location
@@ -351,7 +355,10 @@ class HRL_Coordinator:
         high_done = episode_done
 
         milestone_reward = self._compute_reward_from_env_info(info)
-        alpha = 0.05 if self.current_episode < 200 else 0.1
+        # [A9] alpha线性增长：前期重milestone引导，后期低层信号逐渐加强
+        # ep=0→0.05, ep=400→0.25, ep>=400封顶0.25
+        # 低层贡献量级：0.05时±2.5（无效），0.25时±12.5（与milestone同量级）
+        alpha = min(0.05 + self.current_episode / 2000.0, 0.25)
         high_reward = milestone_reward + alpha * low_total_reward
 
         if hasattr(self.env, 'low_level_controller') and \
@@ -380,7 +387,7 @@ class HRL_Coordinator:
                     completed, status = self.env.high_level_controller._is_all_tasks_completed()
                     if completed:
                         high_done = True
-                        high_reward += 30.0
+                        high_reward += 40.0  # [A12] 与_compute_reward_from_env_info对齐
                         episode_done = True
                         # ── 分叉多样性奖励 + 树总长奖励 ──────────────
                         try:
@@ -446,7 +453,7 @@ class HRL_Coordinator:
         high_obs = self.env.reset()
 
         self._unreachable_targets = set()
-        self._permanent_unreachable = set()  # 每episode重置，不跨episode封禁节点
+        self._episode_deploy_failed = set()  # [A8] episode级封禁，每episode重置
         self._last_tree_redundancy = 0.0
 
         episode_done = False
@@ -521,13 +528,25 @@ class HRL_Coordinator:
         if episode_success:
             self.resources_released = True
         else:
-            try:
-                if (hasattr(self.env, 'resource_mgr') and
-                        hasattr(self.env.resource_mgr, '_archive_request')):
-                    self.env.resource_mgr._archive_request(
-                        success=False, already_rolled_back=False)
-            except Exception as e:
-                pass
+            # [A4] 防双重回滚：低层 _archive_episode_fail 已设 env._bw_already_rolled_back=True
+            # 若低层已回滚则跳过，避免对同一请求释放两次 BW（会导致剩余BW超过总容量）
+            # 用完后清零，避免影响下一个 episode
+            already_rolled = getattr(self.env, '_bw_already_rolled_back', False)
+            if not already_rolled:
+                try:
+                    if (hasattr(self.env, 'resource_mgr') and
+                            hasattr(self.env.resource_mgr, '_archive_request')):
+                        self.env.resource_mgr._archive_request(
+                            success=False, already_rolled_back=False)
+                        logger.debug("[Coord] 高层兜底回滚BW完成")
+                except Exception as e:
+                    # [A5] 不再静默吞异常，打印警告便于排查资源泄漏
+                    logger.warning(f"[Coord] 高层兜底 _archive_request 失败: {e}，"
+                                   f"BW可能未完全释放，请检查资源状态")
+            else:
+                logger.debug("[Coord] 低层已完成BW回滚，跳过高层重复调用")
+            # 清零标志，避免污染下一个 episode
+            self.env._bw_already_rolled_back = False
 
         self._reset_episode_stats()
 
@@ -611,11 +630,16 @@ class HRL_Coordinator:
             return False
 
     def _compute_reward_from_env_info(self, info):
+        # [A12] 奖励路径重新定价（方案A）：
+        # 修复前：all_vnf_deployed(25)+dest×10+episode_complete(30)=75
+        #         vs 直接episode_complete=30，激励路径不一致
+        # 修复后：all_vnf_deployed(15)+dest×10+episode_complete(40)=75（2 dest）
+        #         直接episode_complete=40，均匀路径且完成任务权重更大
         if not info: return 0.0
         if info.get('episode_complete', False) or info.get('all_destinations_connected', False):
-            return 30.0
+            return 40.0  # 提高：完成全部任务的终态奖励更突出
         if info.get('all_vnf_deployed', False):
-            return 25.0
+            return 15.0  # 降低：减少与episode_complete的重复计分（由25→15）
         if info.get('vnf_deployed', False):
             return 20.0
         elif info.get('dest_connected', False):

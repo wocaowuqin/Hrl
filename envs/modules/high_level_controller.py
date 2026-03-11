@@ -204,10 +204,25 @@ class HighLevelController:
             # ── [FIX SFC] VNF部署节点排除：source / dest / 已部署节点
             # VNF不能部署在source节点（会造成Source=VNF重叠）
             # VNF不能部署在dest节点（会造成VNF=Dest重叠，SFC语义错误）
-            # VNF不能重复部署到同一节点
+            # 同一(node, vnf_idx)不能重复部署，但同节点不同vnf_idx是合法的
             _source = self.env.current_request.get('source', -1) if self.env.current_request else -1
             _dests = set(int(d) for d in self.env.current_request.get('dest', [])) if self.env.current_request else set()
-            _already = set(getattr(self.env, 'chain_nodes', []))
+            # [Bug修复] 原来 _already = set(chain_nodes) 做节点级排除，
+            # 导致同一节点部署第二个不同VNF类型时被错误封禁。
+            # placement key 是 (node, vnf_idx)，合法情况：同一DC节点可承载多个不同VNF。
+            # 修复：只排除"当前这个vnf_idx已经部署在该节点"的节点，
+            # 允许同节点部署不同vnf_idx。
+            _placement = self.env.current_tree.get('placement', {}) if self.env.current_tree else {}
+            _already = {key[0] for key in _placement
+                        if isinstance(key, tuple) and len(key) >= 2
+                        and key[1] == current_vnf_idx}
+
+            # [唯一性约束] 同节点不允许部署相同VNF类型
+            # 预计算：每个节点上已部署的vnf_type集合
+            _current_vnf_type = vnf_list[current_vnf_idx]
+            _node_vnf_types = {}  # node -> set of deployed vnf_types
+            for (pnode, _), pinfo in _placement.items():
+                _node_vnf_types.setdefault(pnode, set()).add(pinfo.get('vnf_type'))
             # [Bug9修复] set迭代顺序不确定，直接用有序的chain_nodes列表取最后一个
             _chain_nodes_ordered = getattr(self.env, 'chain_nodes', [])
 
@@ -246,6 +261,8 @@ class HighLevelController:
                         if node == _source:  continue
                         if node in _dests:   continue
                         if node in _already: continue
+                        # [唯一性约束] 该节点已有相同vnf_type，跳过
+                        if _current_vnf_type in _node_vnf_types.get(node, set()): continue
                         avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
                         avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
                         if avail_cpu >= req_cpu and avail_mem >= req_mem:
@@ -287,6 +304,7 @@ class HighLevelController:
                     # 极端情况：放开位置限制，只保留资源约束
                     for node in self.env.dc_nodes:
                         if 0 <= node < n and node != _source and node not in _dests and node not in _already:
+                            if _current_vnf_type in _node_vnf_types.get(node, set()): continue
                             avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
                             avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
                             if avail_cpu >= req_cpu and avail_mem >= req_mem:
@@ -606,12 +624,16 @@ class HighLevelController:
         phase_feat = 0.0 if is_vnf_phase else 1.0
         # [Bug8修复] resource_tension只看CPU，MEM紧张时不可见
         # 改为取CPU和MEM紧张度的最大值，任一资源紧张都会反映到特征里
+        # [语义修复] VNF只部署在DC节点，非DC节点CPU/MEM从不消耗，
+        # 用全部n个节点计算会稀释紧张度（虚低）。改为只统计DC节点。
         _c_cap_g = max(1.0, float(getattr(self.env.resource_mgr, 'C_cap', 100.0)))
         _m_cap_g = max(1.0, float(getattr(self.env.resource_mgr, 'M_cap', 100.0)))
-        total_avail_cpu = sum([self.env.resource_mgr.pool.get_available_cpu(i) for i in range(n)])
-        total_avail_mem = sum([self.env.resource_mgr.pool.get_available_memory(i) for i in range(n)])
-        cpu_tension = 1.0 - (total_avail_cpu / (n * _c_cap_g))
-        mem_tension = 1.0 - (total_avail_mem / (n * _m_cap_g))
+        _dc_nodes = getattr(self.env.resource_mgr, 'dc_nodes', list(range(n)))
+        _n_dc = max(1, len(_dc_nodes))
+        total_avail_cpu = sum(self.env.resource_mgr.pool.get_available_cpu(i) for i in _dc_nodes)
+        total_avail_mem = sum(self.env.resource_mgr.pool.get_available_memory(i) for i in _dc_nodes)
+        cpu_tension = 1.0 - (total_avail_cpu / (_n_dc * _c_cap_g))
+        mem_tension = 1.0 - (total_avail_mem / (_n_dc * _m_cap_g))
         resource_tension = max(cpu_tension, mem_tension)
 
         global_attr = torch.tensor([[

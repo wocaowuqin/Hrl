@@ -435,6 +435,8 @@ class RequestLifecycleManager:
                 vnf_list = info['request'].get('vnf', [])
                 vnf_type = vnf_list[vnf_idx] if vnf_idx < len(vnf_list) else vnf_idx
                 self.resource_manager.release_node_resource(node, vnf_type, cpu_used, mem_used)
+                cpu_rel += cpu_used  # [B3修复] 累加统计，原来遗漏导致 cpu_rel 永远为 0
+                mem_rel += mem_used  # [B3修复] 同上
 
         # 释放链路资源
         tree = resources.get('tree', {})
@@ -442,9 +444,14 @@ class RequestLifecycleManager:
         for edge_key, flow in tree.items():
             if isinstance(edge_key, tuple) and len(edge_key) == 2:
                 u, v = edge_key
+                # [BW泄漏修复] flow=0.0 是 _skip_edge 边标记：
+                # BW 在 _handle_movement 里已经实际扣除（allocate_bandwidth），
+                # 只是不计入多播树结构（不应参与 redundancy 统计）。
+                # 释放时必须归还，否则 BW 永久泄漏。
                 if flow == 0.0:
-                    continue  # flow=0表示仅记录路径，未实际分配BW，跳过释放
-                bw_used = bw_needed * flow  # flow=1.0时释放实际BW
+                    bw_used = bw_needed  # _skip_edge 边扣了完整的 bw_needed
+                else:
+                    bw_used = bw_needed * flow  # flow=1.0时释放实际BW
                 try:
                     self.resource_manager.release_link_resource(u, v, bw_used)
                     bw_rel += bw_used
@@ -571,16 +578,23 @@ class RequestHandler:
 
                 for key, alloc in placement.items():
                     if isinstance(key, tuple) and len(key) >= 2:
-                        node, vnf_t = key[0], key[1]
+                        node, vnf_idx = key[0], key[1]
                         cpu = alloc.get('cpu_used', 1.0)
                         mem = alloc.get('mem_used', 1.0)
+                        # [B1修复] 原来直接用 key[1]（vnf_idx=0,1,2）作为 vnf_type 传入，
+                        # 但 hvt_all 下标用的是真实类型值（如 3,6,1），导致回滚时减错位置。
+                        # 与 lifecycle 路径对齐：先从 request['vnf'] 转换为真实类型值。
+                        vnf_list = self.rm.current_request.get('vnf', [])
+                        vnf_t = vnf_list[vnf_idx] if vnf_idx < len(vnf_list) else vnf_idx
                         self.rm.release_node_resource(node, vnf_t, cpu, mem)
                 for edge_key, flow in tree.items():
                     if isinstance(edge_key, tuple) and len(edge_key) == 2:
                         u, v = edge_key
+                        # [BW泄漏修复] flow=0.0 是 _skip_edge 边：BW 已实际扣除，回滚时必须释放
                         if flow == 0.0:
-                            continue  # 未实际分配，跳过
-                        self.rm.release_link_resource(u, v, bw * flow)
+                            self.rm.release_link_resource(u, v, bw)
+                        else:
+                            self.rm.release_link_resource(u, v, bw * flow)
             logger.debug(f"[Archive] 请求 {req_id} 失败归档")
 
     def complete_current_request(self):
@@ -631,13 +645,18 @@ class RequestHandler:
             if not self.rm.check_node_resource(node, vnf_t, cpu_need, mem_need):
                 return False
 
+        allocated = []  # [B2修复] 记录已分配节点，失败时回滚
         for node, vnf_t in np.argwhere(hvt_branch > 0):
             node = int(node)
             vnf_t = int(vnf_t)
             cpu_need = cpu_reqs[vnf_t] if vnf_t < len(cpu_reqs) else 0
             mem_need = mem_reqs[vnf_t] if vnf_t < len(mem_reqs) else 0
             if not self.rm.allocate_node_resource(node, vnf_t, cpu_need, mem_need):
+                # [B2修复] 回滚前面已分配的节点，避免 CPU/MEM 泄漏
+                for r_node, r_vnf_t, r_cpu, r_mem in allocated:
+                    self.rm.release_node_resource(r_node, r_vnf_t, r_cpu, r_mem)
                 return False
+            allocated.append((node, vnf_t, cpu_need, mem_need))
             self.rm.vnf_instances.append({
                 'req_id': request.get('id', -1),
                 'node': node,
@@ -847,7 +866,9 @@ class FusedResourceManager:
         if mem_need > 0 and not self.pool.allocate_memory(node, mem_need):
             self.pool.release_cpu(node, cpu_need)
             return False
-        self.hvt_all[node, vnf_type] += 1  # 仍更新hvt_all，供状态特征使用
+        # [B6修复] vnf_type 来自请求数据，值域未验证，越界会在 CPU/MEM 已扣后抛 IndexError
+        if 0 <= vnf_type < self.K_vnf:
+            self.hvt_all[node, vnf_type] += 1
         return True
 
     def allocate_link_resource(self, u: int, v: int, bw_need: float) -> bool:
@@ -860,7 +881,8 @@ class FusedResourceManager:
         if node < 0 or node >= self.n:
             return
         # 直接归还物理资源（未启用VNF复用）
-        if vnf_type >= 0 and self.hvt_all[node, vnf_type] > 0:
+        # [B6修复] 同 allocate_node_resource，越界检查保护 hvt_all
+        if 0 <= vnf_type < self.K_vnf and self.hvt_all[node, vnf_type] > 0:
             self.hvt_all[node, vnf_type] = max(0, self.hvt_all[node, vnf_type] - 1)
         if cpu_val > 0:
             self.pool.release_cpu(node, cpu_val)
@@ -953,6 +975,8 @@ class FusedResourceManager:
         """
         # 只清 reserved（未提交事务的预留残留），不动 avail 和 lifecycle
         # hvt_all、vnf_instances 保持不变，lifecycle 释放时会自己维护
+        # current_tree / current_request / next_vnf_idx / nodes_on_tree
+        # 由 env.reset() 在 episode_reset() 之后统一覆盖，此处不清空。
         self.pool.reset(hard=False)
         logger.debug("[FusedRM] Episode软重置完成 (lifecycle/hvt/instances保留)")
 
