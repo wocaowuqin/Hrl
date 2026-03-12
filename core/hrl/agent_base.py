@@ -49,17 +49,32 @@ class HRLAgentBase:
         self.adaptive_epsilon = hrl_cfg.get('adaptive_epsilon', True)
         self.min_epsilon_low = 0.01
 
-        # ── Encoder (重构为 TreeTransformerEncoder) ──────────────────────
-        from core.gnn.tree_transformer_encoder import TreeTransformerEncoder
-        self.encoder = TreeTransformerEncoder(
-            node_dim=21,
-            edge_dim=5,
-            hidden_dim=self.hidden_dim
-        ).to(self.device)
+        # ── Encoder (支持消融实验) ────────────────────────────────────────
+        _ablation_variant = kwargs.get('ablation_variant', 'full')
+        # req_dim：请求特征维度 [bw, avg_cpu, avg_mem]，默认3；配置为0可关闭
+        _req_dim = config.get('gnn', {}).get('req_dim', 3)
+        _node_dim = config.get('gnn', {}).get('node_feat_dim', 24)
+        if _ablation_variant == 'full':
+            from core.gnn.tree_transformer_encoder import TreeTransformerEncoder
+            self.encoder = TreeTransformerEncoder(
+                node_dim=_node_dim,
+                edge_dim=5,
+                hidden_dim=self.hidden_dim,
+                req_dim=_req_dim,
+            ).to(self.device)
+        else:
+            from core.gnn.ablation_encoder import AblationEncoder
+            self.encoder = AblationEncoder(
+                node_dim=_node_dim,
+                edge_dim=5,
+                hidden_dim=self.hidden_dim,
+                variant=_ablation_variant,
+                req_dim=_req_dim,
+            ).to(self.device)
 
         for param in self.encoder.parameters():
             param.requires_grad = True
-        logger.info("✅ 已挂载 Tree-Aware Dual GNN Encoder")
+        logger.info(f"✅ 已挂载 Encoder (variant={_ablation_variant})")
 
         # ── High-Level Policy ─────────────────────────────────────────────
         from core.hrl.high_policy import HighLevelPolicy
@@ -118,7 +133,13 @@ class HRLAgentBase:
         self.epsilon_low_end = float(epsilon_cfg.get('final_low', epsilon_cfg.get('final', 0.05)))
         self.epsilon_low = self.epsilon_low_start
         self.epsilon_decay = float(epsilon_cfg.get('decay_steps', 50000))
-        self.epsilon_decay_episodes = int(epsilon_cfg.get('decay_episodes', 300))
+        # 优先用decay_episodes，没有则从decay_steps换算（假设每episode平均约15步）
+        if 'decay_episodes' in epsilon_cfg:
+            self.epsilon_decay_episodes = int(epsilon_cfg['decay_episodes'])
+        else:
+            _steps = float(epsilon_cfg.get('decay_steps', 50000))
+            self.epsilon_decay_episodes = max(100, int(_steps / 15))
+        logger.info(f"✅ epsilon_decay_episodes={self.epsilon_decay_episodes} (from decay_steps={self.epsilon_decay})")
         self.total_episodes = 0
 
         # ── Replay Buffer ─────────────────────────────────────────────────
@@ -136,7 +157,7 @@ class HRLAgentBase:
             self._ep_transitions = []
             logger.info("✅ [SDG-HRL] PER + EliteBuffer 已启用")
         except ImportError as _e:
-            logger.warning(f"⚠️ PER未找到，回退到deque: {_e}")
+
             self.high_memory = deque(maxlen=buffer_size // 2)
             self.low_memory = deque(maxlen=buffer_size)
             self.elite_buffer = None

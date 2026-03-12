@@ -130,22 +130,37 @@ class GoalConditionedLowLevelPolicy(nn.Module):
         with torch.no_grad():
             logits, value = self.forward(state_emb, goal_emb, action_mask)
 
+            # 预先提取合法动作列表（探索和贪心路径共用）
+            if action_mask is not None:
+                valid_actions = (action_mask.squeeze() > 0).nonzero(as_tuple=True)[0]
+            else:
+                valid_actions = torch.arange(logits.size(-1), device=logits.device)
+
             # 引入 epsilon-greedy 探索机制
             if epsilon > 0.0 and random.random() < epsilon:
-                # 随机探索
-                if action_mask is not None:
-                    valid_actions = (action_mask.squeeze() > 0).nonzero(as_tuple=True)[0]
-                    if len(valid_actions) > 0:
-                        idx = random.randint(0, len(valid_actions) - 1)
-                        action = valid_actions[idx]  # 这里直接提取是 0-dim tensor
-                    else:
-                        # 兜底机制：如果没有合法动作，只能走最高分
-                        action = torch.argmax(logits, dim=-1).squeeze()
+                # 随机探索：从合法动作中随机选
+                if len(valid_actions) > 0:
+                    idx = random.randint(0, len(valid_actions) - 1)
+                    action = valid_actions[idx]
                 else:
-                    action = torch.tensor(random.randint(0, logits.size(-1) - 1), device=logits.device)
+                    # Mask 全0：env 侧问题，返回 -1 让上游感知（不强行选非法节点）
+                    logger.warning("[LowPolicy] action_mask 全0，无合法动作，返回-1")
+                    action = torch.tensor(-1, device=logits.device)
             else:
-                # 贪心选择最高分的动作索引，squeeze() 后是一个 0-dim tensor
+                # 贪心：argmax 在 masked logits 上选（非法动作已被填 -inf）
                 action = torch.argmax(logits, dim=-1).squeeze()
+                # 二次校验：若选出的动作仍非法（理论上不应发生，防御性检查）
+                if len(valid_actions) > 0 and action not in valid_actions:
+                    logger.warning(
+                        f"[LowPolicy] 贪心选中非法动作 {action.item()}，"
+                        f"强制修正为最高Q的合法动作"
+                    )
+                    # 从 valid_actions 中选 Q 值最高的
+                    valid_logits = logits.squeeze()[valid_actions]
+                    action = valid_actions[valid_logits.argmax()]
+                elif len(valid_actions) == 0:
+                    logger.warning("[LowPolicy] action_mask 全0，无合法动作，返回-1")
+                    action = torch.tensor(-1, device=logits.device)
 
             return action, value
 

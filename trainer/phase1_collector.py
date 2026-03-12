@@ -24,7 +24,7 @@ class Phase1ExpertCollector:
     5. **构造准确的资源分配记录**：从 vnf_instances 中提取 CPU/MEM 用量，确保节点资源被正确释放
     """
 
-    def __init__(self, env, expert_solver, output_dir: str, max_episodes: int = 5000,
+    def __init__(self, env, expert_solver, output_dir: str, max_episodes: int = 15000,
                  save_every: int = 500, use_timeslot: bool = True):
         self.env = env
         self.expert = expert_solver
@@ -237,71 +237,64 @@ class Phase1ExpertCollector:
         return self.stats
 
     def _build_graph_state(self, request, nodes_on_tree, current_tree, served_dest_count):
-        rm = self.env.resource_mgr
-        n = rm.n
-        K = rm.K_vnf
-        node_feat_dim = getattr(rm, 'node_feat_dim', 17)
-        edge_feat_dim = getattr(rm, 'edge_feat_dim', 5)
-        request_dim = getattr(rm, 'request_dim', 24)
+        """
+        复用 env.get_state() 获取状态，保证与 Phase3 特征完全一致（21维节点特征）。
+        同时携带 tree_edge_index 和 dest_mask，确保 IL 预训练时树流和目标感知正常工作。
+        """
+        # ← 就加在这里，第一行
+        self.env.current_node_location = request.get('source', 0)
 
-        # 节点特征
-        node_feats = []
-        for i in range(n):
-            cpu_avail = rm.pool.get_available_cpu(i) / max(rm.C_cap, 1.0)
-            mem_avail = rm.pool.get_available_memory(i) / max(rm.M_cap, 1.0)
-            on_tree = 1.0 if i in nodes_on_tree else 0.0
-            is_dest = 1.0 if i in request.get('dest', []) else 0.0
-            served = 1.0 if (i in request.get('dest', []) and i in nodes_on_tree) else 0.0
+        # 临时设置环境状态，让 low_level_controller.get_state() 能感知当前树和请求
+        self.env.current_request = request
+        self.env.current_tree = {
+            'tree': current_tree.get('tree', {}),
+            'hvt': current_tree.get('hvt', np.zeros((self.env.n, self.env.K_vnf))),
+            'connected_dests': set(
+                n for n in nodes_on_tree if n in request.get('dest', [])
+            ),
+            'nodes': nodes_on_tree.copy(),
+        }
 
-            hvt_row = rm.hvt_all[i].copy()
-            if hvt_row.max() > 0:
-                hvt_row = hvt_row / hvt_row.max()
-            hvt_list = hvt_row.tolist()
+        state_data = self.env.get_state()
 
-            degree = len(rm.get_neighbors(i)) / (n - 1) if n > 1 else 0.0
-            is_dc = 1.0 if i in rm.dc_nodes else 0.0
+        x          = state_data.x
+        edge_index = state_data.edge_index
+        edge_attr  = state_data.edge_attr
 
-            feat = [cpu_avail, mem_avail, on_tree, is_dest, served] + hvt_list + [degree, is_dc]
-            if len(feat) < node_feat_dim:
-                feat.extend([0.0] * (node_feat_dim - len(feat)))
-            else:
-                feat = feat[:node_feat_dim]
-            node_feats.append(feat)
+        # ── tree_edge_index ──────────────────────────────────────────────
+        # get_state() 已经构建好，直接取出；若为 None（空树）则保持 None，
+        # 下游 encoder 会退化为 self-loop（与 Phase3 推断时的行为一致）
+        tree_edge_index = getattr(state_data, 'tree_edge_index', None)
 
-        x = torch.tensor(node_feats, dtype=torch.float)
+        # ── dest_mask ────────────────────────────────────────────────────
+        # 从 request.dest 中取剩余未连接的目的地，构建 bool 掩码 [N]
+        dest_mask = getattr(state_data, 'dest_mask', None)
+        if dest_mask is None:
+            # 兜底：手动构建（get_state 返回的 Data 结构不含 dest_mask 字段时）
+            n = x.size(0)
+            all_dests  = set(int(d) for d in request.get('dest', []))
+            conn_dests = self.env.current_tree.get('connected_dests', set())
+            remaining  = all_dests - conn_dests
+            dest_mask  = torch.zeros(n, dtype=torch.bool)
+            for d in remaining:
+                if 0 <= d < n:
+                    dest_mask[d] = True
 
-        # 边特征
-        edge_index = torch.tensor(rm.edge_index, dtype=torch.long)
-        edge_attr = []
-        for u, v in zip(rm.edge_index[0], rm.edge_index[1]):
-            bw_avail = rm.pool.get_available_bandwidth(u, v) / max(rm.B_cap, 1.0)
-            edge_attr.append([bw_avail, 0.0, 0.0, 0.0, 0.0])
-        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+        # ── req_vec ──────────────────────────────────────────────────────
+        # 与 agent_action._build_req_vec 保持一致：[bw, avg_cpu, avg_mem]（3维）
+        # 原来是 torch.zeros(24) 硬编码，Phase2 和 Phase3 语义完全不同，现已修正
+        try:
+            bw      = float(request.get('bw_origin', request.get('bandwidth', 0.0)))
+            cpu_lst = request.get('cpu_origin', request.get('cpu', []))
+            mem_lst = request.get('memory_origin', request.get('memory', []))
+            avg_cpu = float(np.mean(cpu_lst)) if len(cpu_lst) > 0 else 0.0
+            avg_mem = float(np.mean(mem_lst)) if len(mem_lst) > 0 else 0.0
+            req_vec = torch.tensor([[bw, avg_cpu, avg_mem]], dtype=torch.float32)
+        except Exception:
+            req_vec = torch.zeros(1, 3, dtype=torch.float32)
 
-        # 请求特征
-        dest_list = request.get('dest', [])
-        vnf_list = request.get('vnf', [])
-        req_vec = [
-            request.get('source', 0) / n,
-            len(dest_list) / n,
-            len(vnf_list) / K,
-            served_dest_count / max(1, len(dest_list)),
-            request.get('bandwidth', 1.0) / rm.B_cap,
-        ]
-        vnf_hist = [0.0] * K
-        for v in vnf_list:
-            if 0 <= v < K:
-                vnf_hist[v] += 1.0
-        if vnf_list:
-            vnf_hist = [cnt / len(vnf_list) for cnt in vnf_hist]
-        req_vec.extend(vnf_hist)
+        return x, edge_index, edge_attr, req_vec, tree_edge_index, dest_mask
 
-        while len(req_vec) < request_dim:
-            req_vec.append(0.0)
-        req_vec = req_vec[:request_dim]
-        req_vec = torch.tensor(req_vec, dtype=torch.float)
-
-        return x, edge_index, edge_attr, req_vec
 
     def _process_single_request(self, raw_req, pbar):
         self.stats["requests"] += 1
@@ -321,16 +314,42 @@ class Phase1ExpertCollector:
             print(f"带宽: {req.get('bandwidth')}")
 
         # 时间槽驱动释放
+        current_slot = req.get('time_slot', 0)
         if self.use_timeslot:
-            current_slot = req.get('time_slot', 0)
             if current_slot != self.timeslot_stats['current_time_slot']:
                 self.timeslot_stats['current_time_slot'] = current_slot
                 self.timeslot_stats['total_time_slots'] += 1
                 try:
                     if hasattr(self.env.resource_mgr, 'request_manager'):
                         self.env.resource_mgr.request_manager.check_and_release_expired(current_slot)
+                        logger.debug(f"[Phase1] 时间槽切换到 {current_slot}，释放过期请求")
                 except Exception as e:
                     logger.debug(f"生命周期释放失败: {e}")
+
+        # 兜底释放：按 leave_time_slot 精确释放已到期的请求，避免资源耗尽
+        try:
+            if hasattr(self.env.resource_mgr, 'request_manager'):
+                rm = self.env.resource_mgr.request_manager
+                # 找出所有已到期的请求（leave_time_slot <= current_slot）
+                expired_ids = []
+                if hasattr(rm, 'active_requests'):
+                    for rid, rinfo in list(rm.active_requests.items()):
+                        leave_slot = rinfo.get('leave_time_slot',
+                                    rinfo.get('req', {}).get('leave_time_slot', None))
+                        if leave_slot is not None and leave_slot <= current_slot:
+                            expired_ids.append(rid)
+                for rid in expired_ids:
+                    self.env.resource_mgr.remove_request(rid)
+                    logger.debug(f"[Phase1] 精确释放过期请求 {rid}")
+
+                # 终极兜底：若活跃请求数超过20，强制释放最早的一半
+                if hasattr(rm, 'active_requests') and len(rm.active_requests) > 20:
+                    all_ids = list(rm.active_requests.keys())
+                    for rid in all_ids[:len(all_ids) // 2]:
+                        self.env.resource_mgr.remove_request(rid)
+                    logger.debug(f"[Phase1] 活跃请求过多，强制释放一半")
+        except Exception as e:
+            logger.debug(f"兜底精确释放失败: {e}")
 
         # 专家求解
         req_for_solver = req.copy()
@@ -437,24 +456,10 @@ class Phase1ExpertCollector:
                         if len(path_nodes) < 2:
                             continue
                         path_0based = [int(n - 1 if n > 0 else 0) for n in path_nodes]
-                        subgoal_0   = path_0based[-1]
+                        subgoal_0 = path_0based[-1]
 
-                        # paths_map 的 key 是 solver 内部 1-based 目的地节点ID，转为 0-based
-                        dest_node_0 = int(dest_key) - 1
-
-                        if dest_node_0 in dest_list:
-                            # 正常情况：该路径对应一个 dest，high_label = 其在链中的顺序
-                            hl = dest_list.index(dest_node_0)
-                        else:
-                            # dest_key 已经是 0-based（env 传进来的情况）
-                            if dest_node_0 + 1 in dest_list:
-                                hl = dest_list.index(dest_node_0 + 1)
-                            elif int(dest_key) in dest_list:
-                                hl = dest_list.index(int(dest_key))
-                            else:
-                                # 真正的非目的地路径（VNF 部署路径）
-                                # 用路径终点 subgoal 再查一次
-                                hl = dest_list.index(subgoal_0) if subgoal_0 in dest_list else 0
+                        # high_label = 路径终点节点ID（0~27），与 high_policy 输出维度28对齐
+                        hl = subgoal_0
 
                         traj_paths.append((path_0based, hl, subgoal_0))
 
@@ -464,27 +469,32 @@ class Phase1ExpertCollector:
                             path_1based = action_data.get('path', [])
                             if len(path_1based) >= 2:
                                 path_0based = [int(n - 1 if n > 0 else 0) for n in path_1based]
-                                subgoal_0   = path_0based[-1]
+                                subgoal_0 = path_0based[-1]
                                 if subgoal_0 not in existing_sg:
-                                    hl = dest_list.index(subgoal_0) if subgoal_0 in dest_list else 0
+                                    hl = subgoal_0  # high_label = 节点ID
                                     traj_paths.append((path_0based, hl, subgoal_0))
                                     existing_sg.add(subgoal_0)
-
                     print(f"[DEBUG] req {req.get('id')}: paths_map keys = {list(paths_map.keys())}")
                     print(f"[DEBUG] req {req.get('id')}: traj_paths 数量 = {len(traj_paths)}")
 
                     for path_idx, (path_0, high_label, subgoal_node) in enumerate(traj_paths):
                         try:
-                            x, edge_index, edge_attr, req_vec = self._build_graph_state(
-                                request=req,
-                                nodes_on_tree=nodes_on_tree_so_far,
-                                current_tree=current_tree_for_state,
-                                served_dest_count=served_dest_count
-                            )
+                            x, edge_index, edge_attr, req_vec, tree_edge_index, dest_mask = \
+                                self._build_graph_state(
+                                    request=req,
+                                    nodes_on_tree=nodes_on_tree_so_far,
+                                    current_tree=current_tree_for_state,
+                                    served_dest_count=served_dest_count
+                                )
                             print(f"[DEBUG] path {path_idx}: _build_graph_state 成功")
+                            # 携带 tree_edge_index 和 dest_mask，Phase2 训练时树流和目标感知正常工作
                             state_to_save = Data(
-                                x=x.cpu(), edge_index=edge_index.cpu(),
-                                edge_attr=edge_attr.cpu(), req_vec=req_vec.cpu()
+                                x=x.cpu(),
+                                edge_index=edge_index.cpu(),
+                                edge_attr=edge_attr.cpu(),
+                                req_vec=req_vec.cpu(),
+                                tree_edge_index=tree_edge_index.cpu() if tree_edge_index is not None else None,
+                                dest_mask=dest_mask.cpu() if dest_mask is not None else None,
                             )
                         except Exception as e:
                             print(f"[ERROR] path {path_idx}: 构建图状态失败: {e}")

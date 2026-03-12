@@ -31,18 +31,34 @@ class HighLevelController:
             if current_vnf_idx < len(vnf_list):
                 dc_nodes = getattr(self.env, 'dc_nodes', set())
                 if dc_nodes and target_node_id not in dc_nodes:
-                    # 从mask中找第一个合法DC节点替换
+                    # [Bug4修复] set_high_level_goal 调用时 phase/next_vnf_idx 可能尚未
+                    # 切换到最新状态（特别是低层刚完成VNF但高层还未同步时），
+                    # 直接调 get_high_level_action_mask 可能在旧phase下产生错误mask。
+                    # 修复：先强制同步phase状态，再计算mask，保证mask在正确context下运行。
+                    if current_vnf_idx >= len(vnf_list):
+                        self.env.current_phase = 'destination_connection'
+                        self.env.current_deployment_target = None
+                    else:
+                        self.env.current_phase = 'vnf_deployment'
                     mask = self.get_high_level_action_mask()
-                    dc_fallback = next(
-                        (n for n in range(self.env.n) if mask[n] > 0 and n in dc_nodes),
-                        None
-                    )
-                    if dc_fallback is not None:
+                    # [Bug5修复] 按离当前位置最近的合法DC替换，而非按节点编号取第一个
+                    # 原来从小到大取第一个会导致所有被拦截的VNF都堆在节点0
+                    _cur_loc = getattr(self.env, 'current_node_location', 0)
+                    _llc_ref = getattr(self.env, 'low_level_controller', None)
+                    _best_fallback = None
+                    _best_dist = 9999
+                    for _n in range(self.env.n):
+                        if mask[_n] > 0 and _n in dc_nodes:
+                            _d = _llc_ref._get_hop_distance(_cur_loc, _n) if _llc_ref else 9999
+                            if _d < _best_dist:
+                                _best_dist = _d
+                                _best_fallback = _n
+                    if _best_fallback is not None:
                         logger.warning(
                             f"🛡️ [High.set_goal] VNF阶段目标 {target_node_id} 非DC节点，"
-                            f"强制替换为 {dc_fallback}"
+                            f"强制替换为最近合法DC {_best_fallback}（hop={_best_dist}）"
                         )
-                        target_node_id = dc_fallback
+                        target_node_id = _best_fallback
                     else:
                         logger.error(f"❌ [High.set_goal] 无可用DC节点可替换目标 {target_node_id}")
 
@@ -112,8 +128,11 @@ class HighLevelController:
             )
             return None, -10.0, True, False, {'no_valid_action': True, 'phase': phase}
 
-        target_node = getattr(self.env, 'current_subgoal_node', int(action_idx))
-        target_node = int(target_node)
+        # [Bug1修复] current_subgoal_node 是上一轮 set_high_level_goal 写入的值，
+        # step_high_level 调用时 set_high_level_goal 还没有执行，
+        # 读到的是上一轮目标 → target_node in connected 判断完全错位。
+        # 修复：直接用本次 action_idx 作为 target_node。
+        target_node = int(action_idx)
         self.current_high_action = target_node
 
         connected = set()
@@ -185,20 +204,56 @@ class HighLevelController:
             # ── [FIX SFC] VNF部署节点排除：source / dest / 已部署节点
             # VNF不能部署在source节点（会造成Source=VNF重叠）
             # VNF不能部署在dest节点（会造成VNF=Dest重叠，SFC语义错误）
-            # VNF不能重复部署到同一节点
+            # 同一(node, vnf_idx)不能重复部署，但同节点不同vnf_idx是合法的
             _source = self.env.current_request.get('source', -1) if self.env.current_request else -1
             _dests = set(int(d) for d in self.env.current_request.get('dest', [])) if self.env.current_request else set()
-            _already = set(getattr(self.env, 'chain_nodes', []))
+            # [Bug修复] 原来 _already = set(chain_nodes) 做节点级排除，
+            # 导致同一节点部署第二个不同VNF类型时被错误封禁。
+            # placement key 是 (node, vnf_idx)，合法情况：同一DC节点可承载多个不同VNF。
+            # 修复：只排除"当前这个vnf_idx已经部署在该节点"的节点，
+            # 允许同节点部署不同vnf_idx。
+            _placement = self.env.current_tree.get('placement', {}) if self.env.current_tree else {}
+            _already = {key[0] for key in _placement
+                        if isinstance(key, tuple) and len(key) >= 2
+                        and key[1] == current_vnf_idx}
+
+            # [唯一性约束] 同节点不允许部署相同VNF类型
+            # 预计算：每个节点上已部署的vnf_type集合
+            _current_vnf_type = vnf_list[current_vnf_idx]
+            _node_vnf_types = {}  # node -> set of deployed vnf_types
+            for (pnode, _), pinfo in _placement.items():
+                _node_vnf_types.setdefault(pnode, set()).add(pinfo.get('vnf_type'))
+            # [Bug9修复] set迭代顺序不确定，直接用有序的chain_nodes列表取最后一个
+            _chain_nodes_ordered = getattr(self.env, 'chain_nodes', [])
 
             if hasattr(self.env, 'dc_nodes'):
                 _llc = getattr(self.env, 'low_level_controller', None)
-                # 前进约束：第k个VNF离source的距离 必须 > 第k-1个VNF离source的距离
-                # 保证spine沿 source→dest 方向单调推进，不回绕
-                _prev_vnf = (list(_already)[-1] if _already
+                # ── [方案B] SFC顺序约束 ──────────────────────────────────────────────
+                # 约束：dist(candidate→nearest_dest) < dist(prev_vnf→nearest_dest)
+                # 语义：candidate必须比prev_vnf更靠近dest，保证prev_vnf→candidate→dest物理顺序
+                # ──────────────────────────────────────────────────────────────────────
+                # [Bug9修复] 用_chain_nodes_ordered[-1]而非list(set)[-1]
+                _prev_vnf = (_chain_nodes_ordered[-1] if _chain_nodes_ordered
                              else (_source if _source != -1 else None))
-                _dist_prev_from_src = (_llc._get_hop_distance(_source, _prev_vnf)
-                                       if _llc and _prev_vnf is not None and _source != -1
-                                       else 0)
+
+                # [Bug2修复] _llc不可用时无法计算顺序约束，直接走纯资源约束 fallback
+                # 第一个VNF（_chain_nodes_ordered为空）且source有效时：prev_vnf=source，
+                # 顺序约束正常工作；source==-1时跳过顺序约束只做资源过滤
+                _can_use_order_constraint = (_llc is not None and _prev_vnf is not None and bool(_dests))
+
+                if _can_use_order_constraint:
+                    # 一次性预计算prev_vnf到各dest的距离，避免mask循环里反复重建图（Bug7前置优化）
+                    _dist_prev_to_dests = {}
+                    _nearest_dest_dist_prev = 9999
+                    for _d in _dests:
+                        _dd = _llc._get_hop_distance(_prev_vnf, _d)
+                        _dist_prev_to_dests[_d] = _dd
+                        if _dd < _nearest_dest_dist_prev:
+                            _nearest_dest_dist_prev = _dd
+                else:
+                    _dist_prev_to_dests = {}
+                    _nearest_dest_dist_prev = 9999
+
                 _strict_mask = np.zeros(n, dtype=np.float32)
                 _loose_mask  = np.zeros(n, dtype=np.float32)
                 for node in self.env.dc_nodes:
@@ -206,31 +261,54 @@ class HighLevelController:
                         if node == _source:  continue
                         if node in _dests:   continue
                         if node in _already: continue
+                        # [唯一性约束] 该节点已有相同vnf_type，跳过
+                        if _current_vnf_type in _node_vnf_types.get(node, set()): continue
                         avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
                         avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
                         if avail_cpu >= req_cpu and avail_mem >= req_mem:
-                            _dist_node = (_llc._get_hop_distance(_source, node)
-                                          if _llc and _source != -1 else 0)
-                            # 严格前进：离source更远
-                            if _dist_node > _dist_prev_from_src:
-                                _strict_mask[node] = 1.0
-                            # 宽松：至少一样远（fallback用）
-                            if _dist_node >= _dist_prev_from_src:
+                            if not _can_use_order_constraint:
+                                # _llc不可用：跳过顺序约束，只保留资源过滤
                                 _loose_mask[node] = 1.0
-                # 优先严格前进；若无节点满足则退回宽松；再无则不限制
+                                continue
+
+                            _prev_to_node = _llc._get_hop_distance(_prev_vnf, node)
+
+                            # 计算candidate到最近dest的距离
+                            _nearest_dest_dist_node = 9999
+                            for _d in _dests:
+                                _dd = _llc._get_hop_distance(node, _d)
+                                if _dd < _nearest_dest_dist_node:
+                                    _nearest_dest_dist_node = _dd
+
+                            # 严格约束：candidate在prev_vnf→某dest的最短路径上
+                            _on_shortest_path = False
+                            for _d in _dests:
+                                _d_prev = _dist_prev_to_dests.get(_d, 9999)
+                                _d_node = _llc._get_hop_distance(node, _d)
+                                if _prev_to_node + _d_node == _d_prev:
+                                    _on_shortest_path = True
+                                    break
+
+                            if _on_shortest_path:
+                                _strict_mask[node] = 1.0
+                            # 宽松fallback：至少比prev_vnf更靠近dest
+                            if _nearest_dest_dist_node < _nearest_dest_dist_prev:
+                                _loose_mask[node] = 1.0
+
+                # 优先严格前进；若无节点满足则退回宽松；再无则纯资源约束
                 if np.sum(_strict_mask) > 0:
                     mask = _strict_mask
                 elif np.sum(_loose_mask) > 0:
                     mask = _loose_mask
                 else:
-                    # 极端情况：全部DC都在source附近，放开限制
+                    # 极端情况：放开位置限制，只保留资源约束
                     for node in self.env.dc_nodes:
                         if 0 <= node < n and node != _source and node not in _dests and node not in _already:
+                            if _current_vnf_type in _node_vnf_types.get(node, set()): continue
                             avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
                             avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
                             if avail_cpu >= req_cpu and avail_mem >= req_mem:
                                 mask[node] = 1.0
-
             if np.sum(mask) == 0:
                 logger.warning("⚠️ [Mask] 所有DC节点资源不足，返回全0")
                 return np.zeros(n, dtype=np.float32)
@@ -271,12 +349,18 @@ class HighLevelController:
 
     def get_high_level_state_graph(self):
         n = self.env.n
+        # [Bug3修复] 高层与低层共用同一encoder（main.py: high_agent=agent=low_agent），
+        # 高层状态图节点特征维度必须与encoder的node_dim一致，否则维度崩溃。
+        # 动态从env.config读取，与low_level_controller._build_node_features保持同步。
+        _node_feat_dim = 11  # fallback：保留原有维度（独立encoder场景）
+        if hasattr(self.env, 'config'):
+            _node_feat_dim = self.env.config.get('gnn', {}).get('node_feat_dim', 11)
 
         if not self.env.current_request:
             return Data(
-                x=torch.zeros((n, 11), dtype=torch.float32),
+                x=torch.zeros((n, _node_feat_dim), dtype=torch.float32),
                 edge_index=torch.zeros((2, 0), dtype=torch.long),
-                edge_attr=torch.zeros((0, 2), dtype=torch.float32),
+                edge_attr=torch.zeros((0, 5), dtype=torch.float32),
                 global_attr=torch.zeros((1, 5), dtype=torch.float32)
             )
 
@@ -323,11 +407,16 @@ class HighLevelController:
             try:
                 avail_cpu = self.env.resource_mgr.pool.get_available_cpu(node)
                 avail_mem = self.env.resource_mgr.pool.get_available_memory(node)
-                norm_cpu = avail_cpu / 100.0
-                norm_mem = avail_mem / 100.0
+                # [Bug10修复] 用实际cap归一化，与low_level_controller._build_node_features一致
+                # M_cap=80时除100会导致值>1，且与低层特征分布不一致
+                _c_cap = max(1.0, float(getattr(self.env.resource_mgr, 'C_cap', 100.0)))
+                _m_cap = max(1.0, float(getattr(self.env.resource_mgr, 'M_cap', 100.0)))
+                norm_cpu = min(avail_cpu / _c_cap, 1.0)
+                norm_mem = min(avail_mem / _m_cap, 1.0)
             except:
                 norm_cpu, norm_mem = 0.5, 0.5
                 avail_cpu, avail_mem = 50.0, 50.0
+                _c_cap, _m_cap = 100.0, 100.0
 
             features = [norm_cpu, norm_mem]
             features.append(1.0 if node == source else 0.0)
@@ -385,36 +474,79 @@ class HighLevelController:
                 else:
                     pending_dests = [d for d in dests if d not in connected_dests]
                     if pending_dests:
+                        # [Bug6修复] abs(node-dest)+2 在US Backbone拓扑里毫无意义（节点编号≠物理距离）
+                        # 改用llc._get_hop_distance计算真实跳数，llc不可用时退化到9999
+                        _llc_ref = getattr(self.env, 'low_level_controller', None)
                         min_dist = float('inf')
                         for dest in pending_dests:
-                            if node == dest:
-                                min_dist = 0
-                                break
-                            has_direct_link = False
-                            if hasattr(self.env, 'resource_mgr'):
-                                try:
-                                    neighbors = self.env.resource_mgr.get_neighbors(node)
-                                    has_direct_link = dest in neighbors
-                                except:
-                                    if hasattr(self.env, 'topology'):
-                                        has_direct_link = self.env.topology[node][dest] > 0
-                            if has_direct_link:
-                                dist = 1
+                            if _llc_ref is not None:
+                                dist = _llc_ref._get_hop_distance(node, dest)
                             else:
-                                dist = abs(node - dest) + 2
+                                dist = 9999
                             if dist < min_dist:
                                 min_dist = dist
                         if min_dist == 0:
                             phase_guide = 2.5
                         elif min_dist == 1:
-                            phase_guide = 1.0
+                            phase_guide = 1.5
                         elif min_dist <= 3:
+                            phase_guide = 0.5
+                        elif min_dist <= 6:
                             phase_guide = 0.0
                         else:
                             phase_guide = -0.5
                     else:
                         phase_guide = -1.0
             features.append(phase_guide)
+            # 当前高层特征共11维，低层encoder期望 _node_feat_dim（=24）维
+            # [Bug3修复] 补充13个语义有意义的维度，与低层特征对齐：
+            # dim11: is_dc（是否DC节点）
+            # dim12: is_current（是否当前agent位置）
+            # dim13: hop_to_target（归一化跳数，到当前高层subgoal目标）
+            # dim14-16: hvt[0..2]（全局历史访问次数，归一化）
+            # dim17: on_tree（已在dim5，重复置0保持兼容，低层on_tree语义相同）
+            # dim18: connected_dest（是否connected的dest，已在dim4）
+            # dim19: is_target（是否当前目标，高层subgoal）
+            # dim20: vnf_depth（VNF链进度 next_vnf_idx / max_vnf）
+            # dim21: progress（dest连接进度）
+            # dim22: phase_flag（0=vnf阶段 1=dest阶段，已在global_attr）
+            # dim23: hop_to_tree（到最近树上节点的跳数，归一化）
+            # 注：高层不关心邻边BW（dim21-23在低层），用进度/距离替代更有意义
+            features.append(1.0 if node in dc_nodes else 0.0)         # dim11: is_dc
+            cur_loc = getattr(self.env, 'current_node_location', -1)
+            features.append(1.0 if node == cur_loc else 0.0)           # dim12: is_current
+            _subgoal = getattr(self.env, 'current_subgoal_node', None)
+            if _subgoal is not None:
+                _llc_ref2 = getattr(self.env, 'low_level_controller', None)
+                _h = _llc_ref2._get_hop_distance(node, _subgoal) if _llc_ref2 else 9999
+                features.append(min(_h / 10.0, 1.0))                   # dim13: hop_to_target
+            else:
+                features.append(0.5)
+            # dim14-16: hvt（全局历史部署密度）
+            if hasattr(self.env, 'resource_mgr') and hasattr(self.env.resource_mgr, 'hvt_all'):
+                _hvt = self.env.resource_mgr.hvt_all[node]
+                features.append(min(float(_hvt[0]) / 5.0, 1.0))       # dim14
+                features.append(min(float(_hvt[1]) / 5.0, 1.0) if len(_hvt) > 1 else 0.0)  # dim15
+                features.append(min(float(_hvt[2]) / 5.0, 1.0) if len(_hvt) > 2 else 0.0)  # dim16
+            else:
+                features.extend([0.0, 0.0, 0.0])
+            # dim17: is_target（是否当前高层subgoal目标节点）
+            features.append(1.0 if node == _subgoal else 0.0)          # dim17
+            # dim18: vnf_depth（VNF链进度）
+            _vnf_total = max(1, len(vnf_list))
+            features.append(float(next_vnf_idx) / _vnf_total)          # dim18
+            # dim19: dest_progress（目的地连接进度）
+            _dest_total = max(1, len(dests))
+            features.append(len(connected_dests) / _dest_total)        # dim19
+            # dim20: phase_flag（0=VNF阶段，1=dest阶段）
+            features.append(0.0 if is_vnf_phase else 1.0)              # dim20
+            # dim21-23: 保留为0（对齐低层邻边BW特征位置，高层不使用）
+            features.extend([0.0, 0.0, 0.0])                           # dim21-23
+            # 最终确保维度与_node_feat_dim对齐（截断或padding）
+            if len(features) < _node_feat_dim:
+                features.extend([0.0] * (_node_feat_dim - len(features)))
+            elif len(features) > _node_feat_dim:
+                features = features[:_node_feat_dim]
             x.append(features)
 
         x_tensor = torch.tensor(x, dtype=torch.float32)
@@ -442,8 +574,17 @@ class HighLevelController:
                         try:
                             if hasattr(self.env.resource_mgr, 'pool'):
                                 pool = self.env.resource_mgr.pool
+                                cap = pool.bw_cap.get((u, v), pool.bw_cap.get((v, u), 100.0))
                                 available_bw = pool.get_available_bandwidth(u, v)
-                                norm_bw = min(available_bw / 100.0, 1.0)
+                                norm_bw = min(available_bw / max(1.0, cap), 1.0)
+                                bw_util = 1.0 - norm_bw
+
+                                # hop_weight_norm
+                                hop_w = 1.0
+                                if hasattr(self.env.resource_mgr, 'topo'):
+                                    raw_hop = float(self.env.resource_mgr.topo[u, v])
+                                    max_hop = max(1.0, float(self.env.resource_mgr.topo.max()))
+                                    hop_w = raw_hop / max_hop
 
                                 is_in_tree = 0.0
                                 if hasattr(self.env, 'current_tree') and self.env.current_tree:
@@ -452,14 +593,20 @@ class HighLevelController:
                                     if edge_key in tree:
                                         is_in_tree = 1.0
 
-                                edge_attr_list.append([norm_bw, is_in_tree])
-                                edge_attr_list.append([norm_bw, is_in_tree])
+                                # reserved ratio
+                                reserved = pool.bw_reserved.get((u, v), pool.bw_reserved.get((v, u), 0.0))
+                                reserved_ratio = reserved / max(1.0, cap)
+
+                                # 5维：[bw_remaining, bw_utilization, hop_weight_norm, is_tree_edge, reserved]
+                                feat = [norm_bw, bw_util, hop_w, is_in_tree, reserved_ratio]
+                                edge_attr_list.append(feat)
+                                edge_attr_list.append(feat)
                             else:
-                                edge_attr_list.append([0.5, 0.0])
-                                edge_attr_list.append([0.5, 0.0])
+                                edge_attr_list.append([0.5, 0.5, 1.0, 0.0, 0.0])
+                                edge_attr_list.append([0.5, 0.5, 1.0, 0.0, 0.0])
                         except:
-                            edge_attr_list.append([0.5, 0.0])
-                            edge_attr_list.append([0.5, 0.0])
+                            edge_attr_list.append([0.5, 0.5, 1.0, 0.0, 0.0])
+                            edge_attr_list.append([0.5, 0.5, 1.0, 0.0, 0.0])
             except:
                 continue
 
@@ -468,15 +615,26 @@ class HighLevelController:
             edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32)
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long)
-            edge_attr = torch.zeros((0, 2), dtype=torch.float32)
+            edge_attr = torch.zeros((0, 5), dtype=torch.float32)
 
         bw_req = req.get('bw_origin', 0.0)
         norm_bw_req = min(bw_req / 10.0, 1.0)
         vnf_progress = next_vnf_idx / max(1, len(vnf_list))
         dest_progress = len(connected_dests) / max(1, len(dests))
         phase_feat = 0.0 if is_vnf_phase else 1.0
-        total_avail_cpu = sum([self.env.resource_mgr.pool.get_available_cpu(i) for i in range(n)])
-        resource_tension = 1.0 - (total_avail_cpu / (n * 100.0))
+        # [Bug8修复] resource_tension只看CPU，MEM紧张时不可见
+        # 改为取CPU和MEM紧张度的最大值，任一资源紧张都会反映到特征里
+        # [语义修复] VNF只部署在DC节点，非DC节点CPU/MEM从不消耗，
+        # 用全部n个节点计算会稀释紧张度（虚低）。改为只统计DC节点。
+        _c_cap_g = max(1.0, float(getattr(self.env.resource_mgr, 'C_cap', 100.0)))
+        _m_cap_g = max(1.0, float(getattr(self.env.resource_mgr, 'M_cap', 100.0)))
+        _dc_nodes = getattr(self.env.resource_mgr, 'dc_nodes', list(range(n)))
+        _n_dc = max(1, len(_dc_nodes))
+        total_avail_cpu = sum(self.env.resource_mgr.pool.get_available_cpu(i) for i in _dc_nodes)
+        total_avail_mem = sum(self.env.resource_mgr.pool.get_available_memory(i) for i in _dc_nodes)
+        cpu_tension = 1.0 - (total_avail_cpu / (_n_dc * _c_cap_g))
+        mem_tension = 1.0 - (total_avail_mem / (_n_dc * _m_cap_g))
+        resource_tension = max(cpu_tension, mem_tension)
 
         global_attr = torch.tensor([[
             norm_bw_req, vnf_progress, dest_progress, phase_feat, resource_tension
@@ -521,6 +679,21 @@ class HighLevelController:
     def _get_hop_distance(self, node1, node2):
         if node1 == node2: return 0
         if not self._is_valid_node(node1) or not self._is_valid_node(node2): return 9999
+        # [Bug7修复] 每次调用都重建全图极其低效（mask计算里最多~60次调用）
+        # __init__里的_pending_dist_cache和_last_dests_update从未接上，现在接上：
+        # cache按episode失效：用current_request的id作为key前缀
+        _req_id = id(self.env.current_request) if self.env.current_request else 0
+        _cache_key = (_req_id, node1, node2)
+        if _cache_key in self._pending_dist_cache:
+            return self._pending_dist_cache[_cache_key]
+        # 反向也查一下（无向图对称）
+        _cache_key_rev = (_req_id, node2, node1)
+        if _cache_key_rev in self._pending_dist_cache:
+            return self._pending_dist_cache[_cache_key_rev]
+        # 新请求时清空cache防止无限增长
+        if self._last_dests_update != _req_id:
+            self._pending_dist_cache.clear()
+            self._last_dests_update = _req_id
         try:
             G = nx.Graph()
             for u in range(self.env.n):
@@ -537,8 +710,11 @@ class HighLevelController:
                 except:
                     continue
             if G.has_node(node1) and G.has_node(node2):
-                return nx.shortest_path_length(G, node1, node2)
-            return 9999
+                dist = nx.shortest_path_length(G, node1, node2)
+            else:
+                dist = 9999
+            self._pending_dist_cache[_cache_key] = dist
+            return dist
         except:
             return 9999
 

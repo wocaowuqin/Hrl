@@ -98,17 +98,23 @@ class HRLAgentTrain:
                 next_actions = next_q_online.argmax(dim=1, keepdim=True)
                 next_q_target, _, _ = self.target_high_policy(next_state_tensor, return_subgoal=False)
                 next_q   = next_q_target.gather(1, next_actions)
-                target_q = rewards + (1 - dones) * self.gamma * next_q
-                # 取消 clamp，让期望奖励自然发散
-                # target_q = torch.clamp(target_q, -30.0, 150.0)
+                # [Fix] 只做一次归一化：用 reward_scale 统一 Q 值量纲
+                # 去掉原来的 rewards/20.0，避免 curr_q/30 vs target_q/600 的双重缩放
+                target_q = rewards + (1 - dones) * self.gamma * next_q * 30.0
+                # curr_q 和 target_q 都除以 30，Bellman 两端量纲一致
 
-            # [Loss Fix] reward归一化后loss应在0~3，scale=30让reward范围≈[-1,5]
             _reward_scale = 30.0
-            curr_q_scaled  = curr_q  / _reward_scale
+            curr_q_scaled   = curr_q   / _reward_scale
             target_q_scaled = target_q / _reward_scale
             loss = F.smooth_l1_loss(curr_q_scaled, target_q_scaled)
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.warning("❌ High-Level Loss NaN/Inf，跳过")
+                return 0.0
+
+            # ── w/o HRL 消融：高层参数全部冻结时跳过反向传播 ──────────
+            trainable = [p for p in self.high_policy.parameters() if p.requires_grad]
+            if not trainable:
+                logger.debug("🔬 [Ablation] 高层策略已冻结，跳过 backward")
                 return 0.0
 
             self.optimizer_high.zero_grad()
@@ -179,18 +185,59 @@ class HRLAgentTrain:
                 _N = (self.env.n if self.env is not None and hasattr(self.env, 'n')
                       else 28)
 
-                def _encode(state_obj, detach=False):
+                # 判断encoder是否启用了请求特征融合
+                _encoder_has_req = (self.encoder is not None
+                                    and getattr(self.encoder, 'req_fc', None) is not None)
+
+                def _build_req_vec_from_transition(transition):
+                    """从transition的saved req字段重建req_vec，保持训练与推断一致。"""
+                    if not _encoder_has_req:
+                        return None
+                    try:
+                        req = transition.get('req')       # 需在store_transition时一起存入
+                        if req is None:
+                            return None
+                        bw      = float(req.get('bw_origin', req.get('bw', 0.0)))
+                        cpu_lst = req.get('cpu_origin', req.get('cpu', []))
+                        mem_lst = req.get('memory_origin', req.get('memory', []))
+                        avg_cpu = float(np.mean(cpu_lst)) if len(cpu_lst) > 0 else 0.0
+                        avg_mem = float(np.mean(mem_lst)) if len(mem_lst) > 0 else 0.0
+                        return torch.tensor([[bw, avg_cpu, avg_mem]],
+                                            dtype=torch.float32, device=self.device)
+                    except Exception:
+                        return None
+
+                def _build_dest_mask_from_state(s, n_nodes):
+                    """从state对象还原dest掩码（若有保存）。"""
+                    try:
+                        dests = getattr(s, 'unconnected_dests', None)
+                        if dests:
+                            mask = torch.zeros(n_nodes, dtype=torch.bool, device=self.device)
+                            for d in dests:
+                                if isinstance(d, int) and 0 <= d < n_nodes:
+                                    mask[d] = True
+                            return mask if mask.any() else None
+                    except Exception:
+                        pass
+                    return None
+
+                def _encode(state_obj, detach=False, transition=None):
                     s = state_obj[0] if isinstance(state_obj, tuple) else state_obj
                     try:
                         if hasattr(s, 'x') and hasattr(s, 'edge_index'):
                             ei = s.edge_index.to(self.device) if s.edge_index is not None else _topo_ei
                             if ei is not None:
-                                ea = _fix_ea(ei, s)
-                                b  = torch.zeros(s.x.size(0), dtype=torch.long, device=self.device)
+                                ea   = _fix_ea(ei, s)
+                                b    = torch.zeros(s.x.size(0), dtype=torch.long, device=self.device)
                                 _tei = getattr(s, 'tree_edge_index', None)
                                 if _tei is not None: _tei = _tei.to(self.device)
+                                _req  = (_build_req_vec_from_transition(transition)
+                                         if transition is not None else None)
+                                _dest = _build_dest_mask_from_state(s, s.x.size(0))
                                 out = self.encoder(s.x.to(self.device), ei, ea, batch=b,
-                                                   tree_edge_index=_tei)
+                                                   tree_edge_index=_tei,
+                                                   dest_mask=_dest,
+                                                   req_vec=_req)
                                 if detach: out = out.detach()
                                 # [TA-HGRL Fix] 返回 [1, N, H]
                                 if out.size(0) == _N:
@@ -202,8 +249,8 @@ class HRLAgentTrain:
                     # fallback: [1, N, H] 零填充
                     return torch.zeros(1, _N, self.hidden_dim, device=self.device)
 
-                state_tensor      = torch.cat([_encode(x['state'])           for x in batch])
-                next_state_tensor = torch.cat([_encode(x['next_state'], True) for x in batch]).detach()
+                state_tensor      = torch.cat([_encode(x['state'],      detach=False, transition=x) for x in batch])
+                next_state_tensor = torch.cat([_encode(x['next_state'], detach=True,  transition=x) for x in batch]).detach()
                 # state_tensor: [B, N, H]
             else:
                 # encoder未使用時のfallback: mean emb を [1,N,H] に broadcast
@@ -263,9 +310,10 @@ class HRLAgentTrain:
                 next_out_tg = self.target_low_policy(next_state_tensor, goal_tensor)
                 next_q_tg   = next_out_tg[0] if isinstance(next_out_tg, tuple) else next_out_tg
 
-                # 去除强制 clamp 限制，让 DQN 自行拟合上限
                 next_q      = next_q_tg.gather(1, next_acts)
-                target_q    = rewards + (1 - dones) * self.gamma * next_q
+                # [Fix] 只做一次归一化：与 High-Level 保持一致的 scale 统一方式
+                # 去掉原来的 rewards/20.0，避免 curr_q/30 vs target_q/600 的双重缩放
+                target_q    = rewards + (1 - dones) * self.gamma * next_q * 30.0
 
             # [Loss Fix] reward归一化 + PER importance sampling weights
             _reward_scale = 30.0
@@ -307,10 +355,21 @@ class HRLAgentTrain:
             except Exception as _e:
                 logger.debug(f"[tree_bias] error: {_e}")
 
-            # 梯度监控+裁剪
+            # 梯度监控+裁剪（encoder 必须与 low_policy 一起裁剪，否则梯度爆炸被optimizer动量抹平）
+            _all_low_params = list(self.low_policy.parameters())
+            if self.encoder is not None:
+                _all_low_params += list(self.encoder.parameters())
             self.gradient_norms.append(
-                sum(p.grad.norm().item() for p in self.low_policy.parameters() if p.grad is not None))
-            nn.utils.clip_grad_norm_(self.low_policy.parameters(), self.clip_grad_norm)
+                sum(p.grad.norm().item() for p in _all_low_params if p.grad is not None))
+            nn.utils.clip_grad_norm_(_all_low_params, self.clip_grad_norm)
+            # encoder tree_bias 梯度监控
+            if self.encoder is not None and hasattr(self.encoder, 'tree_bias'):
+                _tb_grad = self.encoder.tree_bias.grad
+                if _tb_grad is not None:
+                    logger.debug(f"[tree_bias] after_clip grad={_tb_grad.item():.6f} "
+                                 f"val={self.encoder.tree_bias.item():.6f}")
+                else:
+                    logger.debug("[tree_bias] grad=None (no contribution to loss this step)")
             self.optimizer_low.step()
 
             # Q监控
