@@ -23,10 +23,7 @@ class HRL_Coordinator:
         self.current_episode = 0
         self.resources_released = False
 
-        # [A8] _episode_deploy_failed: episode内VNF资源部署失败的节点集合
-        # 语义：本episode内因资源不足(deploy_fail)而封禁，不跨episode；
-        # 与_unreachable_targets区别：后者每个subgoal结束后清空，前者episode内持久封禁
-        self._episode_deploy_failed = set()
+        self._permanent_unreachable = set()
 
     def _select_bw_feasible_target(self, target_node, start_node, bw_need, valid_indices, high_mask):
         """
@@ -100,10 +97,10 @@ class HRL_Coordinator:
                 if idx < len(high_mask):
                     high_mask[idx] = 0
 
-        if hasattr(self, '_episode_deploy_failed') and self._episode_deploy_failed:
-            for idx in self._episode_deploy_failed:
+        if hasattr(self, '_permanent_unreachable') and self._permanent_unreachable:
+            for idx in self._permanent_unreachable:
                 if idx < len(high_mask):
-                    high_mask[idx] = 0  # 本episode内资源不足的节点持续封禁
+                    high_mask[idx] = 0
 
         if sum(high_mask) == 0:
             return 0.0, True, {'error': 'no_high_actions'}
@@ -334,10 +331,9 @@ class HRL_Coordinator:
                 episode_done = True
             if truncated_low:
                 if info.get('deploy_fail'):
-                    # [A8] deploy_fail时记入episode级封禁集合，避免高层反复选此节点浪费步数
-                    if not hasattr(self, '_episode_deploy_failed'):
-                        self._episode_deploy_failed = set()
-                    self._episode_deploy_failed.add(target_node)
+                    if not hasattr(self, '_permanent_unreachable'):
+                        self._permanent_unreachable = set()
+                    self._permanent_unreachable.add(target_node)
                 break
 
         actual_end_pos = self.env.current_node_location
@@ -355,10 +351,7 @@ class HRL_Coordinator:
         high_done = episode_done
 
         milestone_reward = self._compute_reward_from_env_info(info)
-        # [A9] alpha线性增长：前期重milestone引导，后期低层信号逐渐加强
-        # ep=0→0.05, ep=400→0.25, ep>=400封顶0.25
-        # 低层贡献量级：0.05时±2.5（无效），0.25时±12.5（与milestone同量级）
-        alpha = min(0.05 + self.current_episode / 2000.0, 0.25)
+        alpha = 0.05 if self.current_episode < 200 else 0.1
         high_reward = milestone_reward + alpha * low_total_reward
 
         if hasattr(self.env, 'low_level_controller') and \
@@ -387,13 +380,23 @@ class HRL_Coordinator:
                     completed, status = self.env.high_level_controller._is_all_tasks_completed()
                     if completed:
                         high_done = True
-                        high_reward += 40.0  # [A12] 与_compute_reward_from_env_info对齐
+                        high_reward += 30.0
                         episode_done = True
                         # ── 分叉多样性奖励 + 树总长奖励 ──────────────
                         try:
                             _sfc2 = getattr(self.env, 'current_sfc', None)
                             if _sfc2:
-                                # 树总长奖励（边数越少越好，鼓励路径复用）
+                                # 用 current_tree['tree'] 实际边数（比 spine_paths 重建值更真实）
+                                _actual_len = len(self.env.current_tree.get('tree', {}))
+                                # 奖惩：<=10 每少一条 +0.5；10~16 中立；>16 每多一条 -1.0
+                                if _actual_len <= 10:
+                                    _len_bonus = (10 - _actual_len) * 0.5
+                                elif _actual_len >= 16:
+                                    _len_bonus = -(_actual_len - 16) * 1.0
+                                else:
+                                    _len_bonus = 0.0
+                                high_reward += _len_bonus
+                                # 同时记录 snapshot 边数供日志对比
                                 _all_e = set()
                                 for _sg in _sfc2.get('spine_paths', []):
                                     for _i in range(len(_sg)-1):
@@ -401,10 +404,8 @@ class HRL_Coordinator:
                                 for _bp in _sfc2.get('branch_paths', {}).values():
                                     for _i in range(len(_bp)-1):
                                         _all_e.add(tuple(sorted((_bp[_i],_bp[_i+1]))))
-                                _len_bonus = max(0.0, (23 - len(_all_e)) * 0.5)
-                                high_reward += _len_bonus
-                                logger.debug(f"[TreeQuality] len={len(_all_e)} "
-                                             f"len_bonus={_len_bonus:.1f}")
+                                logger.debug(f"[TreeQuality] actual={_actual_len} "
+                                             f"snap={len(_all_e)} bonus={_len_bonus:.1f}")
                                 # spine回绕惩罚
                                 _seen_spine = set()
                                 _overlap = 0
@@ -453,7 +454,7 @@ class HRL_Coordinator:
         high_obs = self.env.reset()
 
         self._unreachable_targets = set()
-        self._episode_deploy_failed = set()  # [A8] episode级封禁，每episode重置
+        self._permanent_unreachable = set()  # 每episode重置，不跨episode封禁节点
         self._last_tree_redundancy = 0.0
 
         episode_done = False
@@ -528,25 +529,13 @@ class HRL_Coordinator:
         if episode_success:
             self.resources_released = True
         else:
-            # [A4] 防双重回滚：低层 _archive_episode_fail 已设 env._bw_already_rolled_back=True
-            # 若低层已回滚则跳过，避免对同一请求释放两次 BW（会导致剩余BW超过总容量）
-            # 用完后清零，避免影响下一个 episode
-            already_rolled = getattr(self.env, '_bw_already_rolled_back', False)
-            if not already_rolled:
-                try:
-                    if (hasattr(self.env, 'resource_mgr') and
-                            hasattr(self.env.resource_mgr, '_archive_request')):
-                        self.env.resource_mgr._archive_request(
-                            success=False, already_rolled_back=False)
-                        logger.debug("[Coord] 高层兜底回滚BW完成")
-                except Exception as e:
-                    # [A5] 不再静默吞异常，打印警告便于排查资源泄漏
-                    logger.warning(f"[Coord] 高层兜底 _archive_request 失败: {e}，"
-                                   f"BW可能未完全释放，请检查资源状态")
-            else:
-                logger.debug("[Coord] 低层已完成BW回滚，跳过高层重复调用")
-            # 清零标志，避免污染下一个 episode
-            self.env._bw_already_rolled_back = False
+            try:
+                if (hasattr(self.env, 'resource_mgr') and
+                        hasattr(self.env.resource_mgr, '_archive_request')):
+                    self.env.resource_mgr._archive_request(
+                        success=False, already_rolled_back=False)
+            except Exception as e:
+                pass
 
         self._reset_episode_stats()
 
@@ -630,16 +619,11 @@ class HRL_Coordinator:
             return False
 
     def _compute_reward_from_env_info(self, info):
-        # [A12] 奖励路径重新定价（方案A）：
-        # 修复前：all_vnf_deployed(25)+dest×10+episode_complete(30)=75
-        #         vs 直接episode_complete=30，激励路径不一致
-        # 修复后：all_vnf_deployed(15)+dest×10+episode_complete(40)=75（2 dest）
-        #         直接episode_complete=40，均匀路径且完成任务权重更大
         if not info: return 0.0
         if info.get('episode_complete', False) or info.get('all_destinations_connected', False):
-            return 40.0  # 提高：完成全部任务的终态奖励更突出
+            return 30.0
         if info.get('all_vnf_deployed', False):
-            return 15.0  # 降低：减少与episode_complete的重复计分（由25→15）
+            return 25.0
         if info.get('vnf_deployed', False):
             return 20.0
         elif info.get('dest_connected', False):

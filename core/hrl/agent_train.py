@@ -98,10 +98,8 @@ class HRLAgentTrain:
                 next_actions = next_q_online.argmax(dim=1, keepdim=True)
                 next_q_target, _, _ = self.target_high_policy(next_state_tensor, return_subgoal=False)
                 next_q   = next_q_target.gather(1, next_actions)
-                # [Fix] 只做一次归一化：用 reward_scale 统一 Q 值量纲
-                # 去掉原来的 rewards/20.0，避免 curr_q/30 vs target_q/600 的双重缩放
-                target_q = rewards + (1 - dones) * self.gamma * next_q * 30.0
-                # curr_q 和 target_q 都除以 30，Bellman 两端量纲一致
+                # target_q 和 curr_q 用相同 scale，两边都除以 reward_scale 归一化
+                target_q = rewards + (1 - dones) * self.gamma * next_q
 
             _reward_scale = 30.0
             curr_q_scaled   = curr_q   / _reward_scale
@@ -311,11 +309,11 @@ class HRLAgentTrain:
                 next_q_tg   = next_out_tg[0] if isinstance(next_out_tg, tuple) else next_out_tg
 
                 next_q      = next_q_tg.gather(1, next_acts)
-                # [Fix] 只做一次归一化：与 High-Level 保持一致的 scale 统一方式
-                # 去掉原来的 rewards/20.0，避免 curr_q/30 vs target_q/600 的双重缩放
-                target_q    = rewards + (1 - dones) * self.gamma * next_q * 30.0
+                # target_q 和 curr_q 用相同 scale，直接算 Bellman target
+                # 不在 target 里乘 30，而是两边都除以 reward_scale 归一化
+                target_q    = rewards + (1 - dones) * self.gamma * next_q
 
-            # [Loss Fix] reward归一化 + PER importance sampling weights
+            # reward归一化：将 [-20, 150] 的奖励压缩到合理范围，让 loss 稳定在 0~2
             _reward_scale = 30.0
             curr_q_scaled   = curr_q   / _reward_scale
             target_q_scaled = target_q / _reward_scale
@@ -355,21 +353,10 @@ class HRLAgentTrain:
             except Exception as _e:
                 logger.debug(f"[tree_bias] error: {_e}")
 
-            # 梯度监控+裁剪（encoder 必须与 low_policy 一起裁剪，否则梯度爆炸被optimizer动量抹平）
-            _all_low_params = list(self.low_policy.parameters())
-            if self.encoder is not None:
-                _all_low_params += list(self.encoder.parameters())
+            # 梯度监控+裁剪
             self.gradient_norms.append(
-                sum(p.grad.norm().item() for p in _all_low_params if p.grad is not None))
-            nn.utils.clip_grad_norm_(_all_low_params, self.clip_grad_norm)
-            # encoder tree_bias 梯度监控
-            if self.encoder is not None and hasattr(self.encoder, 'tree_bias'):
-                _tb_grad = self.encoder.tree_bias.grad
-                if _tb_grad is not None:
-                    logger.debug(f"[tree_bias] after_clip grad={_tb_grad.item():.6f} "
-                                 f"val={self.encoder.tree_bias.item():.6f}")
-                else:
-                    logger.debug("[tree_bias] grad=None (no contribution to loss this step)")
+                sum(p.grad.norm().item() for p in self.low_policy.parameters() if p.grad is not None))
+            nn.utils.clip_grad_norm_(self.low_policy.parameters(), self.clip_grad_norm)
             self.optimizer_low.step()
 
             # Q监控

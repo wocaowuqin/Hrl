@@ -39,7 +39,10 @@ class FailReason:
     MASK_ZERO       = "Mask=0 (No Resource)"    # 高层动作全被掩码
     PATH_BLOCKED    = "Path Blocked"            # BW不足无法规划路径
     TIMEOUT         = "Timeout"                  # 步数耗尽
-    VNF_FAIL        = "VNF Deploy Fail"           # 节点资源不足
+    VNF_FAIL        = "VNF Deploy Fail"          # 节点资源不足
+    NO_PROGRESS     = "No Progress"              # 连续N个cycle无进展被终止
+    BW_EXHAUSTED    = "BW Exhausted"             # 带宽耗尽无法走新边
+    TRAPPED         = "Trapped"                  # 困死（邻居全无BW）
     UNKNOWN         = "Unknown"
 
 
@@ -119,8 +122,9 @@ class TrainingAnalyzer:
         if rec.success:
             rec.fail_reason = None
         else:
-            error = info.get('error', '')
-            comp  = info.get('completion_status', '')
+            error  = info.get('error', '') or ''
+            reason = info.get('reason', '') or ''   # HRL_Coordinator 设置的 reason 字段
+            comp   = info.get('completion_status', '') or ''
 
             # 临时读取 VNF / Dest 进度（用于精准分类）
             vnf_done_tmp  = 0
@@ -137,8 +141,17 @@ class TrainingAnalyzer:
             all_vnf_done = (vnf_done_tmp >= vnf_total_tmp)
             no_dest_done = (dest_done_tmp == 0)
 
-            if all_vnf_done and no_dest_done:
-                # VNF 全部完成，但目的地连接阶段全部失败 -> BW耗尽/路径不可达
+            # 优先读 reason 字段（HRL_Coordinator 显式设置）
+            if reason == 'no_progress':
+                rec.fail_reason = FailReason.NO_PROGRESS
+            elif reason == 'consecutive_timeout':
+                rec.fail_reason = FailReason.TIMEOUT
+            elif reason in ('bandwidth_exhausted', 'no_bandwidth'):
+                rec.fail_reason = FailReason.BW_EXHAUSTED
+            elif reason == 'trapped' or error == 'trapped':
+                rec.fail_reason = FailReason.TRAPPED
+            # 再按状态推断
+            elif all_vnf_done and no_dest_done:
                 rec.fail_reason = FailReason.PATH_BLOCKED
             elif error == 'no_high_actions' or 'Mask全0' in comp or res_util >= 0.95:
                 rec.fail_reason = FailReason.MASK_ZERO
@@ -570,6 +583,27 @@ class TrainingAnalyzer:
             w("  ① Agent 需要学习避开资源紧张节点（CPU/MEM）")
             w("  ② 在状态特征中强化剩余资源的表示")
             w("  ③ 部署失败时给予更强的负奖励以加速策略收敛")
+
+        elif top_reason == FailReason.NO_PROGRESS:
+            w("  主要问题: Agent 连续多个 cycle 无进展被强制终止")
+            w("  建议:")
+            w("  ① 增大 MAX_NO_PROGRESS 阈值（当前5），给 Agent 更多容错空间")
+            w("  ② 检查高层动作掩码是否过于保守，导致可选目标太少")
+            w("  ③ 增加无进展时的稠密引导奖励（距离梯度），避免原地振荡")
+            w("  ④ 检查低层步数上限是否足够（max_low_steps）")
+
+        elif top_reason == FailReason.BW_EXHAUSTED:
+            w("  主要问题: 带宽耗尽，Agent 无法走新边")
+            w("  建议:")
+            w("  ① 检查 _skip_edge BW 泄漏修复是否生效")
+            w("  ② 优化组播树减少边数，降低总带宽消耗")
+            w("  ③ 增强热点链路惩罚，引导 Agent 绕开拥塞链路")
+
+        elif top_reason == FailReason.TRAPPED:
+            w("  主要问题: Agent 陷入死路（所有邻居 BW 不足）")
+            w("  建议:")
+            w("  ① 在高层动作掩码中预先过滤带宽不足的方向")
+            w("  ② 检查是否有 BW 泄漏导致链路虚报为 0")
 
         # 通用建议（根据训练趋势）
         early_rate = np.mean([r.success for r in recs[:seg_size]])
