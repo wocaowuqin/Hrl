@@ -311,7 +311,7 @@ class LowLevelController:
                         _res_parts.append(f"资源查询异常:{_e}")
                 _res_info = f" [{', '.join(_res_parts) if _res_parts else '原因待查'}]"
                 _fail_type = "💥 资源拦截"
-            logger.warning(
+            logger.debug(
                 f"{_fail_type}{_res_info} at Node {current_node} "
                 f"(连续: {self.env._consecutive_timeout_count}次, steps_used={_steps_used}/{_max_steps}) | "
                 f"phase={_ph} target={_tgt} hop_dist={_dist} "
@@ -325,7 +325,7 @@ class LowLevelController:
                 _dt = len(self.env.current_request.get('dest', [])) if self.env.current_request else 0
                 _dc_conn = len(self.env.current_tree.get('connected_dests', set())) if self.env.current_tree else 0
 
-                logger.warning(
+                logger.debug(
                     f"❌ [Low] 连续超时{self.env._timeout_count}次，Episode失败 | "
                     f"VNF={_vd}/{_vt} Dest={_dc_conn}/{_dt} | "
                     f"phase={_ph} cur={current_node} target={_tgt} hop_dist={_dist}"
@@ -476,7 +476,7 @@ class LowLevelController:
                     # 找到绕路方案，不快速失败，继续让Agent移动
                     logger.info(f"🔀 [Low] 带宽孤岛: target={target_goal} 直连已满，绕路方案: {_fallback_path}")
                 else:
-                    logger.warning(f"🏝️ [Low] 带宽孤岛: target={target_goal} 所有接入链路已满，快速失败")
+                    logger.debug(f"🏝️ [Low] 带宽孤岛: target={target_goal} 所有接入链路已满，快速失败")
                     # 🆕 不直接让整个Episode失败，改为跳过当前目标让高层重新调度
                     # ⚠️ [计数器拆分] 孤岛用独立的_island_count，阈值5，不与超时混用
                     self.env._island_count += 1
@@ -611,12 +611,12 @@ class LowLevelController:
                                     pass
                     _global_util = (1.0 - _total_avail / max(1.0, _total_cap)) * 100.0
 
-                    logger.info(
-                        f"📊 [BW统计] 请求bw={_bw_req:.1f} | 树边数={_n_edges} | "
-                        f"本次请求消耗带宽≈{_total_bw_consumed:.1f} | "
-                        f"全局BW利用率={_global_util:.1f}% | "
-                        f"树边剩余BW: {' '.join(_edge_details)}"
-                    )
+                #     logger.info(
+                #         f"📊 [BW统计] 请求bw={_bw_req:.1f} | 树边数={_n_edges} | "
+                #         f"本次请求消耗带宽≈{_total_bw_consumed:.1f} | "
+                #         f"全局BW利用率={_global_util:.1f}% | "
+                #         f"树边剩余BW: {' '.join(_edge_details)}"
+                #     )
                 except Exception as _bw_e:
                     logger.warning(f"⚠️ [BW统计] 统计失败: {_bw_e}")
                 # ──────────────────────────────────────────────────────────────
@@ -1116,11 +1116,9 @@ class LowLevelController:
             tree = self.env.current_tree.get('tree', {})
             released = 0
             for (u, v), flow in tree.items():
-                # [BW泄漏修复] flow=0.0 的 _skip_edge 边也扣了 BW，必须归还
-                release_amount = bw if flow == 0.0 else bw * flow
-                if release_amount > 0.0:
+                if flow > 0.0:
                     try:
-                        self.env.resource_mgr.pool.release_bandwidth(u, v, release_amount)
+                        self.env.resource_mgr.pool.release_bandwidth(u, v, bw * flow)
                         released += 1
                     except Exception:
                         pass

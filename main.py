@@ -857,7 +857,7 @@ def main():
         logger.info("📥 加载Phase3训练数据")
         logger.info("=" * 70)
 
-        data_file = 'data/input_dir/phase3_requests.pkl'
+        data_file = 'data/input_dir/时间间隔为5请求到达率为24时/phase3_requests.pkl'
         logger.info(f"📂 数据文件路径: {data_file}")
         logger.info(f"📂 当前工作目录: {os.getcwd()}")
         logger.info(f"🔍 文件是否存在: {os.path.exists(data_file)}")

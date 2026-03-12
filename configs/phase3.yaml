@@ -10,7 +10,7 @@ phase3:
   num_episodes: 1000              # 训练轮数
   max_steps: 3000000              # 总步数上限
   max_steps_per_episode: 600      # 单个Episode最大步数（决策步数，不是时间！）
-  episodes: 4000
+  episodes: 500
   # 评估配置
   eval_every: 100                 # 每100个Episode评估一次
   eval_episodes: 20               # 每次评估运行20个Episode
@@ -115,6 +115,29 @@ rl:
   # 优化器
   optimizer: 'adam'               # Adam优化器
   gradient_clip: 1.0              # 梯度裁剪
+
+# ============================================
+# 5b. training节（agent_base.py 从此读epsilon）
+# ============================================
+training:
+  learning_rate: 0.0001
+  batch_size: 128
+  gamma: 0.99
+  target_update_freq: 200
+  clip_grad_norm: 1.0
+
+  # Epsilon 探索配置
+  # 15000个请求，希望前10000ep充分探索，后5000ep收敛
+  epsilon:
+    initial_high: 0.30            # 高层初始探索率
+    final_high:   0.02            # 高层最终探索率
+    initial_low:  0.30            # 低层初始探索率
+    final_low:    0.02            # 低层最终探索率
+    decay_episodes: 10000         # 线性衰减跨越10000个episode
+    # ep    0  -> e=0.30
+    # ep 5000  -> e=0.16
+    # ep10000  -> e=0.02（达到最小值）
+    # ep15000  -> e=0.02（维持）
 
 # ============================================
 # 6. 奖励函数配置（V5.6版本 + 时间槽增强）
@@ -279,8 +302,8 @@ dynamic_env:
 
   # 🔥 新增：时间槽版本（以时间槽为单位）
   timeslot_based_lifetime: true   # 使用时间槽计算生命周期
-  lifetime_min_slots: 200        # 最小生命周期（时间槽）= 10s
-  lifetime_max_slots: 1000        # 最大生命周期（时间槽）= 60s
+  lifetime_min_slots: 1000        # 最小生命周期（时间槽）= 10s
+  lifetime_max_slots: 6000        # 最大生命周期（时间槽）= 60s
 
 # ============================================
 # 14. 路径配置
