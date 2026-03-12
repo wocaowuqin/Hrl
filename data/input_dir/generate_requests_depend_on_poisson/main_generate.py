@@ -17,7 +17,7 @@ NODE_TRAFFIC_LIST = [2, 5, 6, 10, 15, 16, 21, 24]
 TIME_INTERVAL = 5.0  # 时间间隔 5秒
 
 # 🔥 【关键修改】提高到达率 + 增大时间槽
-LAMBDA_PER_INTERVAL = 40
+LAMBDA_PER_INTERVAL = 35
 
 LAMBDA_RATE = LAMBDA_PER_INTERVAL / TIME_INTERVAL
 
@@ -85,15 +85,6 @@ def generate_poisson_arrivals(T, lamda):
         if time_state < T:
             arrivals.append(time_state)
     return arrivals
-
-
-def generate_vnf_resources(bandwidth):
-    """生成资源需求"""
-    cpu_factor = np.random.rand() * 2.75 + 0.25
-    mem_factor = np.random.rand() * 1.75 + 0.25
-    cpu = round(bandwidth * cpu_factor)
-    mem = round(bandwidth * mem_factor)
-    return cpu, mem
 
 
 def group_requests_by_time_slot(requests):
@@ -173,20 +164,39 @@ def generate_all_requests(num_intervals, lamda, seed=None, phase_name="Unknown")
         for arrive_time in arrive_times:
             destinations = random.sample(candidate_dests, NUM_DESTINATIONS)
             vnf_chain = random.sample(range(1, VNF_TYPES + 1), VNF_CHAIN_LENGTH)
-            bandwidth = random.randint(MIN_BANDWIDTH, MAX_BANDWIDTH)
 
-            cpu_needs, mem_needs = [], []
-            for _ in vnf_chain:
-                c, m = generate_vnf_resources(bandwidth)
-                cpu_needs.append(c)
-                mem_needs.append(m)
+            # ========== 修改 1: 存活时间（指数分布） ==========
+            lifetime_seconds = 1.0 + np.random.exponential(scale=1.5)
+            lifetime_seconds = max(MIN_LIFETIME, min(MAX_LIFETIME, lifetime_seconds))
 
-            # 🔥 修改这部分 - 生成1-6秒的存活时间
-            # 方法1：使用均匀分布
-            lifetime_seconds = random.uniform(MIN_LIFETIME, MAX_LIFETIME)
+            # ========== 修改 2: 带宽按比例分配 ==========
+            bandwidth = int(np.random.choice([4, 5, 6, 7, 8], p=[0.50, 0.20, 0.20, 0.05, 0.05]))
 
-            # 或者方法2：使用整数秒
-            # lifetime_seconds = random.randint(int(MIN_LIFETIME), int(MAX_LIFETIME))
+            # ========== 修改 3: CPU 需求（按 MATLAB 比例） ==========
+            cpu_needs = []
+            for _ in range(VNF_CHAIN_LENGTH):
+                bucket = np.random.choice([0, 1, 2, 3], p=[0.55, 0.25, 0.15, 0.05])
+                if bucket == 0:
+                    cpu_needs.append(np.random.randint(1, 7))      # 1~6
+                elif bucket == 1:
+                    cpu_needs.append(np.random.randint(7, 13))     # 7~12
+                elif bucket == 2:
+                    cpu_needs.append(np.random.randint(13, 19))    # 13~18
+                else:
+                    cpu_needs.append(np.random.randint(19, 25))    # 19~24
+
+            # ========== 修改 4: 内存需求（按 MATLAB 比例） ==========
+            mem_needs = []
+            for _ in range(VNF_CHAIN_LENGTH):
+                bucket = np.random.choice([0, 1, 2, 3], p=[0.55, 0.25, 0.15, 0.05])
+                if bucket == 0:
+                    mem_needs.append(np.random.randint(1, 5))      # 1~4
+                elif bucket == 1:
+                    mem_needs.append(np.random.randint(5, 9))      # 5~8
+                elif bucket == 2:
+                    mem_needs.append(np.random.randint(9, 13))     # 9~12
+                else:
+                    mem_needs.append(np.random.randint(13, 17))    # 13~16
 
             req = generate_single_request(
                 req_id=0,
