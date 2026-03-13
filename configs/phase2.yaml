@@ -1,11 +1,12 @@
 # 阶段2配置 - 模仿学习
 phase2:
   output_dir: "${project.base_dir}/phase2"
-  epochs: 300
+  epochs: 150
   batch_size: 64
   lr: 3e-4
   save_every_epoch: 50
   validation_split: 0.1  # 10%用于验证
+  nb_high_level_goals: 28    # ← 加这行，明确指定高层输出维度=28
 
   # 数据加载参数
   data_loader:
@@ -17,3 +18,13 @@ phase2:
   early_stopping:
     patience: 30
     min_delta: 0.0001
+  environment:
+    num_nodes: 28
+    nb_high_level_goals: 28
+    nb_low_level_actions: 28
+
+  node_feat_dim: 24
+  gnn:
+    node_feat_dim: 24
+    edge_feat_dim: 5
+    req_dim: 3

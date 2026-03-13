@@ -486,7 +486,7 @@ def main():
     # 🔥 运行参数配置区：直接在这里修改你想运行的阶段和参数
     # =========================================================================
     args = argparse.Namespace(
-        phase='phase3',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
+        phase='phase2',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
         gpu=0,  # GPU ID, 设为 -1 则强制使用 CPU
         seed=100,  # 随机种子
         goal_strategy='adaptive',  # Phase 3 的目标策略: 'relative', 'adaptive', 'hybrid'
@@ -703,6 +703,8 @@ def main():
             return
 
         phase2_config = config.get('phase2', {})
+        phase2_config['node_feat_dim'] = config.get('gnn', {}).get('node_feat_dim', 24)  # ← 加这一行
+        output_dir = get_config_path(config, 'ckpt_dir')
         output_dir = get_config_path(config, 'ckpt_dir')
 
         try:
@@ -770,65 +772,7 @@ def main():
             traceback.print_exc()
             return
 
-        # 2. 加载预训练模型（Phase2 IL 热启动）
-        ckpt_dir = get_config_path(config, 'ckpt_dir')
-        pretrained_path = os.path.join(ckpt_dir, "il_model_best.pth")
-        if not os.path.exists(pretrained_path):
-            pretrained_path = os.path.join(ckpt_dir, "il_model_final.pth")
-
-        if os.path.exists(pretrained_path):
-            logger.info(f"📥 正在加载 Phase2 预训练权重: {pretrained_path}")
-            try:
-                # 只加载网络权重，不加载optimizer状态（Phase2/3的optimizer结构可能不同）
-                ckpt = torch.load(pretrained_path, map_location=agent.device)
-                if 'high_policy' in ckpt:
-                    agent.high_policy.load_state_dict(ckpt['high_policy'])
-                    agent.target_high_policy.load_state_dict(ckpt['high_policy'])
-                if 'low_policy' in ckpt:
-                    agent.low_policy.load_state_dict(ckpt['low_policy'])
-                    agent.target_low_policy.load_state_dict(ckpt['low_policy'])
-                if 'encoder' in ckpt:
-                    encoder_ckpt = ckpt['encoder']
-                    current_shapes = {k: v.shape for k, v in agent.encoder.state_dict().items()}
-                    # 自动过滤shape不匹配的层（门控融合改动导致fusion层形状变化）
-                    filtered = {k: v for k, v in encoder_ckpt.items()
-                                if k in current_shapes and v.shape == current_shapes[k]}
-                    skipped = [k for k in encoder_ckpt if k not in filtered]
-                    missing, _ = agent.encoder.load_state_dict(filtered, strict=False)
-                    reinit = sorted(set(missing) | set(skipped))
-                    logger.info(f"   encoder加载: {len(filtered)}层继承, {len(reinit)}层重新初始化")
-                    if reinit:
-                        logger.info(f"   重新初始化的层: {reinit}")
-                    # 强制重置tree_bias为0（门控融合初始值，旧版本训练值不适用）
-                    if hasattr(agent.encoder, 'tree_bias'):
-                        with torch.no_grad():
-                            agent.encoder.tree_bias.fill_(0.0)
-                        logger.info(f"   tree_bias已重置为0.0 (sigmoid=0.5，均等融合)")
-
-                # 重建optimizer_low，确保encoder参数绑定正确
-                lr_low = config.get('training', {}).get('lr_low', 1e-5)
-                agent.optimizer_low = torch.optim.Adam(
-                    list(agent.low_policy.parameters()) + list(agent.encoder.parameters()),
-                    lr=lr_low
-                )
-                logger.info("✅ 热启动成功: 权重已加载，optimizer_low已重建")
-                logger.info(f"   tree_bias初始值: {agent.encoder.tree_bias.item():.6f}")
-            except Exception as e:
-                logger.error(f"❌ 热启动加载失败: {e}")
-                import traceback;
-                traceback.print_exc()
-        # ── Phase3 开始前重置 optimizer lr（IL 训练后 lr 可能被 scheduler 降低）──
-        # 使用 config 里设置的小 lr（1e-5），确保 RL 微调阶段不破坏 IL 权重
-        rl_lr_high = config.get('training', {}).get('lr_high', 1e-5)
-        rl_lr_low  = config.get('training', {}).get('lr_low',  1e-5)
-        if hasattr(agent, 'optimizer_high'):
-            for pg in agent.optimizer_high.param_groups:
-                pg['lr'] = rl_lr_high
-            logger.info(f"🔧 重置 optimizer_high lr = {rl_lr_high}")
-        if hasattr(agent, 'optimizer_low'):
-            for pg in agent.optimizer_low.param_groups:
-                pg['lr'] = rl_lr_low
-            logger.info(f"🔧 重置 optimizer_low  lr = {rl_lr_low}")
+        # 2. 热启动加载由 Phase3RLTrainer 内部统一处理（_load_il_checkpoint）
 
         # =========================================================
         # 🔥 初始化 HRL Coordinator
@@ -857,7 +801,7 @@ def main():
         logger.info("📥 加载Phase3训练数据")
         logger.info("=" * 70)
 
-        data_file = 'data/input_dir/时间间隔为5请求到达率为24时/phase3_requests.pkl'
+        data_file = 'data/input_dir/时间间隔为5请求到达率为16时/phase3_requests.pkl'
         logger.info(f"📂 数据文件路径: {data_file}")
         logger.info(f"📂 当前工作目录: {os.getcwd()}")
         logger.info(f"🔍 文件是否存在: {os.path.exists(data_file)}")
@@ -906,6 +850,7 @@ def main():
         # =========================================================
         # 🔥 创建 Trainer
         # =========================================================
+        ckpt_dir = get_config_path(config, 'ckpt_dir')
         trainer = Phase3RLTrainer(
             env=env,
             agent=agent,

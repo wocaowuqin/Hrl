@@ -10,7 +10,8 @@ phase3:
   num_episodes: 1000              # 训练轮数
   max_steps: 3000000              # 总步数上限
   max_steps_per_episode: 600      # 单个Episode最大步数（决策步数，不是时间！）
-  episodes: 500
+  episodes: 5
+  il_checkpoint: "E:/pycharmworkspace/HRL-GNN for Multicast-aware SFC Orchestration/outputs/checkpoints/il_model_best.pth"
   # 评估配置
   eval_every: 100                 # 每100个Episode评估一次
   eval_episodes: 20               # 每次评估运行20个Episode

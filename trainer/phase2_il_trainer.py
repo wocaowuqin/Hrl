@@ -43,7 +43,7 @@ class EarlyStopping:
 class ExpertDataset(Dataset):
     def __init__(self, expert_data_path: str):
         self.samples = []
-        self.max_dest = 5  # 默认值，load后会更新
+        self.max_dest = 28  # 默认值，load后会更新
         self._load_and_convert(expert_data_path)
 
     def _load_and_convert(self, data_path: str):
@@ -152,7 +152,7 @@ class Phase2ILTrainer:
         self._loss_count = 0
 
         phase2_cfg = config.get('phase2', {})
-        self.epochs = phase2_cfg.get('epochs', 200)
+        self.epochs = phase2_cfg.get('epochs', 150)
         self.batch_size = phase2_cfg.get('batch_size', 64)
         self.validation_split = phase2_cfg.get('validation_split', 0.1)
         self.device = agent.device
@@ -214,9 +214,7 @@ class Phase2ILTrainer:
                         f"{weights.argmax().item()} ({weights.max().item():.2f}x)")
         self.criterion_low = nn.CrossEntropyLoss(weight=weights.to(self.device))
         # 固定高层类别数，避免每batch动态切片导致梯度不稳定
-        self.n_dest = getattr(
-            self.train_loader.dataset.dataset, 'max_dest', 5
-        ) if self.train_loader else 5
+        self.n_dest = 28
         logger.info(f"✅ Phase2: 高层固定类别数 n_dest={self.n_dest}")
         from core.gnn.tree_transformer_encoder import TreeTransformerEncoder
         from torch_geometric.nn import global_mean_pool
@@ -437,6 +435,10 @@ class Phase2ILTrainer:
             # ── 传入 action_mask，非法节点被 -inf mask 后再算 loss ────────
             low_logits, _ = self.model_low(node_emb_3d, subgoal_emb, action_mask=action_masks)
 
+            # ── 高层标签对齐：确保 high_labels < high_logits.size(1) ──────
+            n_classes = high_logits.size(1)
+            if high_labels.max() >= n_classes:
+                high_labels = high_labels.clamp(0, n_classes - 1)
             loss_high = self.criterion(high_logits, high_labels)
             loss_low_bc = self.criterion_low(low_logits, low_labels)
 
@@ -495,6 +497,9 @@ class Phase2ILTrainer:
                             node_emb_3d.size(0), self.model_low.action_dim, device=self.device)
                     low_logits, _ = self.model_low(node_emb_3d, subgoal_emb, action_mask=val_action_masks)
 
+                    n_cls = high_logits.size(1)
+                    if high_labels.max() >= n_cls:
+                        high_labels = high_labels.clamp(0, n_cls - 1)
                     loss = self.criterion(high_logits, high_labels) * 0.5 + \
                            self.criterion_low(low_logits, low_labels)
                 else:
@@ -524,6 +529,8 @@ class Phase2ILTrainer:
                 'low_policy': self.model_low.state_dict(),
                 'optimizer_high': self.optimizer_high.state_dict(),
                 'optimizer_low': self.optimizer_low.state_dict(),
+                'n_goals':   self.model_high.num_goals,
+                'n_actions': self.model_low.action_dim,
             })
             if hasattr(self.agent, 'encoder') and self.agent.encoder is not None:
                 save_dict['encoder'] = self.agent.encoder.state_dict()

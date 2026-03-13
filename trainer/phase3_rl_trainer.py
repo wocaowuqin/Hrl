@@ -95,11 +95,17 @@ class Phase3RLTrainer:
         # ── 加载 Phase2 IL 预训练权重 ──────────────────────────────────────
         # 只加载网络权重，不加载 optimizer state：
         # Phase2 用 IL lr(3e-4)，Phase3 用 RL lr，optimizer state 不兼容。
+        _ckpt_dir = (config.get('path', config.get('paths', {})).get('ckpt_dir') or
+                     str(Path(output_dir).parent))
         il_ckpt_path = (
             config.get('phase3', {}).get('il_checkpoint') or
             config.get('il_checkpoint') or
-            str(Path(output_dir).parent / 'il_output' / 'il_model_best.pth')
+            str(Path(_ckpt_dir) / 'il_model_best.pth')
         )
+        if not Path(il_ckpt_path).exists():
+            _fallback = str(Path(_ckpt_dir) / 'il_model_final.pth')
+            if Path(_fallback).exists():
+                il_ckpt_path = _fallback
         self._load_il_checkpoint(il_ckpt_path)
 
     def run(self):
@@ -249,7 +255,7 @@ class Phase3RLTrainer:
                 dc_nodes = getattr(self.env, 'dc_nodes', list(range(self.env.n)))
                 mem_used_abs = sum(
                     max(0.0, self.env.resource_mgr.pool.mem_cap[i]
-                        - self.env.resource_mgr.pool.get_available_mem(i))
+                        - self.env.resource_mgr.pool.get_available_memory(i))
                     for i in dc_nodes
                 )
             except Exception:
@@ -434,52 +440,54 @@ class Phase3RLTrainer:
             logger.warning(f"⚠️ 数据集保存失败: {_se}")
 
     def _load_il_checkpoint(self, ckpt_path: str):
-        """加载 Phase2 IL 预训练权重到 agent，跳过 optimizer state。
-        加载成功后立即同步 target 网络，避免 Q 值估计初期震荡。
+        """加载 Phase2 IL 预训练权重到 agent。
+        shape不匹配的层自动跳过，只继承能用的特征提取层权重。
         """
         if not ckpt_path or not Path(ckpt_path).exists():
             logger.warning(
                 f"⚠️  Phase2 checkpoint 未找到: {ckpt_path}\n"
-                "   Phase3 将从随机初始化开始训练（模仿学习收益丢失）。\n"
-                "   请在 config['phase3']['il_checkpoint'] 或 "
-                "config['il_checkpoint'] 中指定正确路径。"
+                "   Phase3 将从随机初始化开始训练（模仿学习收益丢失）。"
             )
             return
 
+        def _filtered_load(model, state_dict, name):
+            current = model.state_dict()
+            filtered = {k: v for k, v in state_dict.items()
+                        if k in current and v.shape == current[k].shape}
+            skipped = [k for k in state_dict if k not in filtered]
+            model.load_state_dict(filtered, strict=False)
+            logger.info(f"   {name}: {len(filtered)}层继承, 跳过{len(skipped)}层: {skipped}")
+
         try:
             ckpt = torch.load(ckpt_path, map_location=self.agent.device)
-            loaded = []
 
-            # high_policy
+            ckpt_n_goals   = ckpt.get('n_goals',   '未记录')
+            ckpt_n_actions = ckpt.get('n_actions', '未记录')
+            curr_n_goals   = self.agent.high_policy.num_goals
+            curr_n_actions = self.agent.low_policy.action_dim
+            logger.info(f"   ckpt维度:    n_goals={ckpt_n_goals}, n_actions={ckpt_n_actions}")
+            logger.info(f"   current维度: n_goals={curr_n_goals}, n_actions={curr_n_actions}")
+            if ckpt_n_goals != '未记录' and ckpt_n_goals != curr_n_goals:
+                logger.warning(f"   ⚠️  high_policy输出层维度不匹配({ckpt_n_goals}→{curr_n_goals})，输出层随机初始化")
+
             if 'high_policy' in ckpt and hasattr(self.agent, 'high_policy'):
-                missing, unexpected = self.agent.high_policy.load_state_dict(
-                    ckpt['high_policy'], strict=False)
-                loaded.append(f"high_policy(missing={len(missing)}, unexpected={len(unexpected)})")
-                # 同步 target
+                _filtered_load(self.agent.high_policy, ckpt['high_policy'], 'high_policy')
                 if hasattr(self.agent, 'target_high_policy'):
-                    self.agent.target_high_policy.load_state_dict(
-                        self.agent.high_policy.state_dict())
-                    loaded.append("target_high_policy←synced")
+                    _filtered_load(self.agent.target_high_policy, ckpt['high_policy'], 'target_high_policy')
 
-            # low_policy
             if 'low_policy' in ckpt and hasattr(self.agent, 'low_policy'):
-                missing, unexpected = self.agent.low_policy.load_state_dict(
-                    ckpt['low_policy'], strict=False)
-                loaded.append(f"low_policy(missing={len(missing)}, unexpected={len(unexpected)})")
-                # 同步 target
+                _filtered_load(self.agent.low_policy, ckpt['low_policy'], 'low_policy')
                 if hasattr(self.agent, 'target_low_policy'):
-                    self.agent.target_low_policy.load_state_dict(
-                        self.agent.low_policy.state_dict())
-                    loaded.append("target_low_policy←synced")
+                    _filtered_load(self.agent.target_low_policy, ckpt['low_policy'], 'target_low_policy')
 
-            # encoder
             if 'encoder' in ckpt and hasattr(self.agent, 'encoder') and self.agent.encoder is not None:
-                missing, unexpected = self.agent.encoder.load_state_dict(
-                    ckpt['encoder'], strict=False)
-                loaded.append(f"encoder(missing={len(missing)}, unexpected={len(unexpected)})")
+                _filtered_load(self.agent.encoder, ckpt['encoder'], 'encoder')
+                if hasattr(self.agent.encoder, 'tree_bias'):
+                    with torch.no_grad():
+                        self.agent.encoder.tree_bias.fill_(0.0)
+                    logger.info("   tree_bias已重置为0.0")
 
             logger.info(f"✅ Phase2 IL 权重加载成功: {ckpt_path}")
-            logger.info(f"   加载项: {', '.join(loaded)}")
 
         except Exception as e:
             logger.error(f"❌ Phase2 checkpoint 加载失败: {e}，Phase3 从随机初始化开始。")
