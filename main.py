@@ -486,7 +486,7 @@ def main():
     # 🔥 运行参数配置区：直接在这里修改你想运行的阶段和参数
     # =========================================================================
     args = argparse.Namespace(
-        phase='phase2',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
+        phase='phase3',  # 选择运行阶段: 'phase1', 'phase2', 'phase3'
         gpu=0,  # GPU ID, 设为 -1 则强制使用 CPU
         seed=100,  # 随机种子
         goal_strategy='adaptive',  # Phase 3 的目标策略: 'relative', 'adaptive', 'hybrid'
@@ -801,7 +801,7 @@ def main():
         logger.info("📥 加载Phase3训练数据")
         logger.info("=" * 70)
 
-        data_file = 'data/input_dir/时间间隔为5请求到达率为16时/phase3_requests.pkl'
+        data_file = 'data/input_dir/时间间隔为5请求到达率为40时/phase3_requests.pkl'
         logger.info(f"📂 数据文件路径: {data_file}")
         logger.info(f"📂 当前工作目录: {os.getcwd()}")
         logger.info(f"🔍 文件是否存在: {os.path.exists(data_file)}")
